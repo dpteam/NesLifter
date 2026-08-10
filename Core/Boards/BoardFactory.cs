@@ -21,6 +21,9 @@ namespace NesLifter.Core.Boards
                 case 0:
                     return new NromBoard(cart, mapping);
 
+                case 1:
+                    return new Mmc1Board(cart, mapping);
+
                 case 2:
                     return new UxRomBoard(cart, mapping);
 

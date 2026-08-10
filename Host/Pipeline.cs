@@ -243,8 +243,16 @@ namespace NesLifter.Host
 
             if (File.Exists(dllPath))
             {
-                try { File.Delete(dllPath); }
-                catch { }
+                try
+                {
+                    File.Delete(dllPath);
+                }
+                catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+                {
+                    string suffix = DateTime.Now.ToString("yyyyMMdd-HHmmssfff", CultureInfo.InvariantCulture);
+                    dllPath = Path.Combine(workDir, safeName + ".rebuild-" + suffix + ".dll");
+                    Console.WriteLine("Previous game DLL is in use; writing hot-reload build: " + dllPath);
+                }
             }
 
             bool compiled = _compiler.Compile(code, dllPath, message =>
