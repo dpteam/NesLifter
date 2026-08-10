@@ -1,3 +1,5 @@
+--- VERY OLD AND UNSUPPORTED README, WAIT FOR NEW! ---
+
 <img width="262" height="23" alt="Logo" src="https://github.com/user-attachments/assets/40f14cfd-5272-41e2-8afa-fa3abb38aef1" />
 
 NES Static Recompiler / Lifter to .NET Assembly (PoC)
