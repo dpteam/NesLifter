@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "NES2ILRecomp100826": {
+      "commandName": "Project",
+      "commandLineArgs": " --input \"Super Mario Bros. (World).nes\""
+    }
+  }
+}
