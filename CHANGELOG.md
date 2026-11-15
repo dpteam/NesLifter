@@ -47,9 +47,25 @@ Graphical and terminal front ends, plus the icon and packaging pipeline.
 
 ### Fixed
 
+- **A comma in the ROM name broke packaging.** `dotnet publish -o <dir>`
+  forwards the path to MSBuild, which splits property values on commas, so
+  "Legend of Zelda, The" failed with `MSB1006`. Publishing now goes to a
+  comma-free scratch directory and the results are moved afterwards.
 - VRC2 (mapper 22) failed to compile: the IRQ-free VRC variants emitted neither
   the real `ClockScanline` nor the empty stub.
 - The TUI had a duplicate `key` local that shadowed the enclosing scope.
+- The TUI and GUI captured only `Console.Out`, so pipeline errors written to
+  `stderr` landed in the middle of the TUI's own drawing or never reached the
+  GUI log.
+- The interpreter now refuses to execute RAM/IO and reports the exact address.
+  Previously it ran uninitialised memory, which made broken titles look like
+  they worked.
+
+### Added (diagnostics)
+
+- `--no-bank-analysis` (alias `--power-on-only`) restricts the analyser to the
+  power-on layout, as an escape hatch and for A/B comparison.
+- The analysis report prints `bank views=N` so the bank walk is visible.
 
 ---
 

@@ -110,6 +110,45 @@ dotnet run --project tools/Branding
 
 Commit the regenerated binaries together with the code change.
 
+## GUI changes
+
+The front end is plain HTML/CSS/JS in `web/`. There is no bundler, no npm, and
+no build step: edit the file, rebuild, and the change is served.
+
+Rules that keep it that way:
+
+- **No CDN.** NES.css and Font Awesome live in `web/vendor/` and are committed.
+  The app must work with the network unplugged.
+- **No framework.** The UI is small enough that a framework would cost more than
+  it saves.
+- **Theme everything through custom properties.** A new colour goes in the
+  `:root` block and the three theme overrides in `web/theme.css`, never inline.
+- **The page must degrade.** Every `window.chrome.webview` call is optional, so
+  opening `web/index.html` in a browser still renders for design work.
+
+Host-side changes go in `Host/Gui/GuiHost.cs`. A new message needs three edits:
+the JS `post(...)` call, the `switch` in `OnWebMessage`, and the reply shape in
+`Send`. Keep the JSON field names camelCase; they are serialised with
+`PropertyNameCaseInsensitive`.
+
+## Screenshots for docs
+
+`tools/Shot` captures a single window using `PrintWindow`, so the result never
+includes overlapping windows and works over remote desktop:
+
+```powershell
+dotnet run --project tools/Shot -- --process NesLifter --out docs/screenshots/gui-dark.png
+```
+
+Do not use a full-screen capture: on a busy desktop it grabs whatever happens to
+be in front.
+
+## TUI changes
+
+`Host/Tui/ConsoleUi` owns every escape sequence. If you need a new drawing
+primitive, add it there with a plain-text fallback — never write ANSI directly
+from `TuiApp`, or the line-mode fallback will start emitting garbage.
+
 ## License
 
 By contributing you agree your work is licensed under GPL-3.0, the same license

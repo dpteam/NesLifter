@@ -456,12 +456,14 @@ public sealed class GuiHost : Form
     {
         CliOptions options = _state.ToCliOptions(rom.Path);
 
-        // The pipeline writes to Console; capture it and forward each line so
-        // the page shows live progress instead of a frozen window.
-        TextWriter original = Console.Out;
+        // The pipeline writes progress to stdout and diagnostics to stderr;
+        // both have to be forwarded, or half the log never reaches the page.
+        TextWriter originalOut = Console.Out;
+        TextWriter originalError = Console.Error;
         LineForwardingWriter forwarder = new(line => Send("log", new { text = line }));
 
         Console.SetOut(forwarder);
+        Console.SetError(forwarder);
 
         try
         {
@@ -470,7 +472,8 @@ public sealed class GuiHost : Form
         }
         finally
         {
-            Console.SetOut(original);
+            Console.SetOut(originalOut);
+            Console.SetError(originalError);
         }
     }
 
@@ -486,10 +489,12 @@ public sealed class GuiHost : Form
             int ok = 0;
             int failed = 0;
 
-            TextWriter original = Console.Out;
+            TextWriter originalOut = Console.Out;
+            TextWriter originalError = Console.Error;
             LineForwardingWriter forwarder = new(line => Send("log", new { text = line }));
 
             Console.SetOut(forwarder);
+            Console.SetError(forwarder);
 
             try
             {
@@ -509,7 +514,8 @@ public sealed class GuiHost : Form
             }
             finally
             {
-                Console.SetOut(original);
+                Console.SetOut(originalOut);
+                Console.SetError(originalError);
                 _busy = false;
             }
 

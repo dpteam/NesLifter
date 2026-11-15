@@ -231,7 +231,10 @@ public sealed class Pipeline
         string srcDir,
         string safeName)
     {
-        Disassembler dis = new Disassembler(rom, image);
+        Disassembler dis = new Disassembler(rom, image)
+        {
+            AnalyseAllBanks = _options.AnalyseAllBanks
+        };
 
         LoadDynamicTargets(workDir, dis);
 
@@ -254,6 +257,9 @@ public sealed class Pipeline
             "Analysis: code bytes=" + codeBytes +
             " of " + image.PrgRom.Length +
             " (" + Percent(codeBytes, image.PrgRom.Length) + " of PRG)");
+
+        if (model.BankViews > 0)
+            Console.WriteLine("Analysis: bank views=" + model.BankViews);
 
         WriteAnalysisReport(workDir, rom, descriptor, supported, model, codeBytes);
 

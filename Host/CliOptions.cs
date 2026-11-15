@@ -43,6 +43,12 @@ public sealed class CliOptions
     /// </summary>
     public bool RecursiveSpecified;
 
+    /// <summary>
+    /// Analyse every PRG bank instead of only the power-on layout. Off is an
+    /// escape hatch for cartridges where the extra banks confuse the analyser.
+    /// </summary>
+    public bool AnalyseAllBanks = true;
+
     public List<string> UnknownArgs = new List<string>();
 
     public static CliOptions Parse(string[] args)
@@ -157,6 +163,12 @@ public sealed class CliOptions
             if (Is(a, "--no-icon"))
             {
                 o.CaptureIconSeconds = 0;
+                continue;
+            }
+
+            if (Is(a, "--no-bank-analysis", "--power-on-only"))
+            {
+                o.AnalyseAllBanks = false;
                 continue;
             }
 

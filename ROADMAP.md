@@ -1,13 +1,13 @@
-﻿# NesLifter roadmap
+# NesLifter roadmap
 
 Ordered from easiest to hardest. Each stage is shippable on its own and leaves
 the tool in a working state.
 
-Legend: `[x]` done В· `[~]` partial В· `[ ]` planned
+Legend: `[x]` done · `[~]` partial · `[ ]` planned
 
 ---
 
-## Stage 0 вЂ” Foundation (done)
+## Stage 0 — Foundation (done)
 
 Cheap, high-leverage work that makes everything after it verifiable.
 
@@ -21,7 +21,7 @@ Cheap, high-leverage work that makes everything after it verifiable.
 
 ---
 
-## Stage 1 вЂ” Correctness of the mapper layer (done)
+## Stage 1 — Correctness of the mapper layer (done)
 
 The mapper is the single largest source of "it runs but the graphics are wrong".
 
@@ -40,7 +40,7 @@ The mapper is the single largest source of "it runs but the graphics are wrong".
 
 ---
 
-## Stage 1b вЂ” User interface (in progress)
+## Stage 1b — User interface (in progress)
 
 The tool is usable from the command line, but a recompiler is a visual job:
 you pick a ROM folder, watch a queue, read a report, launch a result.
@@ -68,7 +68,23 @@ you pick a ROM folder, watch a queue, read a report, launch a result.
 
 ---
 
-## Stage 2b вЂ” In-game overlay (settings / log / debug)
+
+## Stage 2 — PPU accuracy (done, with known gaps)
+
+- [x] Sprite-0 hit with left-edge clipping
+- [x] Sprite overflow flag (sticky, cleared by `$2002` read)
+- [x] Eight-sprites-per-scanline budget
+- [x] Background and sprite left-edge clipping (`$2001` bits 1/2)
+- [x] Mid-frame scroll capture (per-scanline scroll table)
+- [x] MMC2 CHR latching from the pattern fetch path
+- [~] Sprite priority against the *real* background pixel (currently uses the
+      captured background layer, which is correct for the common case)
+- [ ] Per-dot (cycle-accurate) PPU: 341 dots, A12 filter, sprite evaluation at
+      dot 65/257
+
+---
+
+## Stage 2b — In-game overlay (settings / log / debug)
 
 A lifted game currently has no interface of its own: resolution, scaling,
 audio, input mapping, save slots and diagnostics all live in generated code
@@ -80,10 +96,10 @@ becomes the natural home for every future option.
       by the game, not by a browser).
 - [ ] **Pause on open.** Freeze the CPU thread and the audio ring so settings can
       be changed without the game running underneath.
-- [ ] **Tabs**: Settings В· Video В· Audio В· Input В· Debug В· Log.
+- [ ] **Tabs**: Settings · Video · Audio · Input · Debug · Log.
 - [ ] **Settings**: integer scale (1x-6x), aspect ratio, vsync, frame limiter,
       region override (NTSC/PAL), sprite limit on/off.
-- [ ] **Audio**: master volume, per-channel mute (pulse 1/2, triangle, noise,
+- [ ] **Audio**: master volume, per-channel mute (Pulse ×2, triangle, noise,
       DMC), buffer size, "soft mathematical" UI feedback toggle.
 - [ ] **Input**: rebind every button, per-player, with a capture prompt; gamepad
       mapping once controller support lands.
@@ -99,23 +115,9 @@ becomes the natural home for every future option.
 
 ---
 
-## Stage 2 вЂ” PPU accuracy (done, with known gaps)
-- [x] Sprite-0 hit with left-edge clipping
-- [x] Sprite overflow flag (sticky, cleared by `$2002` read)
-- [x] Eight-sprites-per-scanline budget
-- [x] Background and sprite left-edge clipping (`$2001` bits 1/2)
-- [x] Mid-frame scroll capture (per-scanline scroll table)
-- [x] MMC2 CHR latching from the pattern fetch path
-- [~] Sprite priority against the *real* background pixel (currently uses the
-      captured background layer, which is correct for the common case)
-- [ ] Per-dot (cycle-accurate) PPU: 341 dots, A12 filter, sprite evaluation at
-      dot 65/257
+## Stage 3 — APU accuracy (partial)
 
----
-
-## Stage 3 вЂ” APU accuracy (partial)
-
-- [x] Pulse Г—2, triangle, noise with envelope and length counters
+- [x] Pulse ×2, triangle, noise with envelope and length counters
 - [x] Frame counter, linear counter, sweep skeleton
 - [x] DC-blocking and low-pass filtering
 - [ ] Sweep units (currently ignored)
@@ -126,7 +128,7 @@ becomes the natural home for every future option.
 
 ---
 
-## Stage 4 вЂ” Static analysis depth (next big win)
+## Stage 4 — Static analysis depth (next big win)
 
 Today the lifter analyses **one** bank layout: the one visible at power-on.
 Every other switchable bank is invisible to the analyser and is handled at
@@ -152,7 +154,7 @@ runtime by the interpreter. This is the single largest accuracy gap.
 
 ---
 
-## Stage 5 вЂ” Runtime architecture
+## Stage 5 — Runtime architecture
 
 - [ ] Direct-threaded dispatch instead of `goto` chains for cold blocks
 - [ ] **Apphost `.exe` by default.** A lifted game should be `Game.exe` +
@@ -175,7 +177,7 @@ runtime by the interpreter. This is the single largest accuracy gap.
 
 ---
 
-## Stage 5b вЂ” Game icon (killer feature)
+## Stage 5b — Game icon (killer feature)
 
 A lifted game deserves its own face. Right now every output is a generic
 assembly, which makes a folder of recompiled games indistinguishable.
@@ -203,7 +205,7 @@ assembly, which makes a folder of recompiled games indistinguishable.
 
 ---
 
-## Stage 5c вЂ” Modding (killer feature, hard)
+## Stage 5c — Modding (killer feature, hard)
 
 A lifted game is C#, and C# is editable. That is the one advantage a
 recompilation has over an emulator, and it is currently wasted: the generated
@@ -236,7 +238,7 @@ Three levels of modding, easiest first:
       game runs (Roslyn already sits in the toolchain; the runtime would need an
       assembly reload path).
 
-## Stage 5d вЂ” Multiplayer (hard)
+## Stage 5d — Multiplayer (hard)
 
 The NES had two controller ports, and plenty of games are two-player. Today the
 generated game exposes `Joy1` only.
@@ -260,19 +262,19 @@ generated game exposes `Joy1` only.
 
 ---
 
-## Stage 6 вЂ” Emulation-grade fidelity (hard)
+## Stage 6 — Emulation-grade fidelity (hard)
 - [ ] Cycle-exact 6502 (per-cycle bus accesses, RMW double writes, dummy reads)
 - [ ] CPU interrupt timing: NMI hijacking, IRQ at instruction boundaries only
 - [ ] PPU open bus and decay
 - [ ] Four-screen VRAM and mapper-controlled nametable RAM
-- [ ] MMC5: ExRAM, extended attributes, vertical split mode, 8Г—8 multiply
+- [ ] MMC5: ExRAM, extended attributes, vertical split mode, 8×8 multiply
 - [ ] Mapper 163/MMC5 sound, Namco 163 wavetable, Sunsoft 5B
 - [ ] Famicom Disk System BIOS and disk I/O
 - [ ] VS. System / PlayChoice-10 arcade variants
 
 ---
 
-## Stage 7 вЂ” Tooling and ecosystem (hard)
+## Stage 7 — Tooling and ecosystem (hard)
 
 - [ ] Diff harness: run the generated game and a reference emulator in lockstep,
       compare RAM + framebuffer per frame, report the first divergence

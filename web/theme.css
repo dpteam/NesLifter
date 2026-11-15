@@ -219,7 +219,9 @@ body {
     flex: 1 1 auto;
 }
 
-/* NES.css inputs are enormous; bring them down to a workable size. */
+/* NES.css inputs are enormous and inherit the light-theme border colour; bring
+   them down to a workable size and restate the border in theme colours so they
+   stay visible in dark and OLED. */
 .nes-input,
 .nes-select {
     font-size: 12px;
@@ -228,10 +230,16 @@ body {
     height: auto;
     background: var(--bg-panel-alt);
     color: var(--nes-ink);
-    border-image-slice: 3;
-    border-image-width: 3;
-    border-image-repeat: stretch;
-    border-image-source: var(--nes-border-image);
+    border-style: solid;
+    border-width: 3px;
+    border-color: var(--border);
+    border-radius: 0;
+    outline: none;
+}
+
+.nes-input:focus,
+.nes-select:focus {
+    border-color: var(--nes-red);
 }
 
 .nes-input::placeholder {

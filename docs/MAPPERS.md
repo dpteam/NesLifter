@@ -6,6 +6,7 @@ reference behaviour was followed.
 Every mapper listed here has **two** implementations that must stay in sync:
 
 - `Core/Boards/*Board.cs` — used during analysis to establish the power-on layout
+  and to walk every bank
 - `Lifting/MapperRuntimeEmitter.cs` — emitted into the generated game
 
 Both are selected through `Mappers/MapperCatalog.cs`. If you add a mapper, add
@@ -170,11 +171,14 @@ writes to `$C000-$FFFF` select the outer 64 KB bank from bits 2-4.
    `MapperFamily` (add a new family only if the banking genuinely differs).
 2. Implement the board in `Core/Boards/`.
 3. Register it in `BoardFactory.Builders`.
-4. Implement emission in `MapperRuntimeEmitter` — either reuse an existing
+4. Declare its switchable window size in
+   `Disassembler.SwitchableWindowBytes()` — 8 KB, 16 KB or 32 KB, or 0 if PRG
+   never changes. Getting this wrong makes the bank walk corrupt the layout.
+5. Implement emission in `MapperRuntimeEmitter` — either reuse an existing
    family's write body or add a new one plus its `Emit*` helpers.
-5. Add a `SyntheticRom.Spec` entry to `SyntheticRom.DefaultMatrix`.
-6. Add board tests to `tests/NesLifter.Tests/BoardTests.cs`.
-7. Run `dotnet test` and `dotnet run -- --selftest`.
+6. Add a `SyntheticRom.Spec` entry to `SyntheticRom.DefaultMatrix`.
+7. Add board tests to `tests/NesLifter.Tests/BoardTests.cs`.
+8. Run `dotnet test` and `dotnet run -- --selftest`.
 
 The self-test is the real gate: if the synthetic cartridge lifts, compiles and
 executes, the mapper is wired correctly end to end.

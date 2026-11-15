@@ -188,3 +188,63 @@ Include:
 5. the cartridge's mapper number and CRC32 from `analysis.txt`
 
 Do **not** attach the ROM.
+
+---
+
+## The GUI
+
+### The window closes immediately, or the terminal UI appears instead
+
+The WebView2 runtime is missing. It ships with Windows 11 and with current Edge
+on Windows 10, but not with every stripped-down or LTSC install.
+
+Install the **Microsoft Edge WebView2 Runtime** (Evergreen Bootstrapper) from
+Microsoft. NesLifter falls back to the terminal UI automatically, so nothing is
+broken meanwhile — you just get the TUI.
+
+### `RPC_E_CHANGED_MODE`
+
+This was a NesLifter bug, fixed in 0.9.0: `Main` was not `[STAThread]`, so COM
+initialised as MTA and every WebView2 call failed. If you see it on a current
+build, something is starting the process from an MTA thread — launch the exe
+directly rather than from another managed host.
+
+### The window is blank or black over remote desktop
+
+Also fixed in 0.9.0: Chromium is now forced onto software rendering
+(`--disable-gpu --disable-gpu-compositing`). On very old RDP versions you may
+still see a blank first paint; resizing the window forces a redraw.
+
+### The cartridge list is empty after picking a folder
+
+- Check the path in the box: it must be the folder itself, not a parent.
+- **Recurse into sub-folders** is on by default; if the ROMs are nested deeper
+  than expected, that is what finds them.
+- A folder with no `.nes` files shows "No cartridges yet".
+
+### A row is red
+
+The mapper is not implemented. `analysis.txt` will say
+`Mapper support : fallback (flat PRG layout)`. The game may still run if the
+mapper only banks CHR. See [`MAPPERS.md`](MAPPERS.md).
+
+### Icons need two lifts
+
+The game captures its own icon **while running**, so the icon is embedded into
+the `.exe` on the next lift. To get it right the first time, supply `--icon`
+with your own image.
+
+---
+
+## The TUI
+
+### Arrow keys print escape characters
+
+The console is redirected or reports `TERM=dumb`. NesLifter detects this and
+uses line mode, but a wrapper (some CI runners, some SSH clients) can defeat the
+detection. Set `NesLifter_NO_TUI=1` to force line mode.
+
+### Line mode ignores my flags
+
+Line mode is only reached when no arguments were given. With arguments the CLI
+path runs directly, which is what scripts want.

@@ -39,7 +39,7 @@ inline them.
       │
       ├─ Lifter ─────────────────────────► C# : CPU, PPU, APU, mapper, WinForms
       │
-      └─ Roslyn (embedded PDB) ──────────► game.dll + game.runtimeconfig.json
+      └─ Roslyn / dotnet publish ────────► game.exe + game.dll (+ icon)
 ```
 
 ## Quick start
@@ -84,8 +84,8 @@ A WinForms host with an embedded Chromium view, styled with
 [NES.css](https://nostalgic-css.github.io/NES.css/) and Font Awesome — both
 vendored under `web/vendor`, so it works with no network at all.
 
-- drag a folder path in, or browse for it; cartridges are listed with mapper,
-  board and size, unsupported mappers flagged in red
+- browse or type a folder path; cartridges are listed with mapper, board and
+  size, unsupported mappers flagged in red
 - tick the ones you want (supported ones are pre-selected)
 - choose package mode, screenshot-icon delay, custom icon, output directory
 - press **Lift selected** and watch the log stream live
@@ -368,10 +368,10 @@ NesLifter.csproj
 
 ## Known limitations
 
-- **One bank layout is analysed statically per pass.** Instructions are keyed by
-  PRG offset and every bank is walked, but cross-bank edges are resolved at
-  runtime through the dispatcher rather than proven statically. Static bank
-  tracking is the next roadmap item.
+- **Static bank analysis is per-pass.** Instructions are keyed by PRG offset and
+  every bank is walked, but cross-bank edges are resolved at runtime through the
+  dispatcher rather than proven statically. `--no-bank-analysis` restricts the
+  analyser to the power-on layout if the extra passes ever hurt.
 - **APU sweep and DMC are missing.** Music plays, but some effects are silent.
 - **No save states, no battery save persistence yet.**
 - **Windows only** for the generated game (WinForms + `winmm`).
@@ -380,6 +380,22 @@ NesLifter.csproj
 - **Icons need two lifts.** The game captures its icon while running, so the
   icon is embedded into the `.exe` on the next lift. Supply `--icon` to get it
   right the first time.
+
+### Per-title status
+
+The interpreter refuses to execute RAM, which turns what used to be silent
+garbage execution into a visible trap. That is deliberate: a game that "runs"
+while executing uninitialised memory is worse than one that stops and says
+where.
+
+Of the 17 reference titles used during development, 10 run cleanly and 7 trap.
+The traps are analysis gaps, not packaging problems — most are a RAM jump table
+read before the code that fills it has run, which is exactly the bank-tracking
+work in the [roadmap](ROADMAP.md#stage-4--static-analysis-depth-next-big-win).
+
+`Super Mario Bros. 3` is the clearest example: it dispatches to `$0001` from
+`$8446`. `--no-bank-analysis` does not change it, so the gap predates bank-aware
+analysis and was previously hidden.
 
 ## Legal
 

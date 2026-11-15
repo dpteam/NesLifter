@@ -79,6 +79,35 @@ jobs:
           -p:IncludeNativeLibrariesForSelfExtract=true
           -o dist
 
+      - name: Verify published layout
+        shell: pwsh
+        run: |
+          # The single-file bundle carries the managed assemblies, but the GUI's
+          # web/ folder and the WebView2 native loader must sit next to the exe
+          # or the interface cannot start. Fail loudly rather than shipping a
+          # broken zip.
+          $missing = @()
+          if (-not (Test-Path 'dist/NesLifter.exe')) { $missing += 'NesLifter.exe' }
+          if (-not (Test-Path 'dist/web/index.html')) { $missing += 'web/index.html' }
+          if (-not (Test-Path 'dist/web/vendor/nes.css/nes.min.css')) { $missing += 'web/vendor/nes.css' }
+          if (-not (Test-Path 'dist/assets/icon.ico')) { $missing += 'assets/icon.ico' }
+
+          # The loader lives under runtimes/<rid>/native in a framework-dependent
+          # publish; a self-contained one may flatten it next to the exe.
+          $loader = @(
+            'dist/WebView2Loader.dll',
+            'dist/runtimes/win-x64/native/WebView2Loader.dll'
+          ) | Where-Object { Test-Path $_ }
+
+          if ($loader.Count -eq 0) { $missing += 'WebView2Loader.dll' }
+
+          if ($missing.Count -gt 0) {
+            Write-Error "Published output is missing: $($missing -join ', ')"
+            exit 1
+          }
+
+          Write-Host 'Published layout looks complete.'
+
       - name: Upload lifter
         uses: actions/upload-artifact@v4
         with:

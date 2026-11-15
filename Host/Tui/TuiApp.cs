@@ -764,8 +764,13 @@ public sealed class TuiApp
 
     private void LiftWorker(List<RomEntry> entries)
     {
-        TextWriter original = Console.Out;
+        // Both streams must be captured: the pipeline writes progress to stdout
+        // and errors to stderr, and a stray stderr line would land in the middle
+        // of the TUI's own drawing.
+        TextWriter originalOut = Console.Out;
+        TextWriter originalError = Console.Error;
         Console.SetOut(_log);
+        Console.SetError(_log);
 
         try
         {
@@ -803,7 +808,8 @@ public sealed class TuiApp
         }
         finally
         {
-            Console.SetOut(original);
+            Console.SetOut(originalOut);
+            Console.SetError(originalError);
             _liftClock.Stop();
             _working = false;
         }
@@ -823,8 +829,10 @@ public sealed class TuiApp
 
         _worker = new Thread(() =>
         {
-            TextWriter original = Console.Out;
+            TextWriter originalOut = Console.Out;
+            TextWriter originalError = Console.Error;
             Console.SetOut(_log);
+            Console.SetError(_log);
 
             try
             {
@@ -845,7 +853,8 @@ public sealed class TuiApp
             }
             finally
             {
-                Console.SetOut(original);
+                Console.SetOut(originalOut);
+                Console.SetError(originalError);
                 _liftClock.Stop();
                 _working = false;
                 _liftIndex = _liftTotal;

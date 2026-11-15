@@ -186,3 +186,64 @@ fails the self-test before it can reach a real cartridge.
 Unit tests (`tests/NesLifter.Tests`) cover the layer below: every catalog entry
 must have a board, and each board's banking, mirroring, bus-conflict and IRQ
 behaviour is asserted directly.
+
+## 9. Front ends
+
+Three interfaces sit on top of the same `Pipeline`, and none of them contains
+lift logic:
+
+```
+                 ┌──────────────┐
+   arguments ───►│  CliOptions  │
+                 └──────┬───────┘
+                        │
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+   ┌─────────┐    ┌──────────┐    ┌──────────┐
+   │   CLI   │    │   TUI    │    │   GUI    │
+   └────┬────┘    └────┬─────┘    └────┬─────┘
+        │              │               │
+        └──────────────┴───────────────┘
+                       ▼
+                  ┌──────────┐
+                  │ Pipeline │
+                  └──────────┘
+```
+
+`Program.Main` picks one:
+
+| Condition | Interface |
+|---|---|
+| arguments present | CLI |
+| `--gui` | GUI |
+| no arguments, WebView2 available | GUI |
+| no arguments, WebView2 missing | TUI |
+| console cannot host a full-screen UI | line mode |
+
+**TUI** (`Host/Tui`) draws with `ConsoleUi`, which degrades to plain text when
+the console is redirected or `TERM=dumb`. `LogBuffer` is a `TextWriter` that
+captures the pipeline's console output into a ring buffer, so the lift runs on a
+worker thread while the UI renders its tail.
+
+**GUI** (`Host/Gui`) hosts WebView2 and serves `web/` through a virtual host
+mapping, so the page loads as a normal HTTPS origin with no local server. The
+bridge is JSON over `postMessage`:
+
+```
+page  → host : ready, scan, lift, selfTest, openOutput, pickIcon, pickFolder,
+               saveTheme, saveSound
+host  → page : init, roms, log, progress, romResult, done, iconPicked,
+               folderPicked, error
+```
+
+Two details matter and both were bugs first:
+
+- `Main` must be `[STAThread]`. Without it COM initialises as MTA and every
+  WebView2 call fails with `RPC_E_CHANGED_MODE`.
+- `PostWebMessageAsJson` delivers an already-parsed object to the page, while
+  `PostWebMessageAsString` delivers text. The handler accepts both, otherwise
+  every message is silently dropped.
+
+Chromium is started with `--disable-gpu --disable-gpu-compositing` because over
+RDP and inside VMs the GPU path either fails or renders a blank surface;
+software rendering is slower but works everywhere.

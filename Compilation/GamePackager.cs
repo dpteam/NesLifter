@@ -89,6 +89,7 @@ public sealed class GamePackager
 
         string safeName = SanitizeAssemblyName(options.AssemblyName);
         string projectDir = Path.Combine(workDir, "_pkg");
+        string? publishDir = null;
 
         try
         {
@@ -103,7 +104,12 @@ public sealed class GamePackager
             string projectPath = Path.Combine(projectDir, "LiftedGame.csproj");
             File.WriteAllText(projectPath, BuildProject(safeName, icon, options));
 
-            string publishDir = Path.Combine(projectDir, "publish");
+            // `dotnet publish -o <dir>` forwards the path to MSBuild as a
+            // property, and MSBuild splits property values on commas. A ROM named
+            // "Legend of Zelda, The" therefore breaks publishing with MSB1006.
+            // Publishing into a comma-free scratch directory and moving the
+            // results afterwards sidesteps the parser entirely.
+            publishDir = CreateScratchPublishDir();
 
             (bool ok, string output) = RunPublish(projectPath, publishDir, options, log);
 
@@ -146,7 +152,49 @@ public sealed class GamePackager
         finally
         {
             TryDeleteDirectory(projectDir);
+
+            if (publishDir != null)
+                TryDeleteDirectory(publishDir);
         }
+    }
+
+    /// <summary>
+    /// A unique, comma-free scratch directory for <c>dotnet publish -o</c>.
+    ///
+    /// The temp root itself can contain a comma (a Windows user name is enough),
+    /// so the candidate is validated and a comma-free fallback is used when it
+    /// is not safe.
+    /// </summary>
+    private static string CreateScratchPublishDir()
+    {
+        string name = Guid.NewGuid().ToString("N");
+
+        string[] roots =
+        {
+            Path.Combine(Path.GetTempPath(), "neslifter-publish"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NesLifter", "publish"),
+            Path.Combine(Path.GetPathRoot(Environment.SystemDirectory) ?? "C:\\", "NesLifterPublish")
+        };
+
+        foreach (string root in roots)
+        {
+            if (string.IsNullOrWhiteSpace(root) || root.IndexOf(',') >= 0 || root.IndexOf(';') >= 0)
+                continue;
+
+            string dir = Path.Combine(root, name);
+
+            try
+            {
+                Directory.CreateDirectory(dir);
+                return dir;
+            }
+            catch (Exception)
+            {
+                // Try the next candidate.
+            }
+        }
+
+        throw new IOException("Could not create a comma-free scratch directory for publishing.");
     }
 
     /// <summary>
@@ -353,24 +401,24 @@ public sealed class GamePackager
         return produced;
     }
 
+    /// <summary>
+    /// Makes a ROM name safe to use as an assembly name.
+    ///
+    /// Commas are allowed on purpose: they are legal in an assembly name and
+    /// common in GoodNES titles ("Legend of Zelda, The"). Only characters that
+    /// actually break MSBuild or the file system are replaced.
+    /// </summary>
     private static string SanitizeAssemblyName(string name)
     {
         if (string.IsNullOrWhiteSpace(name))
             return "Game";
 
-        StringBuilder sb = new StringBuilder();
+        char[] invalid = Path.GetInvalidFileNameChars();
+        StringBuilder sb = new StringBuilder(name.Length);
 
         foreach (char c in name)
         {
-            if (char.IsLetterOrDigit(c) || c == '_' || c == '-' || c == '.' ||
-                c == '(' || c == ')' || c == '[' || c == ']' || c == '!' || c == ' ')
-            {
-                sb.Append(c);
-            }
-            else
-            {
-                sb.Append('_');
-            }
+            sb.Append(Array.IndexOf(invalid, c) >= 0 ? '_' : c);
         }
 
         string result = sb.ToString().Trim().TrimEnd('.');
