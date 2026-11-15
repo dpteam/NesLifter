@@ -1,8 +1,12 @@
 {
   "profiles": {
-    "NES2ILRecomp100826": {
+    "NesLifter: self-test": {
       "commandName": "Project",
-      "commandLineArgs": " --input \"Super Mario Bros. (World).nes\""
+      "commandLineArgs": "--selftest --frames 60 --keep"
+    },
+    "NesLifter: help": {
+      "commandName": "Project",
+      "commandLineArgs": "--help"
     }
   }
 }

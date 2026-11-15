@@ -1,4 +1,4 @@
-namespace NesLifter.Core.Boards
+﻿namespace NesLifter.Core.Boards
 {
     /// <summary>
     /// Mapper 1 / MMC1. Based on FCEUmm's asic_mmc1.c and mmc1.c.
@@ -9,7 +9,6 @@ namespace NesLifter.Core.Boards
 
         private byte _shift;
         private byte _bits;
-        private int _writeFilter;
 
         public Mmc1Board(CartInfo cart, CartMapping mapping)
             : base(cart, mapping)
@@ -35,12 +34,10 @@ namespace NesLifter.Core.Boards
 
         public override void ClockCpu(int cycles)
         {
-            if (cycles <= 0 || _writeFilter <= 0)
-                return;
-
-            _writeFilter -= cycles;
-            if (_writeFilter < 0)
-                _writeFilter = 0;
+            // MMC1 has no CPU-cycle state; the RMW write filter used by
+            // emulators exists only to model consecutive-write timing and is
+            // deliberately not applied here: the analyser has no CPU clock and
+            // analysis must see the same banking as the generated runtime.
         }
 
         public override byte ReadLow(ushort address)
@@ -69,20 +66,12 @@ namespace NesLifter.Core.Boards
             if (address < 0x8000)
                 return;
 
-            // Reset writes are accepted even during the RMW write filter.
             if ((value & 0x80) != 0)
             {
                 _registers[0] |= 0x0C;
                 _shift = 0;
                 _bits = 0;
-                _writeFilter = 2;
                 Sync();
-                return;
-            }
-
-            if (_writeFilter != 0)
-            {
-                _writeFilter = 2;
                 return;
             }
 
@@ -96,8 +85,6 @@ namespace NesLifter.Core.Boards
                 _bits = 0;
                 Sync();
             }
-
-            _writeFilter = 2;
         }
 
         private void ClearRegisters()
@@ -108,7 +95,6 @@ namespace NesLifter.Core.Boards
             _registers[3] = 0;
             _shift = 0;
             _bits = 0;
-            _writeFilter = 0;
             Sync();
         }
 

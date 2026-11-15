@@ -362,8 +362,52 @@ public sealed class CartMapping
         mem[index] = value;
     }
 
-    private ChipInfo GetPrgChip(int chip)
+    /// <summary>
+    /// Memory array currently mapped into the given 2 KB PRG page, or null.
+    /// Used by the analyser to follow the power-on bank layout.
+    /// </summary>
+    public byte[] GetPrgPageMemory(int page)
     {
+        if ((uint)page >= PrgPageCount)
+            return null;
+
+        return _prgPageMem[page];
+    }
+
+    /// <summary>
+    /// Offset inside <see cref="GetPrgPageMemory"/> that corresponds to the
+    /// first byte of the given 2 KB PRG page.
+    /// </summary>
+    public int GetPrgPageOffset(int page)
+    {
+        if ((uint)page >= PrgPageCount)
+            return 0;
+
+        return _prgPageAdjust[page] + (page << 11);
+    }
+
+    /// <summary>
+    /// Signed delta between a CPU address and its PRG ROM offset:
+    /// <c>offset = adjust + address</c>.
+    /// </summary>
+    public int GetPrgPageAdjust(int page)
+    {
+        if ((uint)page >= PrgPageCount)
+            return 0;
+
+        return _prgPageAdjust[page];
+    }
+
+    /// <summary>True when the given 2 KB PRG page is writable RAM.</summary>
+    public bool IsPrgPageRam(int page)
+    {
+        if ((uint)page >= PrgPageCount)
+            return false;
+
+        return _prgPageIsRam[page];
+    }
+
+    private ChipInfo GetPrgChip(int chip)    {
         if ((uint)chip >= 32)
             return null;
 

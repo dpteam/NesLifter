@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 440" width="1600" height="440" role="img" aria-labelledby="title">
+  <title id="title">NesLifter - static NES to .NET recompiler</title>
+  <defs>
+    <linearGradient id="badge" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1B2436"/>
+      <stop offset="1" stop-color="#070A11"/>
+    </linearGradient>
+    <linearGradient id="shine" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="body" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFF9EC"/>
+      <stop offset="1" stop-color="#CFC5AF"/>
+    </linearGradient>
+    <linearGradient id="label" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FF4D5A"/>
+      <stop offset="1" stop-color="#B81F31"/>
+    </linearGradient>
+    <linearGradient id="contact" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#D9A23A"/>
+      <stop offset="1" stop-color="#8E661C"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0.55" stop-color="#FF4D5A" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#FF4D5A" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="dots" width="32" height="32" patternUnits="userSpaceOnUse">
+      <rect x="14" y="14" width="3" height="3" fill="#8FB3E0" opacity="0.10"/>
+    </pattern>
+
+    <g id="mark">
+      <rect x="8" y="8" width="496" height="496" rx="112" fill="url(#badge)"/>
+      <rect x="8" y="8" width="496" height="496" rx="112" fill="url(#dots)"/>
+      <rect x="8" y="8" width="496" height="496" rx="112" fill="url(#shine)"/>
+      <rect x="8" y="8" width="496" height="496" rx="112" fill="none" stroke="#2C3D5C" stroke-width="6"/>
+
+      <g stroke="#2F4466" stroke-width="3" opacity="0.55" stroke-linecap="square" fill="none">
+        <path d="M40 176 H116 M40 176 V120 M40 232 H92 V300 H130"/>
+        <path d="M472 168 H400 M472 168 V96 M148 470 V452 H364 V470"/>
+      </g>
+      <g fill="#44608C" opacity="0.75">
+        <rect x="36" y="114" width="8" height="8"/>
+        <rect x="126" y="296" width="8" height="8"/>
+        <rect x="468" y="90" width="8" height="8"/>
+        <rect x="144" y="466" width="8" height="8"/>
+        <rect x="360" y="466" width="8" height="8"/>
+      </g>
+      <g stroke="#FF4D5A" stroke-width="3" opacity="0.8" fill="none" stroke-linecap="square">
+        <path d="M472 336 H408 V372"/>
+      </g>
+      <rect x="404" y="368" width="8" height="8" fill="#FF4D5A" opacity="0.9"/>
+
+      <ellipse cx="256" cy="270" rx="160" ry="170" fill="url(#glow)"/>
+
+      <path d="M150 134 H208 V110 H304 V134 H362 V404 H150 Z" fill="url(#body)" stroke="#8C8168" stroke-width="4" stroke-linejoin="round"/>
+      <path d="M164 150 H348" stroke="#7A6F58" stroke-width="3" opacity="0.35"/>
+      <rect x="174" y="166" width="164" height="122" rx="9" fill="url(#label)" stroke="#FFFFFF" stroke-opacity="0.45" stroke-width="2.5"/>
+
+      <g fill="#F3ECDD" transform="translate(2.5,2.5)" opacity="0.28">
+        <path d="M260 180 L236 230 L252 230 L245 270 L273 216 L256 216 Z"/>
+      </g>
+      <path d="M260 180 L236 230 L252 230 L245 270 L273 216 L256 216 Z" fill="#F3ECDD"/>
+
+      <g fill="url(#contact)" stroke="#5C400E" stroke-opacity="0.45" stroke-width="1.5">
+        <rect x="189.5" y="362" width="17" height="26"/><rect x="218.5" y="362" width="17" height="26"/>
+        <rect x="247.5" y="362" width="17" height="26"/><rect x="276.5" y="362" width="17" height="26"/>
+        <rect x="305.5" y="362" width="17" height="26"/>
+      </g>
+
+      <circle cx="328" cy="324" r="12" fill="#5AFF9A" opacity="0.22"/>
+      <circle cx="328" cy="324" r="6" fill="#5AFF9A"/>
+    </g>
+  </defs>
+
+  <use href="#mark" x="8" y="30" width="380" height="380"/>
+
+  <g font-family="'Segoe UI Variable Display', 'Segoe UI', Inter, Arial, sans-serif">
+    <text x="464" y="242" font-size="168" font-weight="700" letter-spacing="-4">
+      <tspan fill="#F3ECDD">Nes</tspan><tspan fill="#FF4D5A">Lifter</tspan>
+    </text>
+    <path d="M468 258 H1420" stroke="#33496B" stroke-width="4"/>
+    <text x="470" y="318" font-size="40" letter-spacing="6" fill="#93A7C4">STATIC NES &#8594; .NET RECOMPILER</text>
+  </g>
+</svg>

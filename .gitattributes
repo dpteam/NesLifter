@@ -1,0 +1,26 @@
+# Normalise text to LF in the repository, CRLF on Windows checkouts.
+* text=auto eol=crlf
+
+*.cs      text diff=csharp
+*.csproj  text
+*.slnx    text
+*.props   text
+*.targets text
+*.json    text
+*.yml     text
+*.yaml    text
+*.md      text
+*.svg     text
+*.editorconfig text
+*.gitignore    text
+*.gitattributes text
+
+# Binary assets must never be line-ending converted.
+*.png     binary
+*.ico     binary
+*.jpg     binary
+*.gif     binary
+*.nes     binary
+*.unf     binary
+*.dll     binary
+*.pdb     binary

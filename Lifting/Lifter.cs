@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
 using NesLifter.Core;
-using NesLifter.Core.Boards;
+using NesLifter.Mappers;
 
 namespace NesLifter.Lifting
 {
@@ -12,12 +12,13 @@ namespace NesLifter.Lifting
         private readonly NesRom _rom;
         private readonly AnalysisResult _model;
         private readonly string _nsName;
-        private readonly CartMapping _mapping;
-        private readonly IBoard _board;
 
         private readonly Dictionary<ushort, bool> _labels = new Dictionary<ushort, bool>();
         private readonly List<ushort> _emitted = new List<ushort>();
         private readonly List<ushort> _dispatch = new List<ushort>();
+
+        private readonly MapperRuntimeEmitter _mapper;
+        private readonly MapperDescriptor _mapperDescriptor;
 
         private ushort _nmiTarget;
         private bool _hasNmi;
@@ -25,15 +26,13 @@ namespace NesLifter.Lifting
         public Lifter(
             NesRom rom,
             AnalysisResult model,
-            string gameName,
-            CartMapping mapping,
-            IBoard board)
+            string gameName)
         {
             _rom = rom;
             _model = model;
             _nsName = SanitizeIdentifier(gameName);
-            _mapping = mapping;
-            _board = board;
+            _mapperDescriptor = MapperCatalog.Get(rom.Cart.Mapper);
+            _mapper = new MapperRuntimeEmitter(rom.Cart);
 
             BuildLabels();
             BuildDispatch();
@@ -161,8 +160,21 @@ namespace NesLifter.Lifting
             sb.AppendLine("static class Program");
             sb.AppendLine("{");
             sb.AppendLine("    [STAThread]");
-            sb.AppendLine("    static void Main()");
+            sb.AppendLine("    static int Main(string[] args)");
             sb.AppendLine("    {");
+            sb.AppendLine("        int headlessFrames = 0;");
+            sb.AppendLine("        bool headless = false;");
+            sb.AppendLine("        for (int i = 0; i < args.Length; i++)");
+            sb.AppendLine("        {");
+            sb.AppendLine("            if (args[i] == \"--headless\")");
+            sb.AppendLine("            {");
+            sb.AppendLine("                headless = true;");
+            sb.AppendLine("                if (i + 1 < args.Length) int.TryParse(args[i + 1], out headlessFrames);");
+            sb.AppendLine("            }");
+            sb.AppendLine("        }");
+            sb.AppendLine();
+            sb.AppendLine("        if (headless) return RunHeadless(headlessFrames > 0 ? headlessFrames : 600);");
+            sb.AppendLine();
             sb.AppendLine("        try");
             sb.AppendLine("        {");
             sb.AppendLine("            Application.EnableVisualStyles();");
@@ -176,11 +188,45 @@ namespace NesLifter.Lifting
             sb.AppendLine("            cpuThread.Start();");
             sb.AppendLine();
             sb.AppendLine("            Application.Run(form);");
+            sb.AppendLine("            return 0;");
             sb.AppendLine("        }");
             sb.AppendLine("        catch (Exception ex)");
             sb.AppendLine("        {");
             sb.AppendLine("            MessageBox.Show(ex.ToString(), \"NES Lifted fatal\", MessageBoxButtons.OK, MessageBoxIcon.Error);");
+            sb.AppendLine("            return 1;");
             sb.AppendLine("        }");
+            sb.AppendLine("    }");
+            sb.AppendLine();
+            sb.AppendLine("    /// <summary>");
+            sb.AppendLine("    /// Runs the lifted game without a window. Used by CI and by");
+            sb.AppendLine("    /// NesLifter --selftest to prove the generated assembly executes.");
+            sb.AppendLine("    /// Exit code 0 = reached the frame budget without trapping.");
+            sb.AppendLine("    /// </summary>");
+            sb.AppendLine("    static int RunHeadless(int frames)");
+            sb.AppendLine("    {");
+            sb.AppendLine("        Runtime.Headless = true;");
+            sb.AppendLine("        Runtime.ThrottleEnabled = false;");
+            sb.AppendLine("        Runtime.Init();");
+            sb.AppendLine();
+            sb.AppendLine("        Thread cpuThread = new Thread(new ThreadStart(Runtime.CpuThread));");
+            sb.AppendLine("        cpuThread.IsBackground = true;");
+            sb.AppendLine("        cpuThread.Start();");
+            sb.AppendLine();
+            sb.AppendLine("        long deadline = Environment.TickCount64 + 60000;");
+            sb.AppendLine("        while (Ppu.FrameCount < frames && Environment.TickCount64 < deadline)");
+            sb.AppendLine("        {");
+            sb.AppendLine("            if (Runtime.CpuState == \"Trap\" || Runtime.CpuState == \"Exited\") break;");
+            sb.AppendLine("            Thread.Sleep(2);");
+            sb.AppendLine("        }");
+            sb.AppendLine();
+            sb.AppendLine("        Console.WriteLine(\"headless: frames=\" + Ppu.FrameCount + \" instructions=\" + Runtime.InsCount + \" state=\" + Runtime.CpuState);");
+            sb.AppendLine("        if (Runtime.LastError != null)");
+            sb.AppendLine("        {");
+            sb.AppendLine("            Console.Error.WriteLine(\"headless trap: \" + Runtime.LastError);");
+            sb.AppendLine("            return 3;");
+            sb.AppendLine("        }");
+            sb.AppendLine();
+            sb.AppendLine("        return Ppu.FrameCount >= frames ? 0 : 2;");
             sb.AppendLine("    }");
             sb.AppendLine("}");
             sb.AppendLine();
@@ -194,12 +240,16 @@ namespace NesLifter.Lifting
         {
             CartInfo cart = _rom.Cart;
 
+            int wramSize = ResolveWramSize(cart);
+            int chrRamSize = cart.ChrRom.Length == 0 ? ResolveChrRamSize(cart) : 0;
+
             sb.AppendLine("static class Runtime");
             sb.AppendLine("{");
 
             // Metadata
             sb.AppendLine("    public const string GameName = \"" + _nsName + "\";");
             sb.AppendLine("    public const int Mapper = " + cart.Mapper + ";");
+            sb.AppendLine("    public const string MapperName = \"" + _mapperDescriptor.Name + "\";");
             int mir = cart.Mirroring == 1 ? 1 : (cart.Mirroring == 2 ? 2 : 0);
             sb.AppendLine("    public static int Mirroring = " + mir + ";");
             sb.AppendLine();
@@ -211,7 +261,8 @@ namespace NesLifter.Lifting
 
             // RAM
             sb.AppendLine("    public static byte[] Ram = new byte[0x800];");
-            sb.AppendLine("    public static byte[] SaveRam = new byte[0x2000];");
+            sb.AppendLine("    public static byte[] Wram = new byte[" + wramSize + "];");
+            sb.AppendLine("    public static byte[] ChrRam = new byte[" + chrRamSize + "];");
             sb.AppendLine();
 
             // CPU registers
@@ -224,6 +275,7 @@ namespace NesLifter.Lifting
 
             // State
             sb.AppendLine("    public static string LastError;");
+            sb.AppendLine("    public static bool Headless;");
             sb.AppendLine("    public static long InsCount;");
             sb.AppendLine("    public static ushort LastPC;");
             sb.AppendLine("    public static ushort DispatchTarget;");
@@ -285,7 +337,7 @@ namespace NesLifter.Lifting
             sb.AppendLine("    {");
             sb.AppendLine("        A = 0; X = 0; Y = 0; SP = 0xFD; P = 0x24;");
             sb.AppendLine("        DispatchTarget = 0; CpuState = \"Init\";");
-            sb.AppendLine("        Memory.Reset(); Ppu.Reset(); Apu.Reset(); MapperStub.Reset();");
+            sb.AppendLine("        Memory.Reset(); Ppu.Reset(); Apu.Reset(); MapperStub.Power();");
             sb.AppendLine("        Log(\"session\", \"=== game started; mapper=\" + Mapper + \"; log=\" + LogPath + \" ===\", true);");
             sb.AppendLine("    }");
             sb.AppendLine();
@@ -297,6 +349,7 @@ namespace NesLifter.Lifting
             sb.AppendLine("        {");
             sb.AppendLine("            CpuState = \"Starting\";");
             sb.AppendLine("            Log(\"cpu-start\", \"CPU thread started\", true);");
+            sb.AppendLine("            if (Headless) Audio.TryStop();");
             sb.AppendLine("            Reset();");
             sb.AppendLine("            CpuState = \"EnteringRun\";");
             sb.AppendLine("            Run();");
@@ -376,7 +429,7 @@ namespace NesLifter.Lifting
                 sb.AppendLine("    L" + addr.ToString("X4") + ":");
                 sb.AppendLine("        {");
 
-                Instruction inst = null;
+                Instruction? inst;
                 _model.Instructions.TryGetValue(addr, out inst);
 
                 Line(sb, "Runtime.LastPC = 0x" + addr.ToString("X4") + "; Runtime.TraceInstruction(0x" + addr.ToString("X4") + ");");
@@ -846,7 +899,8 @@ namespace NesLifter.Lifting
             sb.AppendLine("    public static void Reset()");
             sb.AppendLine("    {");
             sb.AppendLine("        Array.Clear(Runtime.Ram, 0, Runtime.Ram.Length);");
-            sb.AppendLine("        Array.Clear(Runtime.SaveRam, 0, Runtime.SaveRam.Length);");
+            sb.AppendLine("        Array.Clear(Runtime.Wram, 0, Runtime.Wram.Length);");
+            sb.AppendLine("        Array.Clear(Runtime.ChrRam, 0, Runtime.ChrRam.Length);");
             sb.AppendLine("        MapperStub.Reset();");
             sb.AppendLine("    }");
             sb.AppendLine();
@@ -855,9 +909,7 @@ namespace NesLifter.Lifting
             sb.AppendLine("        if (addr < 0x2000) return Runtime.Ram[addr & 0x07FF];");
             sb.AppendLine("        if (addr < 0x4000) return Ppu.ReadReg((ushort)(0x2000 + (addr & 7)));");
             sb.AppendLine("        if (addr < 0x4020) return Apu.ReadReg(addr);");
-            sb.AppendLine("        if (addr < 0x6000) return MapperStub.Read(addr);");
-            sb.AppendLine("        if (addr < 0x8000) return MapperStub.ReadWram(addr);");
-            sb.AppendLine("        return ReadPrg(addr);");
+            sb.AppendLine("        return MapperStub.Read(addr);");
             sb.AppendLine("    }");
             sb.AppendLine();
             sb.AppendLine("    public static void Write(ushort addr, byte value)");
@@ -869,8 +921,6 @@ namespace NesLifter.Lifting
             sb.AppendLine("            if (addr == 0x4014) { Ppu.DmaOam(value); return; }");
             sb.AppendLine("            Apu.WriteReg(addr, value); return;");
             sb.AppendLine("        }");
-            sb.AppendLine("        if (addr < 0x6000) { MapperStub.Write(addr, value); return; }");
-            sb.AppendLine("        if (addr < 0x8000) { MapperStub.WriteWram(addr, value); return; }");
             sb.AppendLine("        MapperStub.Write(addr, value);");
             sb.AppendLine("    }");
             sb.AppendLine();
@@ -881,12 +931,7 @@ namespace NesLifter.Lifting
             sb.AppendLine();
             sb.AppendLine("    public static byte ReadPrg(ushort addr)");
             sb.AppendLine("    {");
-            sb.AppendLine("        int page = (addr >> 11) & 31;");
-            sb.AppendLine("        byte[] mem = MapperStub.PrgPageMem[page];");
-            sb.AppendLine("        if (mem == null) return 0;");
-            sb.AppendLine("        int offset = MapperStub.PrgPageBase[page] + addr;");
-            sb.AppendLine("        if (offset < 0 || offset >= mem.Length) return 0;");
-            sb.AppendLine("        return mem[offset];");
+            sb.AppendLine("        return MapperStub.ReadPrg(addr);");
             sb.AppendLine("    }");
             sb.AppendLine("}");
             sb.AppendLine();
@@ -973,9 +1018,10 @@ namespace NesLifter.Lifting
             sb.AppendLine("                {");
             sb.AppendLine("                    if (!Sprite0Polled) Sprite0Polled = true;");
             sb.AppendLine("                    if ((Status & 0x40) == 0 && Sprite0HitsAt(sl)) Status = (byte)(Status | 0x40);");
+            sb.AppendLine("                    if ((Status & 0x20) == 0) EvaluateSpriteOverflow(sl);");
             sb.AppendLine("                }");
             sb.AppendLine("                byte s = Status;");
-            sb.AppendLine("                Status = (byte)(Status & 0x7F);");
+            sb.AppendLine("                Status = (byte)(Status & 0x1F);");
             sb.AppendLine("                WToggle = false;");
             sb.AppendLine("                return s;");
             sb.AppendLine("            }");
@@ -1077,17 +1123,12 @@ namespace NesLifter.Lifting
             sb.AppendLine("        LiveLineScrollX[y] = sx; LiveLineScrollY[y] = sy - y; if (LiveLineScrollY[y] < 0) LiveLineScrollY[y] += 480;");
             sb.AppendLine("        // nt is likewise the current line's table; remove the vertical wrap that RenderScreen will add back.");
             sb.AppendLine("        LiveLineBaseNt[y] = nt ^ (((sy >> 8) & 1) << 1);");
+            sb.AppendLine("        if (MapperStub.HasIrq) MapperStub.ClockScanline();");
             sb.AppendLine("        // FCEU Fixit2: copy coarse X + horizontal nametable from t at dot 257.");
             sb.AppendLine("        RefreshAddr = (RefreshAddr & 0xFBE0) | (TempAddr & 0x041F);");
             sb.AppendLine("        // FCEU Fixit1: increment fine/coarse Y and toggle the vertical nametable on wrap.");
             sb.AppendLine("        if ((RefreshAddr & 0x7000) == 0x7000) { RefreshAddr ^= 0x7000; if ((RefreshAddr & 0x03E0) == 0x03A0) RefreshAddr ^= 0x0BA0; else if ((RefreshAddr & 0x03E0) == 0x03E0) RefreshAddr ^= 0x03E0; else RefreshAddr += 0x20; } else RefreshAddr += 0x1000;");
             sb.AppendLine("    }");
-            sb.AppendLine("}");
-            sb.AppendLine();
-            sb.AppendLine("static bool IsAfterSplit()");
-            sb.AppendLine("{");
-            sb.AppendLine("    int sl = CurrentScanline();");
-            sb.AppendLine("    return sl < 240 && sl >= _sprite0Y;");
             sb.AppendLine("}");
             sb.AppendLine();
             sb.AppendLine("static int MirrorTableLive(int t)");
@@ -1112,6 +1153,9 @@ namespace NesLifter.Lifting
             sb.AppendLine("    for (int px = 0; px < 8 && sx + px < 255; px++)");
             sb.AppendLine("    {");
             sb.AppendLine("        int spBit = (attr & 0x40) != 0 ? px : 7 - px; if ((((slo >> spBit) & 1) | ((shi >> spBit) & 1)) == 0) continue;");
+            sb.AppendLine("        // Left-edge clipping applies to sprite-0 as well: with bit 2 clear the");
+            sb.AppendLine("        // leftmost 8 pixels show the backdrop only, so no hit can occur there.");
+            sb.AppendLine("        if ((Mask & 0x04) == 0 && sx + px < 8) continue;");
             sb.AppendLine("        int wx = sx + px + ScrollX0, nt = (BaseNt0 ^ ((ntY << 1) | ((wx >> 8) & 1))) & 3;");
             sb.AppendLine("        int ntBase = 0x2000 + MirrorTableLive(nt) * 0x400, cx = (wx >> 3) & 0x1F;");
             sb.AppendLine("        int bgTile = VRam[ntBase + cy * 32 + cx], bit = 7 - (wx & 7), bp = ((Ctrl & 0x10) != 0 ? 0x1000 : 0) + bgTile * 16 + fy;");
@@ -1119,6 +1163,23 @@ namespace NesLifter.Lifting
             sb.AppendLine("        if ((((blo >> bit) & 1) | ((bhi >> bit) & 1)) != 0) return true;");
             sb.AppendLine("    }");
             sb.AppendLine("    return false;");
+            sb.AppendLine("}");
+            sb.AppendLine();
+            sb.AppendLine("/// <summary>");
+            sb.AppendLine("/// Sets the sprite-overflow flag when more than eight sprites land on one");
+            sb.AppendLine("/// scanline. The flag is sticky until $2002 is read, exactly like hardware;");
+            sb.AppendLine("/// the hardware bug of reporting sprite 0 is not reproduced.");
+            sb.AppendLine("/// </summary>");
+            sb.AppendLine("static void EvaluateSpriteOverflow(int scanline)");
+            sb.AppendLine("{");
+            sb.AppendLine("    int height = (Ctrl & 0x20) != 0 ? 16 : 8;");
+            sb.AppendLine("    int found = 0;");
+            sb.AppendLine("    for (int i = 0; i < 64; i++)");
+            sb.AppendLine("    {");
+            sb.AppendLine("        int sy = Oam[i * 4] + 1;");
+            sb.AppendLine("        if (scanline < sy || scanline >= sy + height) continue;");
+            sb.AppendLine("        if (++found > 8) { Status = (byte)(Status | 0x20); return; }");
+            sb.AppendLine("    }");
             sb.AppendLine("}");
             sb.AppendLine();
             sb.AppendLine("public static void BeginFrame()");
@@ -1169,8 +1230,8 @@ namespace NesLifter.Lifting
             sb.AppendLine("        return addr;");
             sb.AppendLine("    }");
             sb.AppendLine();
-            sb.AppendLine("    static byte ReadVram(ushort addr) { addr = NormalizeVram(addr); if (addr >= 0x3F00) return Palette[(addr - 0x3F00) & 0x1F]; return VRam[addr]; }");
-            sb.AppendLine("    static void WriteVram(ushort addr, byte value) { addr = NormalizeVram(addr); if (addr >= 0x3F00) Palette[(addr - 0x3F00) & 0x1F] = value; else VRam[addr] = value; }");
+            sb.AppendLine("    static byte ReadVram(ushort addr) { if (addr < 0x2000) return MapperStub.ReadChrByte(addr); addr = NormalizeVram(addr); if (addr >= 0x3F00) return Palette[(addr - 0x3F00) & 0x1F]; return VRam[addr]; }");
+            sb.AppendLine("    static void WriteVram(ushort addr, byte value) { if (addr < 0x2000) { MapperStub.WriteChrByte(addr, value); return; } addr = NormalizeVram(addr); if (addr >= 0x3F00) Palette[(addr - 0x3F00) & 0x1F] = value; else VRam[addr] = value; }");
             sb.AppendLine();
 
             // === Rendering ===
@@ -1192,6 +1253,7 @@ namespace NesLifter.Lifting
             sb.AppendLine("    bool bigSpr = (renderCtrl & 0x20) != 0;");
             sb.AppendLine("    if (showBG)");
             sb.AppendLine("    {");
+            sb.AppendLine("        bool clipLeftBg = (renderMask & 0x02) == 0;");
             sb.AppendLine("        for (int y = 0; y < 240; y++)");
             sb.AppendLine("            {");
             sb.AppendLine("                int sx = state.LineScrollX[y], sy = state.LineScrollY[y], bnt = state.LineBaseNt[y];");
@@ -1202,6 +1264,7 @@ namespace NesLifter.Lifting
             sb.AppendLine("                int rowOff = y * 256;");
             sb.AppendLine("                for (int x = 0; x < 256; x++)");
             sb.AppendLine("                {");
+            sb.AppendLine("                    if (clipLeftBg && x < 8) continue;");
             sb.AppendLine("                    int tx = x + sx;");
             sb.AppendLine("                    int nt = (bnt ^ ((ntY << 1) | ((tx >> 8) & 1))) & 3;");
             sb.AppendLine("                    int ntBase = 0x2000 + mt[nt] * 0x400;");
@@ -1210,6 +1273,8 @@ namespace NesLifter.Lifting
             sb.AppendLine("                    int attr = renderVRam[ntBase + 0x3C0 + (cy >> 2) * 8 + (cx >> 2)];");
             sb.AppendLine("                    int pal = (attr >> (((cy & 2) << 1) | (cx & 2))) & 3;");
             sb.AppendLine("                    int paddr = patternBase + tile * 16 + fy;");
+            sb.AppendLine("                    // MMC2 latches its CHR banks from the tiles fetched here.");
+            sb.AppendLine("                    if (MapperStub.HasChrLatch) MapperStub.LatchChr(paddr, tile);");
             sb.AppendLine("                    byte low = MapperStub.ReadChrByte(paddr);");
             sb.AppendLine("                    byte high = MapperStub.ReadChrByte(paddr + 8);");
             sb.AppendLine("                    int bit = 7 - (tx & 7);");
@@ -1227,7 +1292,9 @@ namespace NesLifter.Lifting
             sb.AppendLine("    }");
             sb.AppendLine("    if (showSpr)");
             sb.AppendLine("    {");
-            sb.AppendLine("        for (int i = 63; i >= 0; i--)");
+            sb.AppendLine("        bool clipLeftSpr = (renderMask & 0x04) == 0;");
+            sb.AppendLine("        int[] lineCount = new int[240];");
+            sb.AppendLine("        for (int i = 0; i < 64; i++)");
             sb.AppendLine("        {");
             sb.AppendLine("            int sy2 = renderOam[i * 4] + 1;");
             sb.AppendLine("            int tile = renderOam[i * 4 + 1];");
@@ -1241,10 +1308,28 @@ namespace NesLifter.Lifting
             sb.AppendLine("            int tileIndex = tile;");
             sb.AppendLine("            int patBase = sprPatternBase;");
             sb.AppendLine("            if (bigSpr) { patBase = (tile & 1) != 0 ? 0x1000 : 0x0000; tileIndex = tile & 0xFE; }");
+            sb.AppendLine();
+            sb.AppendLine("            // The PPU evaluates sprites in OAM order and only draws the");
+            sb.AppendLine("            // first eight that intersect a scanline. Lower OAM indices are");
+            sb.AppendLine("            // drawn on top, so this loop walks OAM backwards for painter's");
+            sb.AppendLine("            // algorithm order but counts the budget forwards.");
+            sb.AppendLine("            bool visible = false;");
+            sb.AppendLine("            for (int py = 0; py < height; py++)");
+            sb.AppendLine("            {");
+            sb.AppendLine("                int probe = sy2 + py;");
+            sb.AppendLine("                if ((uint)probe >= 240) continue;");
+            sb.AppendLine("                if (lineCount[probe] >= 8) continue;");
+            sb.AppendLine("                visible = true;");
+            sb.AppendLine("                break;");
+            sb.AppendLine("            }");
+            sb.AppendLine("            if (!visible) continue;");
+            sb.AppendLine();
             sb.AppendLine("            for (int py = 0; py < height; py++)");
             sb.AppendLine("            {");
             sb.AppendLine("                int screenY = sy2 + py;");
             sb.AppendLine("                if ((uint)screenY >= 240) continue;");
+            sb.AppendLine("                if (lineCount[screenY] >= 8) continue;");
+            sb.AppendLine("                lineCount[screenY]++;");
             sb.AppendLine("                int srcY = flipV ? (height - 1 - py) : py;");
             sb.AppendLine("                int t = tileIndex;");
             sb.AppendLine("                int row = srcY;");
@@ -1253,6 +1338,7 @@ namespace NesLifter.Lifting
             sb.AppendLine("                {");
             sb.AppendLine("                    int screenX = sx2 + px;");
             sb.AppendLine("                    if ((uint)screenX >= 256) continue;");
+            sb.AppendLine("                    if (clipLeftSpr && screenX < 8) continue;");
             sb.AppendLine("                    int srcX = flipH ? (7 - px) : px;");
             sb.AppendLine("                    int color = GetPatternPixel(patBase, t, srcX, row);");
             sb.AppendLine("                    if (color == 0) continue;");
@@ -1278,34 +1364,6 @@ namespace NesLifter.Lifting
             sb.AppendLine("        byte g = (byte)((rgb >> 8) & 0xFF);");
             sb.AppendLine("        byte r = (byte)((rgb >> 16) & 0xFF);");
             sb.AppendLine("        for (int i = 0; i < Screen.Length; i += 4) { Screen[i] = b; Screen[i + 1] = g; Screen[i + 2] = r; Screen[i + 3] = 0xFF; }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    static void SetPixel(int x, int y, int colorIndex)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        if ((uint)x >= 256 || (uint)y >= 240) return;");
-            sb.AppendLine("        int rgb = NesPalette[colorIndex & 0x3F];");
-            sb.AppendLine("        int off = (y * 256 + x) * 4;");
-            sb.AppendLine("        Screen[off] = (byte)(rgb & 0xFF);");
-            sb.AppendLine("        Screen[off + 1] = (byte)((rgb >> 8) & 0xFF);");
-            sb.AppendLine("        Screen[off + 2] = (byte)((rgb >> 16) & 0xFF);");
-            sb.AppendLine("        Screen[off + 3] = 0xFF;");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    static int GetAttributePalette(int nameBase, int tileX, int tileY)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        int attrBase = nameBase + 0x3C0;");
-            sb.AppendLine("        int ax = tileX >> 2;");
-            sb.AppendLine("        int ay = tileY >> 2;");
-            sb.AppendLine("        int attr = VRam[attrBase + ay * 8 + ax];");
-            sb.AppendLine("        int shift = ((tileY & 2) << 1) | (tileX & 2);");
-            sb.AppendLine("        return (attr >> shift) & 3;");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    static int GetBackgroundColor(int pal, int color)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        if (color == 0) return Palette[0] & 0x3F;");
-            sb.AppendLine("        int idx = 1 + pal * 4 + (color - 1);");
-            sb.AppendLine("        return Palette[idx & 0x1F] & 0x3F;");
             sb.AppendLine("    }");
             sb.AppendLine();
             sb.AppendLine("static int GetPatternPixel(int patternBase, int tile, int px, int py)");
@@ -1346,8 +1404,7 @@ namespace NesLifter.Lifting
             sb.AppendLine("    EnvStart1 = EnvStart2 = EnvStartN = false;");
             sb.AppendLine("    Array.Clear(Regs, 0, Regs.Length);");
             sb.AppendLine("    Period1 = Period2 = PeriodT = 0; Len1 = Len2 = LenT = LenN = 0; LinT = 0; LinReload = false; _lenDiv = 0; _frameCycleAcc = 0;");
-            sb.AppendLine("    Audio.TryStart();");
-            sb.AppendLine("}");
+            sb.AppendLine("    if (!Runtime.Headless) Audio.TryStart();");            sb.AppendLine("}");
             sb.AppendLine("public static byte ReadReg(ushort addr)");
             sb.AppendLine("{");
             sb.AppendLine("    if (addr == 0x4016) return Runtime.JoyRead1();");
@@ -1571,243 +1628,7 @@ namespace NesLifter.Lifting
 
         private void AppendMapper(StringBuilder sb)
         {
-            sb.AppendLine("static class MapperStub");
-            sb.AppendLine("{");
-            sb.AppendLine("    public static byte[][] PrgPageMem = new byte[32][];");
-            sb.AppendLine("    public static int[] PrgPageBase = new int[32];");
-            sb.AppendLine("    public static bool[] PrgPageIsRam = new bool[32];");
-            sb.AppendLine("    public static byte[][] ChrPageMem = new byte[8][];");
-            sb.AppendLine("    public static int[] ChrPageBase = new int[8];");
-            sb.AppendLine("    public static bool[] ChrPageIsRam = new bool[8];");
-            sb.AppendLine();
-            sb.AppendLine("    // === MMC1 state ===");
-            sb.AppendLine("    static int _shift, _count, _ctrl, _chr0, _chr1, _prg;");
-            sb.AppendLine();
-            sb.AppendLine("    // === MMC3 state ===");
-            sb.AppendLine("    static int _cmd;");
-            sb.AppendLine("    static int[] _r = new int[8];");
-            sb.AppendLine("    static int _irqLatch, _irqCount;");
-            sb.AppendLine("    static bool _irqEnabled;");
-            sb.AppendLine();
-            sb.AppendLine("    public static void Reset()");
-            sb.AppendLine("    {");
-            sb.AppendLine("        for (int i = 0; i < 32; i++) { PrgPageMem[i] = null; PrgPageBase[i] = 0; PrgPageIsRam[i] = false; }");
-            sb.AppendLine("        for (int i = 0; i < 8; i++) { ChrPageMem[i] = null; ChrPageBase[i] = 0; ChrPageIsRam[i] = false; }");
-            sb.AppendLine("        _shift = 0; _count = 0; _ctrl = 0x0C; _chr0 = 0; _chr1 = 0; _prg = 0;");
-            sb.AppendLine("        _cmd = 0; for (int i = 0; i < 8; i++) _r[i] = 0;");
-            sb.AppendLine("        _irqLatch = 0; _irqCount = 0; _irqEnabled = false;");
-            sb.AppendLine("        Power();");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    static int PrgBanks() { int b = Runtime.PrgRom.Length / 0x4000; return b < 1 ? 1 : b; }");
-            sb.AppendLine("    static int PrgBanks8() { int b = Runtime.PrgRom.Length / 0x2000; return b < 1 ? 1 : b; }");
-            sb.AppendLine("    static byte[] ChrMem() { return Runtime.ChrRom.Length > 0 ? Runtime.ChrRom : Ppu.VRam; }");
-            sb.AppendLine("    static int ChrBanks1() { int b = ChrMem().Length / 0x400; return b < 1 ? 1 : b; }");
-            sb.AppendLine("    static int ChrBanks2() { int b = ChrMem().Length / 0x800; return b < 1 ? 1 : b; }");
-            sb.AppendLine("    static int ChrBanks4() { int b = ChrMem().Length / 0x1000; return b < 1 ? 1 : b; }");
-            sb.AppendLine("    static int ChrBanks8() { int b = ChrMem().Length / 0x2000; return b < 1 ? 1 : b; }");
-            sb.AppendLine();
-            sb.AppendLine("    public static void Power()");
-            sb.AppendLine("    {");
-            sb.AppendLine("        if (Runtime.Mapper == 1) { Mmc1Sync(); return; }");
-            sb.AppendLine("        if (Runtime.Mapper == 4) { Mmc3Sync(); return; }");
-            sb.AppendLine("        if (Runtime.Mapper == 0)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            int len = Runtime.PrgRom.Length;");
-            sb.AppendLine("            if (len <= 0x4000) { SetPrg16(0x8000, 0); SetPrg16(0xC000, 0); }");
-            sb.AppendLine("            else { SetPrg32(0x8000, 0); }");
-            sb.AppendLine("            SetChr8(0);");
-            sb.AppendLine("            return;");
-            sb.AppendLine("        }");
-            sb.AppendLine("        if (Runtime.Mapper == 2)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            SetPrg16(0x8000, 0);");
-            sb.AppendLine("            SetPrg16(0xC000, PrgBanks() - 1);");
-            sb.AppendLine("            SetChr8(0);");
-            sb.AppendLine("            return;");
-            sb.AppendLine("        }");
-            sb.AppendLine("        if (Runtime.Mapper == 3)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            SetPrg32(0x8000, 0);");
-            sb.AppendLine("            SetChr8(0);");
-            sb.AppendLine("            return;");
-            sb.AppendLine("        }");
-            sb.AppendLine("        int basePage = (Runtime.PrgRom.Length - 0x8000) / 0x800;");
-            sb.AppendLine("        if (basePage < 0) basePage = 0;");
-            sb.AppendLine("        for (int i = 0; i < 32; i++)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            PrgPageMem[i] = Runtime.PrgRom;");
-            sb.AppendLine("            PrgPageBase[i] = (basePage + i) * 0x800 - (0x8000 + i * 0x800);");
-            sb.AppendLine("        }");
-            sb.AppendLine("        SetChr8(0);");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    // === PRG setters ===");
-            sb.AppendLine("    public static void SetPrg8(ushort addr, int bank)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        int banks = PrgBanks8(); bank %= banks; if (bank < 0) bank += banks;");
-            sb.AppendLine("        int page = (addr >> 11) & 31;");
-            sb.AppendLine("        int baseOff = bank * 0x2000 - addr;");
-            sb.AppendLine("        for (int i = 0; i < 4; i++) { int p = page + i; if (p < 32) { PrgPageMem[p] = Runtime.PrgRom; PrgPageBase[p] = baseOff; PrgPageIsRam[p] = false; } }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static void SetPrg16(ushort addr, int bank)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        int banks = PrgBanks(); bank %= banks; if (bank < 0) bank += banks;");
-            sb.AppendLine("        int page = (addr >> 11) & 31;");
-            sb.AppendLine("        int baseOff = bank * 0x4000 - addr;");
-            sb.AppendLine("        for (int i = 0; i < 8; i++) { int p = page + i; if (p < 32) { PrgPageMem[p] = Runtime.PrgRom; PrgPageBase[p] = baseOff; PrgPageIsRam[p] = false; } }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static void SetPrg32(ushort addr, int bank)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        int banks = PrgBanks(); bank %= banks; if (bank < 0) bank += banks;");
-            sb.AppendLine("        int page = (addr >> 11) & 31;");
-            sb.AppendLine("        int baseOff = bank * 0x8000 - addr;");
-            sb.AppendLine("        for (int i = 0; i < 16; i++) { int p = page + i; if (p < 32) { PrgPageMem[p] = Runtime.PrgRom; PrgPageBase[p] = baseOff; PrgPageIsRam[p] = false; } }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    // === CHR setters ===");
-            sb.AppendLine("    public static void SetChr1(ushort addr, int bank)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        byte[] mem = ChrMem(); int banks = ChrBanks1(); bank %= banks; if (bank < 0) bank += banks;");
-            sb.AppendLine("        int page = (addr >> 10) & 7;");
-            sb.AppendLine("        ChrPageMem[page] = mem; ChrPageBase[page] = bank * 0x400 - addr; ChrPageIsRam[page] = (mem == Ppu.VRam);");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static void SetChr2(ushort addr, int bank)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        byte[] mem = ChrMem(); int banks = ChrBanks2(); bank %= banks; if (bank < 0) bank += banks;");
-            sb.AppendLine("        int page = (addr >> 10) & 7;");
-            sb.AppendLine("        int baseOff = bank * 0x800 - addr;");
-            sb.AppendLine("        for (int i = 0; i < 2; i++) { int p = page + i; if (p < 8) { ChrPageMem[p] = mem; ChrPageBase[p] = baseOff; ChrPageIsRam[p] = (mem == Ppu.VRam); } }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static void SetChr4(ushort addr, int bank)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        byte[] mem = ChrMem(); int banks = ChrBanks4(); bank %= banks; if (bank < 0) bank += banks;");
-            sb.AppendLine("        int page = (addr >> 10) & 7;");
-            sb.AppendLine("        int baseOff = bank * 0x1000 - addr;");
-            sb.AppendLine("        for (int i = 0; i < 4; i++) { int p = page + i; if (p < 8) { ChrPageMem[p] = mem; ChrPageBase[p] = baseOff; ChrPageIsRam[p] = (mem == Ppu.VRam); } }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static void SetChr8(int bank)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        byte[] mem = ChrMem(); int banks = ChrBanks8(); bank %= banks; if (bank < 0) bank += banks;");
-            sb.AppendLine("        for (int i = 0; i < 8; i++) { ChrPageMem[i] = mem; ChrPageBase[i] = bank * 0x2000; ChrPageIsRam[i] = (mem == Ppu.VRam); }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static byte ReadChrByte(int addr)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        int page = (addr >> 10) & 7;");
-            sb.AppendLine("        byte[] mem = ChrPageMem[page];");
-            sb.AppendLine("        if (mem == null) return 0;");
-            sb.AppendLine("        int off = ChrPageBase[page] + addr;");
-            sb.AppendLine("        if (off < 0 || off >= mem.Length) return 0;");
-            sb.AppendLine("        return mem[off];");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static byte Read(ushort addr) { return 0x40; }");
-            sb.AppendLine();
-            sb.AppendLine("    public static byte ReadWram(ushort addr)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        if (addr < 0x6000 || addr >= 0x8000) return 0;");
-            sb.AppendLine("        if (Runtime.Mapper == 1 && (_prg & 0x10) != 0) return (byte)(addr >> 8);");
-            sb.AppendLine("        return Runtime.SaveRam[addr - 0x6000];");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static void WriteWram(ushort addr, byte value)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        if (addr < 0x6000 || addr >= 0x8000) return;");
-            sb.AppendLine("        if (Runtime.Mapper == 1 && (_prg & 0x10) != 0) return;");
-            sb.AppendLine("        Runtime.SaveRam[addr - 0x6000] = value;");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static void Write(ushort addr, byte value)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        if (Runtime.Mapper == 1) { Mmc1Write(addr, value); return; }");
-            sb.AppendLine("        if (Runtime.Mapper == 2) { SetPrg16(0x8000, value & 0x0F); return; }");
-            sb.AppendLine("        if (Runtime.Mapper == 3) { SetChr8(value); return; }");
-            sb.AppendLine("        if (Runtime.Mapper == 4) { Mmc3Write(addr, value); return; }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    // === MMC1 ===");
-            sb.AppendLine("    static void Mmc1Write(ushort addr, byte value)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        if ((value & 0x80) != 0) { _shift = 0; _count = 0; _ctrl |= 0x0C; Mmc1Sync(); return; }");
-            sb.AppendLine("        _shift = (_shift >> 1) | ((value & 1) << 4);");
-            sb.AppendLine("        _count++;");
-            sb.AppendLine("        if (_count < 5) return;");
-            sb.AppendLine("        int v = _shift & 0x1F; _shift = 0; _count = 0;");
-            sb.AppendLine("        if (addr <= 0x9FFF) _ctrl = v;");
-            sb.AppendLine("        else if (addr <= 0xBFFF) _chr0 = v;");
-            sb.AppendLine("        else if (addr <= 0xDFFF) _chr1 = v;");
-            sb.AppendLine("        else _prg = v;");
-            sb.AppendLine("        Mmc1Sync();");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    static void Mmc1Sync()");
-            sb.AppendLine("    {");
-            sb.AppendLine("        switch (_ctrl & 3) { case 0: Runtime.Mirroring = 3; break; case 1: Runtime.Mirroring = 4; break; case 2: Runtime.Mirroring = 1; break; default: Runtime.Mirroring = 0; break; }");
-            sb.AppendLine("        int mode = (_ctrl >> 2) & 3;");
-            sb.AppendLine("        int outer = _chr0 & 0x10;");
-            sb.AppendLine("        int prg = (_prg & 0x0F) + outer;");
-            sb.AppendLine("        if (mode <= 1) { int b0 = (_prg & 0x0E) + outer; SetPrg16(0x8000, b0); SetPrg16(0xC000, b0 + 1); }");
-            sb.AppendLine("        else if (mode == 2) { SetPrg16(0x8000, outer); SetPrg16(0xC000, prg); }");
-            sb.AppendLine("        else { SetPrg16(0x8000, prg); SetPrg16(0xC000, 0x0F + outer); }");
-            sb.AppendLine("        if ((_ctrl & 0x10) == 0) SetChr8(_chr0 >> 1);");
-            sb.AppendLine("        else { SetChr4(0x0000, _chr0); SetChr4(0x1000, _chr1); }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    // === MMC3 ===");
-            sb.AppendLine("    static void Mmc3Write(ushort addr, byte value)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        switch (addr & 0xE001)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            case 0x8000: _cmd = value; Mmc3Sync(); break;");
-            sb.AppendLine("            case 0x8001: _r[_cmd & 7] = value; Mmc3Sync(); break;");
-            sb.AppendLine("            case 0xA000: Runtime.Mirroring = (value & 1) == 0 ? 1 : 0; break;");
-            sb.AppendLine("            case 0xA001: break;");
-            sb.AppendLine("            case 0xC000: _irqLatch = value; break;");
-            sb.AppendLine("            case 0xC001: _irqCount = 0; break;");
-            sb.AppendLine("            case 0xE000: _irqEnabled = false; Runtime.IrqPending = false; break;");
-            sb.AppendLine("            case 0xE001: _irqEnabled = true; break;");
-            sb.AppendLine("        }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    static void Mmc3Sync()");
-            sb.AppendLine("    {");
-            sb.AppendLine("        int banks8 = PrgBanks8();");
-            sb.AppendLine("        int last = banks8 - 1;");
-            sb.AppendLine("        int slast = banks8 - 2; if (slast < 0) slast = 0;");
-            sb.AppendLine("        if ((_cmd & 0x40) == 0) { SetPrg8(0x8000, _r[6]); SetPrg8(0xA000, _r[7]); SetPrg8(0xC000, slast); }");
-            sb.AppendLine("        else { SetPrg8(0x8000, slast); SetPrg8(0xA000, _r[7]); SetPrg8(0xC000, _r[6]); }");
-            sb.AppendLine("        SetPrg8(0xE000, last);");
-            sb.AppendLine("        bool inv = (_cmd & 0x80) != 0;");
-            sb.AppendLine("        if (!inv)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            SetChr2(0x0000, _r[0] >> 1); SetChr2(0x0800, _r[1] >> 1);");
-            sb.AppendLine("            SetChr1(0x1000, _r[2]); SetChr1(0x1400, _r[3]); SetChr1(0x1800, _r[4]); SetChr1(0x1C00, _r[5]);");
-            sb.AppendLine("        }");
-            sb.AppendLine("        else");
-            sb.AppendLine("        {");
-            sb.AppendLine("            SetChr2(0x1000, _r[0] >> 1); SetChr2(0x1800, _r[1] >> 1);");
-            sb.AppendLine("            SetChr1(0x0000, _r[2]); SetChr1(0x0400, _r[3]); SetChr1(0x0800, _r[4]); SetChr1(0x0C00, _r[5]);");
-            sb.AppendLine("        }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static void ClockScanline()");
-            sb.AppendLine("    {");
-            sb.AppendLine("        if (Runtime.Mapper != 4) return;");
-            sb.AppendLine("        if (_irqCount == 0) _irqCount = _irqLatch;");
-            sb.AppendLine("        else");
-            sb.AppendLine("        {");
-            sb.AppendLine("            _irqCount--;");
-            sb.AppendLine("            if (_irqCount == 0 && _irqEnabled) Runtime.IrqPending = true;");
-            sb.AppendLine("        }");
-            sb.AppendLine("    }");
-            sb.AppendLine("}");
-            sb.AppendLine();
+            sb.Append(_mapper.Emit());
         }
 
         private void AppendForm(StringBuilder sb)
@@ -1995,7 +1816,7 @@ namespace NesLifter.Lifting
 
         private void EmitBranch(StringBuilder sb, Instruction inst)
         {
-            string cond = GetBranchCondition(inst.Info.Mn);
+            string cond = GetBranchCondition(inst.Info?.Mn ?? "???");
             Line(sb, "if (" + cond + ")");
             Line(sb, "{");
             if (_labels.ContainsKey(inst.Target))
@@ -2227,7 +2048,7 @@ namespace NesLifter.Lifting
 
         private string GetReadExpr(Instruction inst)
         {
-            switch (inst.Info.Mode)
+            switch (inst.Info?.Mode)
             {
                 case AddrMode.Imm: return "0x" + inst.Operand.ToString("X2");
                 case AddrMode.Acc: return "Runtime.A";
@@ -2241,7 +2062,7 @@ namespace NesLifter.Lifting
             string op2 = inst.Operand.ToString("X2");
             string op4 = inst.Operand.ToString("X4");
 
-            switch (inst.Info.Mode)
+            switch (inst.Info?.Mode)
             {
                 case AddrMode.Zp: return "0x" + op2;
                 case AddrMode.ZpX: return "(ushort)((0x" + op2 + " + Runtime.X) & 0xFF)";
@@ -2336,6 +2157,46 @@ namespace NesLifter.Lifting
                 case "KIL": return 67;
                 default: return 0;
             }
+        }
+
+        /// <summary>
+        /// Size of the cartridge WRAM window, in bytes.
+        /// iNES 2.0 headers carry the real size; iNES 1.0 headers do not, so
+        /// the mapper's conventional size is used.
+        /// </summary>
+        private int ResolveWramSize(CartInfo cart)
+        {
+            int declared = cart.PrgRamSize + cart.PrgRamSaveSize;
+
+            if (declared > 0)
+                return RoundUpPow2(declared, 0x2000);
+
+            int conventional = _mapperDescriptor.DefaultPrgRam;
+
+            return conventional > 0 ? conventional : 0x2000;
+        }
+
+        /// <summary>
+        /// Size of the CHR RAM buffer for CHR-RAM cartridges.
+        /// </summary>
+        private static int ResolveChrRamSize(CartInfo cart)
+        {
+            int declared = cart.ChrRamSize + cart.ChrRamSaveSize;
+
+            if (declared > 0)
+                return RoundUpPow2(declared, 0x2000);
+
+            return 0x2000;
+        }
+
+        private static int RoundUpPow2(int value, int minimum)
+        {
+            int size = minimum;
+
+            while (size < value)
+                size <<= 1;
+
+            return size;
         }
 
         private void AppendByteArrayField(StringBuilder sb, string name, byte[] data)

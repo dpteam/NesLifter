@@ -7,12 +7,12 @@ namespace NesLifter.Core
     {
         public ushort Address;
         public byte Opcode;
-        public OpInfo Info;
+        public OpInfo? Info;
 
         public int Length;
         public ushort Operand;
 
-        public string Text;
+        public string Text = string.Empty;
         public OpControl Control;
 
         public ushort Target;
@@ -39,18 +39,28 @@ namespace NesLifter.Core
     public sealed class Disassembler
     {
         private readonly NesRom _rom;
+        private readonly ProgramImage _image;
 
         private readonly Queue<ushort> _queue = new Queue<ushort>();
         private readonly Dictionary<ushort, bool> _seen = new Dictionary<ushort, bool>();
 
-        private AnalysisResult _result;
+        private AnalysisResult _result = new AnalysisResult();
 
         public List<ushort> ForcedAddresses = new List<ushort>();
 
         public Disassembler(NesRom rom)
+            : this(rom, ProgramImage.Create(rom, null))
         {
-            _rom = rom;
         }
+
+        public Disassembler(NesRom rom, ProgramImage image)
+        {
+            _rom = rom ?? throw new ArgumentNullException(nameof(rom));
+            _image = image ?? throw new ArgumentNullException(nameof(image));
+        }
+
+        /// <summary>Power-on address space used for decoding.</summary>
+        public ProgramImage Image => _image;
 
         public AnalysisResult Analyze()
         {
@@ -70,7 +80,6 @@ namespace NesLifter.Core
             }
 
             _result.Entry = reset;
-
             if (IsValid(reset))
             {
                 Enqueue(reset);
@@ -111,7 +120,7 @@ namespace NesLifter.Core
                 if (_result.Instructions.ContainsKey(addr))
                     continue;
 
-                int offset = _rom.AddrToOffset(addr);
+                int offset = _image.ToOffset(addr);
                 if (offset < 0)
                     continue;
 
@@ -194,7 +203,7 @@ namespace NesLifter.Core
             if (addr >= 0xFFFA)
                 return false;
 
-            return _rom.AddrToOffset(addr) >= 0;
+            return _image.ToOffset(addr) >= 0;
         }
 
         private void Enqueue(ushort addr)
@@ -308,7 +317,7 @@ namespace NesLifter.Core
 
                 case OpControl.JmpInd:
                     {
-                        int ptrOff = _rom.AddrToOffset(inst.Operand);
+                        int ptrOff = _image.ToOffset(inst.Operand);
 
                         if (ptrOff >= 0 && ptrOff + 1 < prg.Length)
                         {

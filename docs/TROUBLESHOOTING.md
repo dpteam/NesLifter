@@ -1,0 +1,190 @@
+# Troubleshooting
+
+Start with `analysis.txt` in the output folder. It tells you which mapper was
+detected, whether that mapper is implemented, and how much of PRG was reached.
+
+---
+
+## The lift itself fails
+
+### `Missing iNES signature (NES\x1A)`
+
+The file is not an iNES image. `.unf`, `.unif` and raw `.bin` dumps are not
+supported; convert them first.
+
+### `Header reports zero PRG ROM size`
+
+A corrupt header. Some dumps store the PRG size in the wrong nibble. Try another
+dump of the same cartridge.
+
+### `Mapper N is not implemented`
+
+Expected. The report will say `Mapper support : fallback (flat PRG layout)` and
+the game may still run if the mapper only banks CHR. See
+[`MAPPERS.md`](MAPPERS.md) for the supported list.
+
+### `Roslyn compilation failed`
+
+Run with `--verbose`; the diagnostics include the file, line and column inside
+`Game.generated.cs`. Keep the generated source (`--keep-source`, the default) and
+open it — a compile error means the lifter emitted invalid code, which is a bug
+worth reporting.
+
+### `Previous build is in use; writing a hot-reload build`
+
+The previous game is still running and Windows has the DLL locked. The new build
+is written as `<name>.rebuild-<timestamp>.dll`. Close the game and re-run if you
+want the canonical filename.
+
+---
+
+## The game starts but the screen is black
+
+### Check `analysis.txt` first
+
+```
+Instructions  : 0
+```
+
+means the analyser found no code at all. Almost always this is a vector problem:
+the RESET vector points outside PRG, or the mapper maps the vector bank
+elsewhere. Try forcing the entry point:
+
+```
+# dynamic_targets.txt
+8000
+```
+
+### Check `runtime.log`
+
+The generated game writes `runtime.log` next to the DLL:
+
+```
+2026-11-15 12:04:31.118 [session] === game started; mapper=4; log=... ===
+2026-11-15 12:04:31.120 [reset] CPU reset; entry will be $8000
+2026-11-15 12:04:31.121 [cpu-start] CPU thread started
+2026-11-15 12:04:31.140 [nmi] vblank/frame=1 cycles=27394 pc=$8123
+```
+
+If `[nmi]` never appears, the CPU never reached the VBlank wait — look at the
+last `PC=` value.
+
+### Run headless for a clean signal
+
+```powershell
+dotnet game.dll --headless 600
+```
+
+Exit codes: `0` reached the frame budget, `2` ran but fell short (usually a
+trap), `3` trapped. The trap message names the address.
+
+---
+
+## Graphics are wrong
+
+### Wrong colours / wrong palette
+
+Check `Mirroring` in `analysis.txt`. Single-screen mirroring (AxROM, MMC1
+one-screen modes) is the usual culprit; a mapper that reports the wrong
+mirroring mode will fetch nametables from the wrong table.
+
+### Status bar or HUD jumps
+
+Mid-frame scroll changes are captured per scanline. If a game changes scroll by
+writing `$2006` rather than `$2005`, the split point is estimated from the
+sprite-0 position. Report it with the game name and the expected row.
+
+### Sprites flicker or disappear
+
+The renderer applies the hardware eight-sprites-per-scanline limit and the
+`$2001` left-edge clipping bits. A game that overflows the budget on purpose
+(multiplexing sprites across frames) needs the CPU and renderer to stay in sync;
+if `frames=` in `runtime.log` advances unevenly, the CPU is being throttled.
+
+### CHR tiles are garbage on MMC2 games
+
+CHR latching happens on background pattern fetches. If a game latches from sprite
+fetches instead, tiles will be wrong — this is a known gap (see
+[`MAPPERS.md`](MAPPERS.md#mmc2--9)).
+
+### Banked game shows the wrong code
+
+The analyser decodes through the **power-on** bank layout. Code in a bank that
+is only switched in later runs through the interpreter. It will execute, but
+slowly, and any code the interpreter cannot classify shows up in
+`dynamic_targets.log`. Feed that file back in and re-lift.
+
+---
+
+## The game traps
+
+A trap writes `trap.log` with the last 256 instructions (PC, A, X, Y, SP, P) and
+prints the reason in the window and in `runtime.log`.
+
+| Message | Meaning |
+|---|---|
+| `Unknown opcode $XX at $YYYY` | The byte has no entry in the opcode table. Almost always the analyser decoded data as code. Force the real entry point. |
+| `Missing branch target $YYYY` | A branch leaves the decoded region. Add the target to `dynamic_targets.txt`. |
+| `Dynamic dispatch -> $YYYY` | An indirect jump went somewhere not statically known and the interpreter could not classify it. |
+| `No valid entry/reset vector` | RESET points outside PRG. See above. |
+| `KIL/HLT opcode executed` | The CPU reached a deliberate halt. Usually data, not code. |
+
+The fix loop is always the same:
+
+1. Read the address from `trap.log`.
+2. Add it to `dynamic_targets.txt`.
+3. Re-run the lifter.
+
+---
+
+## Audio
+
+### No sound at all
+
+`winmm` is Windows-only. On other platforms the game runs but is silent. Check
+`runtime.log` for `Audio.TryStop()` — headless mode disables audio deliberately.
+
+### Crackling or stuttering
+
+The mixer runs on its own thread with four 512-sample buffers. If the CPU thread
+cannot keep up (a large game running through the interpreter), buffers starve.
+Confirm with `instructions=` in the headless summary: if the count is far below
+what the frame budget implies, the CPU is the bottleneck.
+
+### Missing instruments
+
+APU sweep and DMC are not implemented, and VRC6 expansion audio is absent. Music
+plays, but those voices are silent. See the roadmap.
+
+---
+
+## Performance
+
+### The generated C# is enormous
+
+Expected for large cartridges: every reachable instruction becomes a labelled
+block, and PRG/CHR are embedded as byte arrays. A 512 KB PRG game produces tens
+of MB of source and a few MB of assembly.
+
+Mitigations today: `--no-source` to skip writing the file. Structural fixes
+(splitting into multiple files, direct-threaded dispatch) are roadmap items.
+
+### The lift takes a long time
+
+The dominant cost is Roslyn compiling a very large single file. `--no-compile`
+generates C# only and returns in seconds; compile it yourself if you want to
+iterate on the source.
+
+---
+
+## Reporting a bug
+
+Include:
+
+1. `analysis.txt`
+2. `runtime.log` (or `trap.log` if it trapped)
+3. the output of `dotnet game.dll --headless 600`
+4. `dotnet --version` and the NesLifter version (`--version`)
+5. the cartridge's mapper number and CRC32 from `analysis.txt`
+
+Do **not** attach the ROM.

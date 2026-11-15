@@ -1,181 +1,276 @@
---- VERY OLD AND UNSUPPORTED README, WAIT FOR NEW! ---
+<div align="center">
 
-<img width="262" height="23" alt="Logo" src="https://github.com/user-attachments/assets/40f14cfd-5272-41e2-8afa-fa3abb38aef1" />
+<img src="assets/logo.svg" alt="NesLifter" width="720">
 
-NES Static Recompiler / Lifter to .NET Assembly (PoC)
+**Static NES → .NET recompiler.** Feed it a `.nes` file, get a runnable .NET game and readable C#.
 
-> ⚠️ **Very experimental.** Exists as a proof of concept. Currently tested only on Super Mario Bros ROM.
+[![CI](https://github.com/dpteam/NesLifter/actions/workflows/ci.yml/badge.svg)](https://github.com/dpteam/NesLifter/actions/workflows/ci.yml)
+[![.NET](https://img.shields.io/badge/.NET-10.0-512BD4?logo=dotnet&logoColor=white)](https://dotnet.microsoft.com/)
+[![Platform](https://img.shields.io/badge/platform-Windows-0078D4)](#requirements)
+[![License](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
+[![Mappers](https://img.shields.io/badge/mappers-25-success)](#supported-mappers)
 
-Example: 
-
-<img width="258" height="267" alt="SMB Game Screenshot" src="https://github.com/user-attachments/assets/1aaafdbc-bc5e-4544-8288-c1725ef5eca5" />
-
----
-
-## What is this?
-
-NES2ILRecomp is a static binary recompiler that lifts NES (6502) ROM images into self-contained .NET executables. Instead of interpreting opcodes at runtime, it disassembles the 6502 machine code, translates each instruction into equivalent C#, and compiles the result into a standalone `Game.exe` via `CSharpCodeProvider`.
-
-The generated executable includes:
-- A fully lifted CPU core (all official + most unofficial 6502 opcodes)
-- A dispatch table for indirect jumps / RTS / RTI / BRK
-- A software interpreter fallback for dynamically-discovered code paths
-- PPU stub with background & sprite rendering (256×240, WinForms)
-- APU stub with square/triangle/noise synthesis (winmm.dll, 22050 Hz 8-bit mono)
-- Memory bus with RAM / SaveRAM / PRG / CHR mapping
-- Keyboard-mapped joystick input
-- Frame throttling (~60 fps)
+</div>
 
 ---
 
-## Pipeline
+## What it does
+
+NesLifter reads an iNES / NES 2.0 image, disassembles the 6502 program, and
+translates every reachable instruction into equivalent C#. The result is
+compiled with Roslyn into a self-contained .NET assembly that renders with
+WinForms and plays through `winmm`.
+
+There is no 6502 interpreter in the hot path: control flow becomes real C#
+`goto` labels, and a dispatch table handles `RTS`/`RTI`/indirect jumps. An
+interpreter fallback still exists, but only for addresses the static analysis
+could not prove reachable — and it reports them back so the next lift can
+inline them.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  1. Parse iNES header (PRG ROM, CHR ROM, mapper, mirroring)     │
-│  2. Disassemble 6502 code (recursive descent from vectors)      │
-│  3. Lift instructions → C# source (goto-based control flow)     │
-│  4. Build dispatch table (JMP indirect / RTS / RTI / BRK)       │
-│  5. Generate Memory Bus, PPU, APU, Mapper stubs, WinForms UI    │
-│  6. Compile generated C# → Game.exe (CSharpCodeProvider)        │
-└─────────────────────────────────────────────────────────────────┘
+   game.nes
+      │
+      ├─ iNES / NES 2.0 header ──────────► mapper, mirroring, RAM sizes, CRC32
+      │
+      ├─ Board.Power() ──────────────────► power-on bank layout
+      │
+      ├─ recursive-descent 6502 analyser ► instructions, labels, functions
+      │                                    (decoding through the real bank map)
+      │
+      ├─ Lifter ─────────────────────────► C# : CPU, PPU, APU, mapper, WinForms
+      │
+      └─ Roslyn (embedded PDB) ──────────► game.dll + game.runtimeconfig.json
 ```
 
----
+## Quick start
+
+```powershell
+git clone https://github.com/dpteam/NesLifter.git
+cd NesLifter
+dotnet build
+
+# Prove the whole toolchain works. No ROM needed.
+dotnet run -- --selftest
+
+# Lift a real cartridge.
+dotnet run -- "Super Mario Bros. (World).nes"
+
+# Play the result.
+dotnet "nes_lifted_output\Super Mario Bros. (World)\Super Mario Bros. (World).dll"
+```
+
+`--selftest` builds synthetic cartridges for sixteen mapper families, lifts
+them, compiles them, then executes each generated assembly headlessly and
+checks it reaches a frame budget without trapping:
+
+```
+  PASS  nrom-32k              mapper 0    -> headless: frames=28 instructions=187527
+  PASS  mmc1-256k-chrram      mapper 1    -> headless: frames=23 instructions=154991
+  PASS  mmc3-256k-chr         mapper 4    -> headless: frames=24 instructions=164331
+  PASS  vrc6-128k-chr         mapper 24   -> headless: frames=15 instructions=103877
+  ...
+Self-test passed: 16/16 cartridges lifted and executed.
+```
 
 ## Requirements
 
-- **.NET Framework 2.0 – 4.8** (Windows)
-- No third-party dependencies
-- Single-file build (`Program.cs`)
+| | |
+|---|---|
+| OS | Windows 10 / 11 (the generated game uses WinForms and `winmm`) |
+| SDK | .NET 10 SDK |
+| Runtime | .NET 10 Desktop Runtime (to *run* a generated game) |
 
----
+No third-party native dependencies. The only NuGet package is
+`Microsoft.CodeAnalysis.CSharp`, used for compilation.
 
-## Usage
-
-```
-NesLifter.exe --input <rom.nes|folder> --output <dir> [options]
-```
-
-### Options
-
-| Flag | Description |
-|------|-------------|
-| `-i, --input <path>` | Input `.nes` file or folder with ROMs |
-| `-o, --output <dir>` | Output directory (default: `nes_lifted_output`) |
-| `-r, --recursive` | Recursively process subdirectories |
-| `--no-tray` | Do not create a system tray icon |
-| `--wait` | Stay in tray / wait after completion |
-| `--fresh` | Ignore saved state (start from scratch) |
-| `--no-compile` | Only generate C# source, skip EXE compilation |
-| `--no-source` | Do not save intermediate C# (not recommended) |
-| `--keep-source` | Save intermediate C# (default) |
-| `--checkpoint <min>` | Auto-save interval in minutes (default: 10) |
-| `-h, --help` | Show help |
-
-### Examples
-
-```bash
-# Single ROM
-NesLifter.exe game.nes
-
-# Folder, recursive, stay in tray when done
-NesLifter.exe --input C:\roms --output C:\lifted -r --wait
-
-# Generate source only, checkpoint every 5 minutes
-NesLifter.exe --input C:\roms -r --no-compile --checkpoint 5
-```
-
-### Interactive mode (TUI)
-
-If launched without arguments in an interactive console, a text-based menu appears:
+## Command line
 
 ```
-NES Static Recompiler -- TUI
-> Specify ROM or folder path
-  Recursive folder processing: off
-  Start recompilation
-  Exit
+NesLifter <rom.nes|folder> [options]
+NesLifter --selftest [options]
 ```
 
----
+| Option | Description |
+|---|---|
+| `-i, --input <path>` | Input `.nes` file or folder |
+| `-o, --output <dir>` | Output directory (default `nes_lifted_output`) |
+| `-r, --recursive` | Recurse into sub-folders |
+| `--no-compile` | Generate C# only, skip Roslyn |
+| `--no-source` | Do not keep the generated C# |
+| `--keep-source` | Keep the generated C# (default) |
+| `-v, --verbose` | Verbose pipeline output, PDB paths, diagnostics |
+| `--selftest` | Lift + compile + execute synthetic ROMs for every mapper |
+| `--frames <n>` | Frame budget for `--selftest` execution (default 30) |
+| `--no-run` | Compile but do not execute during `--selftest` |
+| `--keep` | Keep `--selftest` artifacts |
+| `--version` | Version and supported mapper list |
+| `-h, --help` | Help |
 
-## Output Structure
+Generated games accept one flag of their own:
+
+```powershell
+dotnet game.dll                     # windowed
+dotnet game.dll --headless 600      # 600 frames, no window, exit code 0 on success
+```
+
+## Output layout
 
 ```
 nes_lifted_output/
-├── .neslifter.state.xml        # Resume state (processed files)
-├── neslifter.config.ini        # Auto-created config reference
-└── <RomName>/
-    ├── <RomName>.exe           # Compiled lifted game
-    ├── dynamic_targets.txt     # Manual forced disassembly addresses
-    ├── dynamic_targets.log     # Runtime-discovered jump targets
+└── Super Mario Bros. (World)/
+    ├── Super Mario Bros. (World).dll             # the lifted game
+    ├── Super Mario Bros. (World).pdb             # embedded-symbol PDB
+    ├── Super Mario Bros. (World).runtimeconfig.json
+    ├── analysis.txt                              # mapper, vectors, coverage
+    ├── dynamic_targets.txt                       # manually forced addresses
+    ├── dynamic_targets.log                       # runtime-discovered addresses
     └── src/
-        └── Game.generated.cs   # Intermediate C# source
+        └── Game.generated.cs                     # the generated C#
 ```
 
----
+`analysis.txt` is the first place to look when a game misbehaves:
 
-## Dynamic Targets
+```
+[Cartridge]
+Mapper         : 4 (MMC3)
+Mapper support : full
+Board summary  : 8 KB PRG / 1-2 KB CHR banking, scanline IRQ, 4 mirroring modes.
+Mirroring      : vertical
+[Analysis]
+Entry         : 0x8000
+Instructions  : 18142
+Code bytes    : 61204 (74.7% of PRG)
+Unknown ops   : 0
+Indirect jumps: 37
+```
 
-The lifter uses recursive-descent disassembly from the RESET / NMI / IRQ vectors. Code reachable only through computed jumps (e.g. `JMP ($0006)`) may be missed statically.
+## Supported mappers
 
-To handle this:
+Analysis and runtime emission are generated from the same descriptor, so a
+mapper cannot be half-supported.
 
-1. **`dynamic_targets.txt`** — add hex addresses (one per line) to force disassembly:
+| # | Board | Notes |
+|---|---|---|
+| 0 | NROM | fixed 16/32 KB PRG |
+| 1 | MMC1 | serial shift register, 4 mirroring modes, WRAM disable |
+| 2 | UxROM | 16 KB switch at `$8000`, last bank fixed |
+| 3 | CNROM | 8 KB CHR banking |
+| 4 | MMC3 | 8 KB PRG, 1/2 KB CHR, scanline IRQ, PRG/CHR swap bits |
+| 7 | AxROM | 32 KB switch, single-screen mirroring |
+| 9 | MMC2 | latch-based CHR switching (Punch-Out!!) |
+| 11 | Color Dreams | PRG + CHR from one register, bus conflicts |
+| 13 | CPROM | 16 KB CHR RAM, 4 KB banking |
+| 21 | VRC4a/c | 8 KB PRG, 1 KB CHR, IRQ |
+| 22 | VRC2a | 16 KB PRG, 2 KB CHR |
+| 23 | VRC4e/f | VRC4 variant |
+| 24 | VRC6a | + 3 expansion sound channels |
+| 25 | VRC4b/d | VRC4 variant |
+| 26 | VRC6b | VRC6 variant |
+| 34 | BNROM / NINA-001 | 32 KB PRG, optional 4 KB CHR |
+| 66 | GxROM | PRG + CHR, bus conflicts |
+| 69 | Sunsoft FME-7 | command banking, 1 KB CHR, IRQ, 8 KB WRAM |
+| 71 | Camerica | UxROM + mirroring bit, bus conflicts |
+| 79 | NINA-03/06 | fixed PRG, CHR banking, mirroring bit |
+| 87 | Jaleco CHR | fixed PRG, CHR banking |
+| 88 | Namco 118 | fixed PRG, CHR banking, mirroring |
+| 206 | Namco 118 / DxROM | MMC3 clone without IRQ |
+| 232 | Codemasters Quattro | 4 × 128 KB blocks |
+
+Anything else falls back to a flat PRG layout and is reported as
+`Mapper support : fallback`. See [`docs/MAPPERS.md`](docs/MAPPERS.md) for the
+implementation notes and the remaining gaps.
+
+## How the generated game looks
+
+The output is ordinary, readable C#. One label per 6502 address, one statement
+per instruction, with the original disassembly in a comment:
+
+```csharp
+L8000:
+{
+    Runtime.LastPC = 0x8000; Runtime.TraceInstruction(0x8000);
+    Runtime.InsCount++; Runtime.AdvanceCycles(7);
+    if (Runtime.CheckNmi(0x8000)) goto L8100;
+    if (Runtime.CheckIrq(0x8000)) { Runtime.DispatchTarget = Runtime.IrqVector; goto Dispatch; }
+    // SEI
+    Runtime.P = (byte)(Runtime.P | 0x04);
+    goto L8001;
+}
+```
+
+Because the PDB is emitted, a crash gives a real line number inside
+`Game.generated.cs` instead of `<unknown>`.
+
+## Dynamic targets
+
+Recursive descent cannot see code reached only through a computed jump. Three
+mechanisms cover that gap:
+
+1. **`dynamic_targets.txt`** — force addresses into the analysis.
    ```
-   ; Format: 8231 / 0x8231 / $8231
-   8231
+   ; 8231 / 0x8231 / $8231 all work
+   8231          ; title screen setup
    ```
+2. **`dynamic_targets.log`** — the generated game records every address it had
+   to interpret. Re-running the lifter picks the file up and inlines them.
+3. **Interpreter fallback** — anything still unknown executes in a built-in 6502
+   interpreter at runtime, so the game keeps playing instead of trapping.
 
-2. **Runtime logging** — the generated EXE writes newly-discovered targets to `dynamic_targets.log`. Feed these back into `dynamic_targets.txt` and re-run the lifter for full coverage.
+## Project layout
 
-3. **Interpreter fallback** — at runtime, any address not in the static dispatch table is executed by a built-in 6502 interpreter (up to 4M instructions per dispatch).
+```
+NesLifter.csproj
+├── Core/                 cartridge model and CPU-side analysis
+│   ├── InesLoader.cs     iNES / NES 2.0 parsing, CRC32
+│   ├── CartInfo.cs       cartridge description
+│   ├── CartMapping.cs    page-table memory map (2 KB PRG / 1 KB CHR pages)
+│   ├── ProgramImage.cs   power-on address space view for the analyser
+│   ├── Cpu6502.cs        256-entry opcode table
+│   ├── Disassembler.cs   recursive-descent analyser
+│   └── Boards/           one board per mapper family
+├── Mappers/              MapperCatalog: identity + family metadata
+├── Lifting/
+│   ├── Lifter.cs         emits the whole game
+│   └── MapperRuntimeEmitter.cs  emits a specialised MapperStub
+├── Compilation/          Roslyn wrapper
+├── Host/                 CLI, pipeline, self-test
+├── Common/               file helpers, synthetic ROM builder
+├── tests/                xUnit tests
+├── tools/Branding/       logo and icon generator
+├── assets/               SVG + PNG + ICO
+└── docs/                 architecture, mappers, troubleshooting
+```
+## Documentation
 
----
+- [`ROADMAP.md`](ROADMAP.md) — what is done and what is next, easiest first
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how a lift works, stage by stage
+- [`docs/MAPPERS.md`](docs/MAPPERS.md) — per-board implementation notes
+- [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — black screen, wrong graphics, traps
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — build, test, add a mapper
+- [`CHANGELOG.md`](CHANGELOG.md) — release notes
 
-## Supported Opcodes
+## Known limitations
 
-- All **151 official** 6502 instructions
-- **Unofficial / illegal** opcodes commonly found in NES ROMs:
-  `LAX`, `SAX`, `DCP`, `ISB`, `SLO`, `RLA`, `SRE`, `RRA`, `ANC`, `ALR`, `ARR`, `ANE`, `LXA`, `AXS`, `SHY`, `LAS`, `AXA`, `KIL`, various `NOP` variants
+- **One bank layout is analysed.** The analyser sees the power-on mapping; other
+  switchable banks run through the interpreter. Bank-aware analysis is the top
+  item in the [roadmap](ROADMAP.md#stage-4--static-analysis-depth-next-big-win).
+- **APU sweep and DMC are missing.** Music plays, but some effects are silent.
+- **No save states, no battery save persistence yet.**
+- **Windows only** for the generated game (WinForms + `winmm`).
+- **Large ROMs produce large C#.** A 512 KB PRG game generates tens of MB of
+  source; it compiles, but the file is not pleasant to open.
 
----
+## Legal
 
-## Limitations
-
-- **Mapper support**: Mapper 0 (NROM) only; other mappers use a stub
-- **PPU**: Software rendering, no mid-scanline effects, no MMC2/4 CHR banking
-- **APU**: Simplified synthesis (no DMC, no sweep, no envelope decay)
-- **No save states** in the generated EXE
-- **Large ROMs** may produce very large C# files (tens of MB)
-- Tested primarily on **Super Mario Bros (Mapper 0, 32 KB PRG)**
-
----
-
-## Architecture (single file)
-
-| Class | Role |
-|-------|------|
-| `Program` | Entry point, CLI, TUI, tray, logging |
-| `Options` | Argument parsing |
-| `Pipeline` | Orchestrates file collection → disassembly → lift → compile |
-| `NesRom` | iNES parser (header, PRG, CHR, vectors) |
-| `Cpu6502` | Full opcode table (256 entries) |
-| `Disassembler` | Recursive-descent 6502 disassembler |
-| `Lifter` | Instruction → C# code generator |
-| `StateManager` | XML-based resume/checkpoint |
-| `TrayManager` | WinForms NotifyIcon background processing |
-| `PointerScanner` | Heuristic ZP pointer target discovery |
-
----
+NesLifter contains no ROMs and no emulator BIOS files. Use it only with
+cartridge images you are legally entitled to. The generated game embeds the
+PRG and CHR data of the cartridge you feed it — treat that output with the same
+care as the input.
 
 ## License
 
-Licensed under GPLv3 
+GPL-3.0. See [`LICENSE`](LICENSE).
 
-And this is proof of concept. Use at your own risk. 
-
----
-
-*Previously known as NesToDotNetRecompiler.*
+<div align="center">
+<sub>Previously known as <em>NES2ILRecomp</em> / <em>NesToDotNetRecompiler</em>.</sub>
+</div>

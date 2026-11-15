@@ -138,6 +138,24 @@ namespace NesLifter.Core.Boards
             return count - 1;
         }
 
+        protected int PrgBankCount8()
+        {
+            if (Cart.PrgRom.Length <= 0)
+                return 0;
+
+            return Cart.PrgRom.Length / 0x2000;
+        }
+
+        protected int LastPrgBank8()
+        {
+            int count = PrgBankCount8();
+
+            if (count <= 0)
+                return 0;
+
+            return count - 1;
+        }
+
         protected int ChrBankCount8()
         {
             if (Cart.ChrRom.Length <= 0)

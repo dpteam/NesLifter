@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+
+jobs:
+  build:
+    name: build + test (${{ matrix.configuration }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [Debug, Release]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore NesLifter.slnx
+
+      - name: Build
+        run: dotnet build NesLifter.slnx -c ${{ matrix.configuration }} --no-restore -warnaserror
+
+      - name: Unit tests
+        run: dotnet test tests/NesLifter.Tests/NesLifter.Tests.csproj -c ${{ matrix.configuration }} --no-build
+
+      - name: Self-test (lift, compile, execute every mapper)
+        run: dotnet run --project NesLifter.csproj -c ${{ matrix.configuration }} --no-build -- --selftest --frames 60 --keep
+
+      - name: Upload self-test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selftest-${{ matrix.configuration }}
+          path: nes_lifted_output/_selftest
+          if-no-files-found: ignore
+          retention-days: 7
+
+  package:
+    name: publish
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish lifter
+        run: >
+          dotnet publish NesLifter.csproj
+          -c Release
+          -r win-x64
+          --self-contained false
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -o dist
+
+      - name: Upload lifter
+        uses: actions/upload-artifact@v4
+        with:
+          name: NesLifter-win-x64
+          path: dist
+          retention-days: 30

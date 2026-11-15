@@ -13,6 +13,12 @@ public sealed class CliOptions
     public bool SaveSource = true;
     public bool NoCompile;
     public bool ShowHelp;
+    public bool ShowVersion;
+    public bool Verbose;
+    public bool RunSelfTest;
+    public bool SkipRun;
+    public bool KeepTemp;
+    public int HeadlessFrames = 30;
 
     public List<string> UnknownArgs = new List<string>();
 
@@ -33,9 +39,21 @@ public sealed class CliOptions
                 continue;
             }
 
+            if (Is(a, "--version"))
+            {
+                o.ShowVersion = true;
+                continue;
+            }
+
             if (Is(a, "-r", "--recursive"))
             {
                 o.Recursive = true;
+                continue;
+            }
+
+            if (Is(a, "-v", "--verbose"))
+            {
+                o.Verbose = true;
                 continue;
             }
 
@@ -57,6 +75,24 @@ public sealed class CliOptions
                 continue;
             }
 
+            if (Is(a, "--selftest"))
+            {
+                o.RunSelfTest = true;
+                continue;
+            }
+
+            if (Is(a, "--no-run"))
+            {
+                o.SkipRun = true;
+                continue;
+            }
+
+            if (Is(a, "--keep"))
+            {
+                o.KeepTemp = true;
+                continue;
+            }
+
             if (Is(a, "-i", "--input"))
             {
                 if (i + 1 < args.Length)
@@ -73,6 +109,17 @@ public sealed class CliOptions
                 continue;
             }
 
+            if (Is(a, "--frames"))
+            {
+                if (i + 1 < args.Length && int.TryParse(args[i + 1], out int frames))
+                {
+                    o.HeadlessFrames = frames;
+                    i++;
+                }
+
+                continue;
+            }
+
             if (TryGetValue(a, "--input", out string input))
             {
                 o.InputPath = input;
@@ -82,6 +129,13 @@ public sealed class CliOptions
             if (TryGetValue(a, "--output", out string output))
             {
                 o.OutputPath = output;
+                continue;
+            }
+
+            if (TryGetValue(a, "--frames", out string framesValue) &&
+                int.TryParse(framesValue, out int parsedFrames))
+            {
+                o.HeadlessFrames = parsedFrames;
                 continue;
             }
 
@@ -114,9 +168,12 @@ public sealed class CliOptions
             }
             catch
             {
-                // Оставляем как есть.
+                // Keep the raw value; the pipeline reports it as missing.
             }
         }
+
+        if (o.HeadlessFrames <= 0)
+            o.HeadlessFrames = 30;
 
         return o;
     }
