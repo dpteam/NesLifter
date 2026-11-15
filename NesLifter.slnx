@@ -2,4 +2,5 @@
   <Project Path="NesLifter.csproj" />
   <Project Path="tests/NesLifter.Tests/NesLifter.Tests.csproj" />
   <Project Path="tools/Branding/Branding.csproj" />
+  <Project Path="tools/Shot/Shot.csproj" />
 </Solution>

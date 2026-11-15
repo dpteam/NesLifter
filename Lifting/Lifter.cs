@@ -13,15 +13,18 @@ namespace NesLifter.Lifting
         private readonly AnalysisResult _model;
         private readonly string _nsName;
 
-        private readonly Dictionary<ushort, bool> _labels = new Dictionary<ushort, bool>();
-        private readonly List<ushort> _emitted = new List<ushort>();
-        private readonly List<ushort> _dispatch = new List<ushort>();
+        // Blocks are keyed by PRG ROM offset, not by CPU address. A byte in a
+        // switchable bank appears at several addresses over the life of a
+        // cartridge, but it is always the same code, so offset is the only
+        // stable identity for a lifted block.
+        private readonly HashSet<int> _labels = new HashSet<int>();
+        private readonly List<int> _emitted = new List<int>();
 
         private readonly MapperRuntimeEmitter _mapper;
         private readonly MapperDescriptor _mapperDescriptor;
 
-        private ushort _nmiTarget;
-        private bool _hasNmi;
+        private int _nmiOffset = -1;
+        private int _irqOffset = -1;
 
         public Lifter(
             NesRom rom,
@@ -35,83 +38,45 @@ namespace NesLifter.Lifting
             _mapper = new MapperRuntimeEmitter(rom.Cart);
 
             BuildLabels();
-            BuildDispatch();
 
-            _nmiTarget = _rom.ReadVector(0xFFFA);
-            _hasNmi = IsEmittableLabel(_nmiTarget) && _labels.ContainsKey(_nmiTarget);
+            _nmiOffset = _model.NmiOffset;
+            _irqOffset = _model.IrqOffset;
         }
 
         // ================================================================
-        // Label / dispatch construction
+        // Label construction
         // ================================================================
 
         private void BuildLabels()
         {
-            foreach (ushort a in _model.Labels)
+            _labels.Clear();
+
+            foreach (int offset in _model.Labels)
             {
-                if (IsEmittableLabel(a))
-                    _labels[a] = true;
+                if (IsEmittableOffset(offset))
+                    _labels.Add(offset);
             }
 
-            if (IsEmittableLabel(_model.Entry))
-                _labels[_model.Entry] = true;
+            if (IsEmittableOffset(_model.EntryOffset))
+                _labels.Add(_model.EntryOffset);
 
             _emitted.Clear();
-            _emitted.AddRange(_labels.Keys);
+            _emitted.AddRange(_labels);
             _emitted.Sort();
         }
 
-        private void BuildDispatch()
+        private bool IsEmittableOffset(int offset)
         {
-            List<ushort> dispatch = new List<ushort>();
+            if (offset < 0 || offset >= _rom.PrgRom.Length)
+                return false;
 
-            // Functions / entry points
-            foreach (ushort a in _model.Functions)
-            {
-                if (_labels.ContainsKey(a) && !dispatch.Contains(a))
-                    dispatch.Add(a);
-            }
-
-            // Known dynamic targets
-            foreach (ushort a in _model.DynamicTargets)
-            {
-                if (_labels.ContainsKey(a) && !dispatch.Contains(a))
-                    dispatch.Add(a);
-            }
-
-            // Return addresses after JSR, and static JMP targets
-            foreach (Instruction inst in _model.Instructions.Values)
-            {
-                if (inst.Control == OpControl.Jsr &&
-                    inst.HasFallthrough &&
-                    _labels.ContainsKey(inst.Fallthrough) &&
-                    !dispatch.Contains(inst.Fallthrough))
-                {
-                    dispatch.Add(inst.Fallthrough);
-                }
-
-                if ((inst.Control == OpControl.Jmp || inst.Control == OpControl.JmpInd) &&
-                    inst.HasTarget &&
-                    _labels.ContainsKey(inst.Target) &&
-                    !dispatch.Contains(inst.Target))
-                {
-                    dispatch.Add(inst.Target);
-                }
-            }
-
-            if (dispatch.Count == 0 && _model.Entry != 0 && _labels.ContainsKey(_model.Entry))
-                dispatch.Add(_model.Entry);
-
-            dispatch.Sort();
-            _dispatch.Clear();
-            _dispatch.AddRange(dispatch);
+            return _model.Instructions.ContainsKey(offset);
         }
 
-        private bool IsEmittableLabel(ushort addr)
+        /// <summary>Label name for a PRG offset, e.g. <c>L_0012A4</c>.</summary>
+        private static string Label(int offset)
         {
-            if (addr < 0x8000) return false;
-            if (addr >= 0xFFFA) return false;
-            return _model.Instructions.ContainsKey(addr);
+            return "L_" + offset.ToString("X6", CultureInfo.InvariantCulture);
         }
 
         // ================================================================
@@ -122,20 +87,23 @@ namespace NesLifter.Lifting
         {
             StringBuilder sb = new StringBuilder();
 
-            sb.AppendLine("// <auto-generated>");
-            sb.AppendLine("// NES static recompiler generated code.");
-            sb.AppendLine("// Runtime: .NET WinForms. PPU renders to window.");
-            sb.AppendLine("// </auto-generated>");
-            sb.AppendLine();
-            sb.AppendLine("using System;");
-            sb.AppendLine("using System.Drawing;");
-            sb.AppendLine("using System.Drawing.Imaging;");
-            sb.AppendLine("using System.Windows.Forms;");
-            sb.AppendLine("using System.Threading;");
-            sb.AppendLine("using System.Runtime.InteropServices;");
-            sb.AppendLine();
-            sb.AppendLine("namespace Lifted." + _nsName);
-            sb.AppendLine("{");
+            sb.Append(Raw($$"""
+                // <auto-generated>
+                // NES static recompiler generated code.
+                // Runtime: .NET WinForms. PPU renders to window.
+                // </auto-generated>
+
+                using System;
+                using System.Drawing;
+                using System.Drawing.Imaging;
+                using System.Windows.Forms;
+                using System.Threading;
+                using System.Runtime.InteropServices;
+
+                namespace Lifted.{{_nsName}}
+                {
+
+                """));
 
             AppendProgram(sb);
             AppendRuntime(sb);
@@ -157,79 +125,95 @@ namespace NesLifter.Lifting
 
         private void AppendProgram(StringBuilder sb)
         {
-            sb.AppendLine("static class Program");
-            sb.AppendLine("{");
-            sb.AppendLine("    [STAThread]");
-            sb.AppendLine("    static int Main(string[] args)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        int headlessFrames = 0;");
-            sb.AppendLine("        bool headless = false;");
-            sb.AppendLine("        for (int i = 0; i < args.Length; i++)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            if (args[i] == \"--headless\")");
-            sb.AppendLine("            {");
-            sb.AppendLine("                headless = true;");
-            sb.AppendLine("                if (i + 1 < args.Length) int.TryParse(args[i + 1], out headlessFrames);");
-            sb.AppendLine("            }");
-            sb.AppendLine("        }");
-            sb.AppendLine();
-            sb.AppendLine("        if (headless) return RunHeadless(headlessFrames > 0 ? headlessFrames : 600);");
-            sb.AppendLine();
-            sb.AppendLine("        try");
-            sb.AppendLine("        {");
-            sb.AppendLine("            Application.EnableVisualStyles();");
-            sb.AppendLine("            Runtime.Init();");
-            sb.AppendLine();
-            sb.AppendLine("            PpuForm form = new PpuForm();");
-            sb.AppendLine();
-            sb.AppendLine("            Thread cpuThread = new Thread(new ThreadStart(Runtime.CpuThread));");
-            sb.AppendLine("            cpuThread.IsBackground = true;");
-            sb.AppendLine("            cpuThread.Priority = ThreadPriority.BelowNormal;");
-            sb.AppendLine("            cpuThread.Start();");
-            sb.AppendLine();
-            sb.AppendLine("            Application.Run(form);");
-            sb.AppendLine("            return 0;");
-            sb.AppendLine("        }");
-            sb.AppendLine("        catch (Exception ex)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            MessageBox.Show(ex.ToString(), \"NES Lifted fatal\", MessageBoxButtons.OK, MessageBoxIcon.Error);");
-            sb.AppendLine("            return 1;");
-            sb.AppendLine("        }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    /// <summary>");
-            sb.AppendLine("    /// Runs the lifted game without a window. Used by CI and by");
-            sb.AppendLine("    /// NesLifter --selftest to prove the generated assembly executes.");
-            sb.AppendLine("    /// Exit code 0 = reached the frame budget without trapping.");
-            sb.AppendLine("    /// </summary>");
-            sb.AppendLine("    static int RunHeadless(int frames)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        Runtime.Headless = true;");
-            sb.AppendLine("        Runtime.ThrottleEnabled = false;");
-            sb.AppendLine("        Runtime.Init();");
-            sb.AppendLine();
-            sb.AppendLine("        Thread cpuThread = new Thread(new ThreadStart(Runtime.CpuThread));");
-            sb.AppendLine("        cpuThread.IsBackground = true;");
-            sb.AppendLine("        cpuThread.Start();");
-            sb.AppendLine();
-            sb.AppendLine("        long deadline = Environment.TickCount64 + 60000;");
-            sb.AppendLine("        while (Ppu.FrameCount < frames && Environment.TickCount64 < deadline)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            if (Runtime.CpuState == \"Trap\" || Runtime.CpuState == \"Exited\") break;");
-            sb.AppendLine("            Thread.Sleep(2);");
-            sb.AppendLine("        }");
-            sb.AppendLine();
-            sb.AppendLine("        Console.WriteLine(\"headless: frames=\" + Ppu.FrameCount + \" instructions=\" + Runtime.InsCount + \" state=\" + Runtime.CpuState);");
-            sb.AppendLine("        if (Runtime.LastError != null)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            Console.Error.WriteLine(\"headless trap: \" + Runtime.LastError);");
-            sb.AppendLine("            return 3;");
-            sb.AppendLine("        }");
-            sb.AppendLine();
-            sb.AppendLine("        return Ppu.FrameCount >= frames ? 0 : 2;");
-            sb.AppendLine("    }");
-            sb.AppendLine("}");
-            sb.AppendLine();
+            sb.Append(Raw("""
+                static class Program
+                {
+                    [STAThread]
+                    static int Main(string[] args)
+                    {
+                        int headlessFrames = 0;
+                        bool headless = false;
+                        for (int i = 0; i < args.Length; i++)
+                        {
+                            if (args[i] == "--headless")
+                            {
+                                headless = true;
+                                if (i + 1 < args.Length) int.TryParse(args[i + 1], out headlessFrames);
+                            }
+                            else if (args[i] == "--capture-icon")
+                            {
+                                // Seconds to sample the framebuffer before picking an icon.
+                                if (i + 1 < args.Length) int.TryParse(args[i + 1], out Runtime.CaptureIconSeconds);
+                                if (Runtime.CaptureIconSeconds <= 0) Runtime.CaptureIconSeconds = 5;
+                            }
+                            else if (args[i] == "--icon-out" && i + 1 < args.Length)
+                            {
+                                Runtime.IconOutputPath = args[++i];
+                            }
+                            else if (args[i] == "--icon-exit")
+                            {
+                                Runtime.ExitAfterIcon = true;
+                            }
+                        }
+
+                        if (headless) return RunHeadless(headlessFrames > 0 ? headlessFrames : 600);
+
+                        try
+                        {
+                            Application.EnableVisualStyles();
+                            Runtime.Init();
+
+                            PpuForm form = new PpuForm();
+
+                            Thread cpuThread = new Thread(new ThreadStart(Runtime.CpuThread));
+                            cpuThread.IsBackground = true;
+                            cpuThread.Priority = ThreadPriority.BelowNormal;
+                            cpuThread.Start();
+
+                            Application.Run(form);
+                            return 0;
+                        }
+                        catch (Exception ex)
+                        {
+                            MessageBox.Show(ex.ToString(), "NES Lifted fatal", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                            return 1;
+                        }
+                    }
+
+                    /// <summary>
+                    /// Runs the lifted game without a window. Used by CI and by
+                    /// NesLifter --selftest to prove the generated assembly executes.
+                    /// Exit code 0 = reached the frame budget without trapping.
+                    /// </summary>
+                    static int RunHeadless(int frames)
+                    {
+                        Runtime.Headless = true;
+                        Runtime.ThrottleEnabled = false;
+                        Runtime.Init();
+
+                        Thread cpuThread = new Thread(new ThreadStart(Runtime.CpuThread));
+                        cpuThread.IsBackground = true;
+                        cpuThread.Start();
+
+                        long deadline = Environment.TickCount64 + 60000;
+                        while (Ppu.FrameCount < frames && Environment.TickCount64 < deadline)
+                        {
+                            if (Runtime.CpuState == "Trap" || Runtime.CpuState == "Exited") break;
+                            Thread.Sleep(2);
+                        }
+
+                        Console.WriteLine("headless: frames=" + Ppu.FrameCount + " instructions=" + Runtime.InsCount + " state=" + Runtime.CpuState);
+                        if (Runtime.LastError != null)
+                        {
+                            Console.Error.WriteLine("headless trap: " + Runtime.LastError);
+                            return 3;
+                        }
+
+                        return Ppu.FrameCount >= frames ? 0 : 2;
+                    }
+                }
+
+                """));
         }
 
         // ================================================================
@@ -242,147 +226,133 @@ namespace NesLifter.Lifting
 
             int wramSize = ResolveWramSize(cart);
             int chrRamSize = cart.ChrRom.Length == 0 ? ResolveChrRamSize(cart) : 0;
-
-            sb.AppendLine("static class Runtime");
-            sb.AppendLine("{");
-
-            // Metadata
-            sb.AppendLine("    public const string GameName = \"" + _nsName + "\";");
-            sb.AppendLine("    public const int Mapper = " + cart.Mapper + ";");
-            sb.AppendLine("    public const string MapperName = \"" + _mapperDescriptor.Name + "\";");
             int mir = cart.Mirroring == 1 ? 1 : (cart.Mirroring == 2 ? 2 : 0);
-            sb.AppendLine("    public static int Mirroring = " + mir + ";");
-            sb.AppendLine();
 
-            // ROM data
+            sb.Append(Raw($$"""
+                static class Runtime
+                {
+                    public const string GameName = "{{_nsName}}";
+                    public const int Mapper = {{cart.Mapper}};
+                    public const string MapperName = "{{_mapperDescriptor.Name}}";
+                    public static int Mirroring = {{mir}};
+
+                """));
+
             AppendByteArrayField(sb, "PrgRom", _rom.PrgRom);
             AppendByteArrayField(sb, "ChrRom", _rom.ChrRom);
-            sb.AppendLine();
 
-            // RAM
-            sb.AppendLine("    public static byte[] Ram = new byte[0x800];");
-            sb.AppendLine("    public static byte[] Wram = new byte[" + wramSize + "];");
-            sb.AppendLine("    public static byte[] ChrRam = new byte[" + chrRamSize + "];");
-            sb.AppendLine();
+            sb.Append(Raw($$"""
 
-            // CPU registers
-            sb.AppendLine("    public static byte A;");
-            sb.AppendLine("    public static byte X;");
-            sb.AppendLine("    public static byte Y;");
-            sb.AppendLine("    public static byte SP;");
-            sb.AppendLine("    public static byte P;");
-            sb.AppendLine();
+                    public static byte[] Ram = new byte[0x800];
+                    public static byte[] Wram = new byte[{{wramSize}}];
+                    public static byte[] ChrRam = new byte[{{chrRamSize}}];
 
-            // State
-            sb.AppendLine("    public static string LastError;");
-            sb.AppendLine("    public static bool Headless;");
-            sb.AppendLine("    public static long InsCount;");
-            sb.AppendLine("    public static ushort LastPC;");
-            sb.AppendLine("    public static ushort DispatchTarget;");
-            sb.AppendLine("    public static volatile string CpuState;");
-            sb.AppendLine("    public static volatile int TrapCount;");
-            sb.AppendLine("    public static string LastTrap;");
-            sb.AppendLine("    static readonly ulong[] TraceRing = new ulong[256];");
-            sb.AppendLine("    static int TraceWrite;");
-            sb.AppendLine();
+                    public static byte A;
+                    public static byte X;
+                    public static byte Y;
+                    public static byte SP;
+                    public static byte P;
 
-            // Runtime diagnostics: one compact log file per generated game.
-            sb.AppendLine("    static readonly object LogLock = new object();");
-            sb.AppendLine("    static readonly System.Collections.Generic.Dictionary<string, long> LastLogAt = new System.Collections.Generic.Dictionary<string, long>();");
-            sb.AppendLine("    static readonly System.Collections.Generic.Dictionary<string, int> SuppressedLogs = new System.Collections.Generic.Dictionary<string, int>();");
-            sb.AppendLine("    public static readonly string LogPath = System.IO.Path.Combine(System.AppDomain.CurrentDomain.BaseDirectory, \"runtime.log\");");
-            sb.AppendLine();
+                    public static string LastError;
+                    public static bool Headless;
+                    public static int CaptureIconSeconds;
+                    public static string IconOutputPath;
+                    public static bool ExitAfterIcon;
+                    public static int IconSamples;
+                    public static int IconBestScore;
+                    public static byte[] IconBest;
+                    public static long InsCount;
+                    public static ushort LastPC;
+                    public static ushort DispatchTarget;
+                    public static volatile string CpuState;
+                    public static volatile int TrapCount;
+                    public static string LastTrap;
+                    static readonly ulong[] TraceRing = new ulong[256];
+                    static int TraceWrite;
 
-            // Dynamic dispatch
-            sb.AppendLine("    public static object DynLock = new object();");
-            sb.AppendLine("    public static System.Collections.Generic.Dictionary<ushort, bool> SeenDynamic = new System.Collections.Generic.Dictionary<ushort, bool>();");
-            sb.AppendLine();
+                    // Runtime diagnostics: one compact log file per generated game.
+                    static readonly object LogLock = new object();
+                    static readonly System.Collections.Generic.Dictionary<string, long> LastLogAt = new System.Collections.Generic.Dictionary<string, long>();
+                    static readonly System.Collections.Generic.Dictionary<string, int> SuppressedLogs = new System.Collections.Generic.Dictionary<string, int>();
+                    public static readonly string LogPath = System.IO.Path.Combine(System.AppDomain.CurrentDomain.BaseDirectory, "runtime.log");
 
-            // NMI
-            sb.AppendLine("    public static volatile bool NmiPending;");
-            sb.AppendLine("    public static volatile bool IrqPending;");
-            sb.AppendLine("    public static ushort IrqVector = 0x" + _rom.ReadVector(0xFFFE).ToString("X4") + ";");
-            sb.AppendLine("    public static volatile bool InNmi;");
-            sb.AppendLine("    public static ushort NmiVector = 0x" + _nmiTarget.ToString("X4") + ";");
-            sb.AppendLine();
+                    // Dynamic dispatch
+                    public static object DynLock = new object();
+                    public static System.Collections.Generic.Dictionary<ushort, bool> SeenDynamic = new System.Collections.Generic.Dictionary<ushort, bool>();
 
-            // Throttle
-            sb.AppendLine("    public static long ClockStart = System.Diagnostics.Stopwatch.GetTimestamp();");
-            sb.AppendLine("    public static long FrameClockStart = System.Diagnostics.Stopwatch.GetTimestamp();");
-            sb.AppendLine("    public static volatile bool ThrottleEnabled = true;");
-            sb.AppendLine("    public static long CpuCycles = 0;");
-            sb.AppendLine("    public static long NextVblankCycle = 27394;");
-            sb.AppendLine("    public static long VblankClearCycle;");
-            sb.AppendLine("    public static long NextThrottleCycle = 2048;");
-            sb.AppendLine("    public static long NmiEnterCycles;");
-            sb.AppendLine();
+                    public static volatile bool NmiPending;
+                    public static volatile bool IrqPending;
+                    public static ushort IrqVector = 0x{{_rom.ReadVector(0xFFFE).ToString("X4")}};
+                    public static volatile bool InNmi;
+                    public static ushort NmiVector = 0x{{_rom.ReadVector(0xFFFA).ToString("X4")}};
 
-            // Frame sync
-            sb.AppendLine("    public static object FrameLock = new object();");
-            sb.AppendLine("    public static volatile bool OsdFull;");
-            sb.AppendLine();
+                    // Throttle
+                    public static long ClockStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                    public static long FrameClockStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                    public static volatile bool ThrottleEnabled = true;
+                    public static long CpuCycles = 0;
+                    public static long NextVblankCycle = 27394;
+                    public static long VblankClearCycle;
+                    public static long NextThrottleCycle = 2048;
+                    public static long NmiEnterCycles;
 
-            // Input
-            sb.AppendLine("    public static volatile byte Joy1Buttons;");
-            sb.AppendLine("    public static volatile byte Joy2Buttons;");
-            sb.AppendLine("    public static byte Joy1Latch;");
-            sb.AppendLine("    public static byte Joy2Latch;");
-            sb.AppendLine("    public static int Joy1Idx;");
-            sb.AppendLine("    public static int Joy2Idx;");
-            sb.AppendLine("    public static bool JoyStrobeHigh;");
-            sb.AppendLine();
+                    // Frame sync
+                    public static object FrameLock = new object();
+                    public static volatile bool OsdFull;
 
-            // Init
-            sb.AppendLine("    public static void Init()");
-            sb.AppendLine("    {");
-            sb.AppendLine("        A = 0; X = 0; Y = 0; SP = 0xFD; P = 0x24;");
-            sb.AppendLine("        DispatchTarget = 0; CpuState = \"Init\";");
-            sb.AppendLine("        Memory.Reset(); Ppu.Reset(); Apu.Reset(); MapperStub.Power();");
-            sb.AppendLine("        Log(\"session\", \"=== game started; mapper=\" + Mapper + \"; log=\" + LogPath + \" ===\", true);");
-            sb.AppendLine("    }");
-            sb.AppendLine();
+                    // Input
+                    public static volatile byte Joy1Buttons;
+                    public static volatile byte Joy2Buttons;
+                    public static byte Joy1Latch;
+                    public static byte Joy2Latch;
+                    public static int Joy1Idx;
+                    public static int Joy2Idx;
+                    public static bool JoyStrobeHigh;
 
-            // CpuThread
-            sb.AppendLine("    public static void CpuThread()");
-            sb.AppendLine("    {");
-            sb.AppendLine("        try");
-            sb.AppendLine("        {");
-            sb.AppendLine("            CpuState = \"Starting\";");
-            sb.AppendLine("            Log(\"cpu-start\", \"CPU thread started\", true);");
-            sb.AppendLine("            if (Headless) Audio.TryStop();");
-            sb.AppendLine("            Reset();");
-            sb.AppendLine("            CpuState = \"EnteringRun\";");
-            sb.AppendLine("            Run();");
-            sb.AppendLine("            CpuState = LastError != null ? \"Trap\" : \"Exited\";");
-            sb.AppendLine("            Log(\"cpu-end\", \"CPU thread ended: \" + CpuState, true);");
-            sb.AppendLine("        }");
-            sb.AppendLine("        catch (Exception ex)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            CpuState = \"Exception\";");
-            sb.AppendLine("            OnCpuException(ex);");
-            sb.AppendLine("        }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
+                    public static void Init()
+                    {
+                        A = 0; X = 0; Y = 0; SP = 0xFD; P = 0x24;
+                        DispatchTarget = 0; CpuState = "Init";
+                        Memory.Reset(); Ppu.Reset(); Apu.Reset(); MapperStub.Power();
+                        Log("session", "=== game started; mapper=" + Mapper + "; log=" + LogPath + " ===", true);
+                    }
 
-            // Reset
-            sb.AppendLine("    public static void Reset()");
-            sb.AppendLine("    {");
-            sb.AppendLine("        A = 0; X = 0; Y = 0; SP = 0xFD; P = 0x24;");
-            sb.AppendLine("        LastError = null; LastTrap = null; InsCount = 0; LastPC = 0;");
-            sb.AppendLine("        TrapCount = 0; DispatchTarget = 0; CpuState = \"Reset\";");
-            sb.AppendLine("        Array.Clear(TraceRing, 0, TraceRing.Length); TraceWrite = 0;");
-            sb.AppendLine("        CpuCycles = 0; NextVblankCycle = 27394; VblankClearCycle = 0; NextThrottleCycle = 2048;");
-            sb.AppendLine("        ClockStart = FrameClockStart = System.Diagnostics.Stopwatch.GetTimestamp();");
-            sb.AppendLine("        if (SeenDynamic != null) SeenDynamic.Clear();");
-            sb.AppendLine("        Joy1Latch = Joy2Latch = 0; Joy1Idx = Joy2Idx = 0; JoyStrobeHigh = false;");
-            sb.AppendLine("        Log(\"reset\", \"CPU reset; entry will be $\" + NmiVector.ToString(\"X4\"), true);");
-            sb.AppendLine("    }");
-            sb.AppendLine();
+                    public static void CpuThread()
+                    {
+                        try
+                        {
+                            CpuState = "Starting";
+                            Log("cpu-start", "CPU thread started", true);
+                            if (Headless) Audio.TryStop();
+                            Reset();
+                            CpuState = "EnteringRun";
+                            Run();
+                            CpuState = LastError != null ? "Trap" : "Exited";
+                            Log("cpu-end", "CPU thread ended: " + CpuState, true);
+                        }
+                        catch (Exception ex)
+                        {
+                            CpuState = "Exception";
+                            OnCpuException(ex);
+                        }
+                    }
 
-            // Run
+                    public static void Reset()
+                    {
+                        A = 0; X = 0; Y = 0; SP = 0xFD; P = 0x24;
+                        LastError = null; LastTrap = null; InsCount = 0; LastPC = 0;
+                        TrapCount = 0; DispatchTarget = 0; CpuState = "Reset";
+                        Array.Clear(TraceRing, 0, TraceRing.Length); TraceWrite = 0;
+                        CpuCycles = 0; NextVblankCycle = 27394; VblankClearCycle = 0; NextThrottleCycle = 2048;
+                        ClockStart = FrameClockStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                        if (SeenDynamic != null) SeenDynamic.Clear();
+                        Joy1Latch = Joy2Latch = 0; Joy1Idx = Joy2Idx = 0; JoyStrobeHigh = false;
+                        Log("reset", "CPU reset; entry will be $" + NmiVector.ToString("X4"), true);
+                    }
+
+                """));
+
             AppendRun(sb);
-
-            // Helpers
             AppendRuntimeHelpers(sb);
 
             // Interpreter
@@ -394,56 +364,72 @@ namespace NesLifter.Lifting
 
         private void AppendRun(StringBuilder sb)
         {
-            bool hasEntry = _model.Entry != 0 && _labels.ContainsKey(_model.Entry);
+            bool hasEntry = _model.EntryOffset >= 0 && _labels.Contains(_model.EntryOffset);
 
-            sb.AppendLine("    public static void Run()");
-            sb.AppendLine("    {");
-            sb.AppendLine("        try");
-            sb.AppendLine("        {");
-            Line(sb, "Runtime.CpuState = \"Running\";");
-            Line(sb, "Console.WriteLine(\"CPU started. Entry: 0x" + _model.Entry.ToString("X4") + "\");");
-            Line(sb, "Console.WriteLine(\"Press Ctrl+C to exit.\");");
+            sb.Append(Raw($$"""
+                        public static void Run()
+                        {
+                            try
+                            {
+                                Runtime.CpuState = "Running";
+                                Console.WriteLine("CPU started. Entry: 0x{{_model.Entry.ToString("X4")}}");
+                                Console.WriteLine("Press Ctrl+C to exit.");
+                """));
 
             if (hasEntry)
-                Line(sb, "goto L" + _model.Entry.ToString("X4") + ";");
+                Line(sb, "goto " + Label(_model.EntryOffset) + ";");
             else
                 Line(sb, "Runtime.Trap(\"No valid entry/reset vector.\"); return;");
 
-            // Dispatch table
+            // Dispatch: the CPU hands us an address, the mapper resolves it to a
+            // PRG offset, and the offset selects the block. Keying on offset is
+            // what lets one lift cover every bank of the cartridge.
             if (_emitted.Count > 0)
             {
-                sb.AppendLine("    Dispatch:");
-                sb.AppendLine("        {");
-                Line(sb, "switch (Runtime.DispatchTarget)");
-                Line(sb, "{");
-                foreach (ushort daddr in _emitted)
-                    Line(sb, "case 0x" + daddr.ToString("X4") + ": goto L" + daddr.ToString("X4") + ";");
-                Line(sb, "default: Runtime.ReportDynamicTarget(Runtime.DispatchTarget); if (!Runtime.Interpret()) { Runtime.Trap(\"Dynamic dispatch -> $\" + Runtime.DispatchTarget.ToString(\"X4\")); return; } goto Dispatch;");
-                Line(sb, "}");
-                sb.AppendLine("        }");
+                sb.Append(Raw("""
+                            Dispatch:
+                                {
+                                    int off = MapperStub.ToOffset(Runtime.DispatchTarget);
+                                    switch (off)
+                                    {
+                    """));
+
+                foreach (int offset in _emitted)
+                    Line(sb, "case 0x" + offset.ToString("X6") + ": goto " + Label(offset) + ";");
+
+                sb.Append(Raw("""
+                                        default: Runtime.ReportDynamicTarget(Runtime.DispatchTarget); if (!Runtime.Interpret()) { Runtime.Trap("Dynamic dispatch -> $" + Runtime.DispatchTarget.ToString("X4")); return; } goto Dispatch;
+                                    }
+                                }
+                    """));
             }
 
             // Emitted instructions
-            foreach (ushort addr in _emitted)
+            foreach (int offset in _emitted)
             {
-                sb.AppendLine("    L" + addr.ToString("X4") + ":");
+                sb.AppendLine("    " + Label(offset) + ":");
                 sb.AppendLine("        {");
 
                 Instruction? inst;
-                _model.Instructions.TryGetValue(addr, out inst);
+                _model.Instructions.TryGetValue(offset, out inst);
 
-                Line(sb, "Runtime.LastPC = 0x" + addr.ToString("X4") + "; Runtime.TraceInstruction(0x" + addr.ToString("X4") + ");");
+                ushort display = inst?.Address ?? 0;
+                string hex = display.ToString("X4");
+
+                Line(sb, "Runtime.LastPC = 0x" + hex + "; Runtime.TraceInstruction(0x" + hex + ");");
 
                 if (inst != null && inst.Info != null)
                     Line(sb, "Runtime.InsCount++; Runtime.AdvanceCycles(" + inst.Info.Cycles + ");");
                 else
                     Line(sb, "Runtime.InsCount++; Runtime.AdvanceCycles(1);");
 
-                if (_hasNmi)
-                {
-                    Line(sb, "if (Runtime.CheckNmi(0x" + addr.ToString("X4") + ")) goto L" + _nmiTarget.ToString("X4") + ";");
-                    Line(sb, "if (Runtime.CheckIrq(0x" + addr.ToString("X4") + ")) { Runtime.DispatchTarget = Runtime.IrqVector; goto Dispatch; }");
-                }
+                if (_nmiOffset >= 0)
+                    Line(sb, "if (Runtime.CheckNmi(0x" + hex + ")) goto " + Label(_nmiOffset) + ";");
+
+                if (_irqOffset >= 0)
+                    Line(sb, "if (Runtime.CheckIrq(0x" + hex + ")) goto " + Label(_irqOffset) + ";");
+                else
+                    Line(sb, "if (Runtime.CheckIrq(0x" + hex + ")) { Runtime.DispatchTarget = Runtime.IrqVector; goto Dispatch; }");
 
                 if (inst != null)
                 {
@@ -458,238 +444,461 @@ namespace NesLifter.Lifting
                 sb.AppendLine("        }");
             }
 
-            sb.AppendLine("        }");
-            sb.AppendLine("        catch (Exception ex) { OnCpuException(ex); }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
+            sb.Append(Raw("""
+                            }
+                            catch (Exception ex) { OnCpuException(ex); }
+                        }
+
+                """));
         }
 
         private void AppendRuntimeHelpers(StringBuilder sb)
         {
-            sb.AppendLine("    public static void Log(string category, string message, bool force)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        try");
-            sb.AppendLine("        {");
-            sb.AppendLine("            lock (LogLock)");
-            sb.AppendLine("            {");
-            sb.AppendLine("                long now = Environment.TickCount64;");
-            sb.AppendLine("                long previous; int suppressed = 0;");
-            sb.AppendLine("                if (!force && LastLogAt.TryGetValue(category, out previous) && now - previous < 1000)");
-            sb.AppendLine("                { SuppressedLogs[category] = (SuppressedLogs.ContainsKey(category) ? SuppressedLogs[category] : 0) + 1; return; }");
-            sb.AppendLine("                if (SuppressedLogs.TryGetValue(category, out suppressed)) SuppressedLogs[category] = 0;");
-            sb.AppendLine("                LastLogAt[category] = now;");
-            sb.AppendLine("                string suffix = suppressed == 0 ? string.Empty : \" (coalesced \" + suppressed + \" repeats)\";");
-            sb.AppendLine("                System.IO.File.AppendAllText(LogPath, DateTime.Now.ToString(\"yyyy-MM-dd HH:mm:ss.fff\") + \" [\" + category + \"] \" + message + suffix + Environment.NewLine);");
-            sb.AppendLine("            }");
-            sb.AppendLine("        }");
-            sb.AppendLine("        catch { }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static void SetCarry(bool v) { P = (byte)(v ? (P | 0x01) : (P & 0xFE)); }");
-            sb.AppendLine("    public static void SetZero(bool v) { P = (byte)(v ? (P | 0x02) : (P & 0xFD)); }");
-            sb.AppendLine("    public static void SetInterrupt(bool v) { P = (byte)(v ? (P | 0x04) : (P & 0xFB)); }");
-            sb.AppendLine("    public static void SetDecimal(bool v) { P = (byte)(v ? (P | 0x08) : (P & 0xF7)); }");
-            sb.AppendLine("    public static void SetOverflow(bool v) { P = (byte)(v ? (P | 0x40) : (P & 0xBF)); }");
-            sb.AppendLine("    public static void SetNegative(bool v) { P = (byte)(v ? (P | 0x80) : (P & 0x7F)); }");
-            sb.AppendLine("    public static void SetNZ(byte v) { P = (byte)((P & 0x7D) | (v == 0 ? 0x02 : 0) | (v & 0x80)); }");
-            sb.AppendLine();
-            sb.AppendLine("    public static byte Asl(byte v) { SetCarry((v & 0x80) != 0); v = (byte)(v << 1); SetNZ(v); return v; }");
-            sb.AppendLine("    public static byte Lsr(byte v) { SetCarry((v & 0x01) != 0); v = (byte)(v >> 1); SetNZ(v); return v; }");
-            sb.AppendLine("    public static byte Rol(byte v) { int c = (P & 0x01); SetCarry((v & 0x80) != 0); v = (byte)((v << 1) | c); SetNZ(v); return v; }");
-            sb.AppendLine("    public static byte Ror(byte v) { int c = (P & 0x01); SetCarry((v & 0x01) != 0); v = (byte)((v >> 1) | (c << 7)); SetNZ(v); return v; }");
-            sb.AppendLine();
-            sb.AppendLine("    public static void Adc(byte v)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        int aa = A; int vv = v; int c = (P & 0x01); int sum = aa + vv + c;");
-            sb.AppendLine("        SetOverflow(((~(aa ^ vv) & (aa ^ sum)) & 0x80) != 0);");
-            sb.AppendLine("        SetCarry(sum > 0xFF);");
-            sb.AppendLine("        A = (byte)sum; SetNZ(A);");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static void Sbc(byte v)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        int aa = A; int vv = v; int c = (P & 0x01); int diff = aa - vv - (1 - c);");
-            sb.AppendLine("        SetOverflow((((aa ^ vv) & (aa ^ diff)) & 0x80) != 0);");
-            sb.AppendLine("        SetCarry(diff >= 0);");
-            sb.AppendLine("        A = (byte)diff; SetNZ(A);");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static void Compare(byte reg, byte v) { int diff = reg - v; SetCarry(reg >= v); SetNZ((byte)diff); }");
-            sb.AppendLine("    public static void Bit(byte v) { SetZero((A & v) == 0); SetOverflow((v & 0x40) != 0); SetNegative((v & 0x80) != 0); }");
-            sb.AppendLine();
-            sb.AppendLine("    public static ushort ReadPtrZp(byte ptr)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        byte lo = Memory.Read(ptr);");
-            sb.AppendLine("        byte hi = Memory.Read((byte)(ptr + 1));");
-            sb.AppendLine("        return (ushort)(lo | (hi << 8));");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static ushort AddrXInd(byte op) { return ReadPtrZp((byte)(op + X)); }");
-            sb.AppendLine("    public static ushort AddrIndY(byte op) { return (ushort)(ReadPtrZp(op) + Y); }");
-            sb.AppendLine();
-            sb.AppendLine("    public static void Push(byte v) { Memory.Write((ushort)(0x100 + SP), v); SP = (byte)(SP - 1); }");
-            sb.AppendLine("    public static byte Pull() { SP = (byte)(SP + 1); return Memory.Read((ushort)(0x100 + SP)); }");
-            sb.AppendLine("    public static void Push16(ushort v) { Push((byte)(v >> 8)); Push((byte)(v & 0xFF)); }");
-            sb.AppendLine("    public static ushort Pull16() { byte lo = Pull(); byte hi = Pull(); return (ushort)(lo | (hi << 8)); }");
-            sb.AppendLine("    public static void JsrPush(ushort returnAddress) { Push16((ushort)(returnAddress - 1)); }");
-            sb.AppendLine("    public static ushort RtsPull() { return (ushort)(Pull16() + 1); }");
-            sb.AppendLine();
+            sb.Append(Raw("""
+                        public static void Log(string category, string message, bool force)
+                        {
+                            try
+                            {
+                                lock (LogLock)
+                                {
+                                    long now = Environment.TickCount64;
+                                    long previous; int suppressed = 0;
+                                    if (!force && LastLogAt.TryGetValue(category, out previous) && now - previous < 1000)
+                                    { SuppressedLogs[category] = (SuppressedLogs.ContainsKey(category) ? SuppressedLogs[category] : 0) + 1; return; }
+                                    if (SuppressedLogs.TryGetValue(category, out suppressed)) SuppressedLogs[category] = 0;
+                                    LastLogAt[category] = now;
+                                    string suffix = suppressed == 0 ? string.Empty : " (coalesced " + suppressed + " repeats)";
+                                    System.IO.File.AppendAllText(LogPath, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + " [" + category + "] " + message + suffix + Environment.NewLine);
+                                }
+                            }
+                            catch { }
+                        }
 
-            // === Input ===
-            sb.AppendLine("    public static void JoyStrobe(byte v)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        bool high = (v & 1) != 0;");
-            sb.AppendLine("        if (JoyStrobeHigh && !high) { Joy1Latch = Joy1Buttons; Joy2Latch = Joy2Buttons; Joy1Idx = 0; Joy2Idx = 0; Log(\"joy-latch\", \"controller latched: P1=$\" + Joy1Latch.ToString(\"X2\"), false); }");
-            sb.AppendLine("        JoyStrobeHigh = high;");
-            sb.AppendLine("    }");
-            sb.AppendLine("    public static byte JoyRead1() { if (JoyStrobeHigh) return (byte)(Joy1Buttons & 1); int i = Joy1Idx++; byte value = (byte)(0x40 | (i < 8 ? ((Joy1Latch >> i) & 1) : 1)); if ((value & 1) != 0) Log(\"joy-read\", \"P1 serial read bit \" + i + \" = 1\", false); return value; }");
-            sb.AppendLine("    public static byte JoyRead2() { if (JoyStrobeHigh) return (byte)(Joy2Buttons & 1); int i = Joy2Idx++; return (byte)(0x40 | (i < 8 ? ((Joy2Latch >> i) & 1) : 1)); }");
-            sb.AppendLine();
+                        public static void SetCarry(bool v) { P = (byte)(v ? (P | 0x01) : (P & 0xFE)); }
+                        public static void SetZero(bool v) { P = (byte)(v ? (P | 0x02) : (P & 0xFD)); }
+                        public static void SetInterrupt(bool v) { P = (byte)(v ? (P | 0x04) : (P & 0xFB)); }
+                        public static void SetDecimal(bool v) { P = (byte)(v ? (P | 0x08) : (P & 0xF7)); }
+                        public static void SetOverflow(bool v) { P = (byte)(v ? (P | 0x40) : (P & 0xBF)); }
+                        public static void SetNegative(bool v) { P = (byte)(v ? (P | 0x80) : (P & 0x7F)); }
+                        public static void SetNZ(byte v) { P = (byte)((P & 0x7D) | (v == 0 ? 0x02 : 0) | (v & 0x80)); }
 
-            // === Throttle ===
-            sb.AppendLine("    public static void Throttle()");
-            sb.AppendLine("    {");
-            sb.AppendLine("        if (!ThrottleEnabled) return;");
-            sb.AppendLine("        long freq = System.Diagnostics.Stopwatch.Frequency;");
-            sb.AppendLine("        long now = System.Diagnostics.Stopwatch.GetTimestamp();");
-            sb.AppendLine("        long elapsedCycles = (now - ClockStart) * 1789773L / freq;");
-            sb.AppendLine("        long ahead = CpuCycles - elapsedCycles;");
-            sb.AppendLine("        if (ahead <= 1789L) return;");
-            sb.AppendLine("        // Never reset the clock when CPU is ahead: that was an unlimited-fast-forward path.");
-            sb.AppendLine("        long targetTimestamp = ClockStart + (CpuCycles - 1789L) * freq / 1789773L;");
-            sb.AppendLine("        long maxTs = now + 50000L * freq / 1000000L;");
-            sb.AppendLine("        if (targetTimestamp > maxTs) targetTimestamp = maxTs;");
-            sb.AppendLine("        long t;");
-            sb.AppendLine("        while ((t = System.Diagnostics.Stopwatch.GetTimestamp()) < targetTimestamp)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            long leftUs = (targetTimestamp - t) * 1000000L / freq;");
-            sb.AppendLine("            if (leftUs > 1500L) System.Threading.Thread.Sleep(1);");
-            sb.AppendLine("            else System.Threading.Thread.SpinWait(50);");
-            sb.AppendLine("        }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static void ThrottleFrame()");
-            sb.AppendLine("    {");
-            sb.AppendLine("        if (!ThrottleEnabled) return;");
-            sb.AppendLine("        long freq = System.Diagnostics.Stopwatch.Frequency;");
-            sb.AppendLine("        long now = System.Diagnostics.Stopwatch.GetTimestamp();");
-            sb.AppendLine("        long target = FrameClockStart + Ppu.FrameCount * freq / 60L;");
-            sb.AppendLine("        // After a debugger pause/window stall, resynchronise rather than freezing for stale time.");
-            sb.AppendLine("        if (target < now - freq) { FrameClockStart = now - Ppu.FrameCount * freq / 60L; return; }");
-            sb.AppendLine("        while ((now = System.Diagnostics.Stopwatch.GetTimestamp()) < target)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            long leftMs = (target - now) * 1000L / freq;");
-            sb.AppendLine("            if (leftMs > 1) Thread.Sleep((int)Math.Min(leftMs - 1, 10)); else Thread.SpinWait(80);");
-            sb.AppendLine("        }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
+                        public static byte Asl(byte v) { SetCarry((v & 0x80) != 0); v = (byte)(v << 1); SetNZ(v); return v; }
+                        public static byte Lsr(byte v) { SetCarry((v & 0x01) != 0); v = (byte)(v >> 1); SetNZ(v); return v; }
+                        public static byte Rol(byte v) { int c = (P & 0x01); SetCarry((v & 0x80) != 0); v = (byte)((v << 1) | c); SetNZ(v); return v; }
+                        public static byte Ror(byte v) { int c = (P & 0x01); SetCarry((v & 0x01) != 0); v = (byte)((v >> 1) | (c << 7)); SetNZ(v); return v; }
 
-            // === CheckNmi with cycle-based VBlank ===
-            sb.AppendLine("    public static void AdvanceCycles(int cycles)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        CpuCycles += cycles;");
-            sb.AppendLine("        Apu.ClockCpu(cycles);");
-            sb.AppendLine("        Ppu.Clock();");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static bool CheckNmi(ushort pc)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        if (CpuCycles >= NextThrottleCycle) { NextThrottleCycle = CpuCycles + 2048; Throttle(); }");
-            sb.AppendLine("        if (VblankClearCycle != 0 && CpuCycles >= VblankClearCycle) { Ppu.Status = (byte)(Ppu.Status & 0x1F); VblankClearCycle = 0; }");
-            sb.AppendLine();
-            sb.AppendLine("        if (CpuCycles >= NextVblankCycle)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            NextVblankCycle += 29780;");
-            sb.AppendLine("            VblankClearCycle = CpuCycles + 2273;");
-            sb.AppendLine("            Ppu.FrameCount++;");
-            sb.AppendLine("            ThrottleFrame();");
-            sb.AppendLine("            NmiPending = true;");
-            sb.AppendLine("            Ppu.Status = (byte)(Ppu.Status | 0x80);");
-            sb.AppendLine("            Ppu.BeginFrame();");
-            sb.AppendLine("            Log(\"nmi\", \"vblank/frame=\" + Ppu.FrameCount + \" cycles=\" + CpuCycles + \" pc=$\" + pc.ToString(\"X4\"), false);");
-            sb.AppendLine("        }");
-            sb.AppendLine();
-            sb.AppendLine("        if (InNmi && (CpuCycles - NmiEnterCycles) > 1500000L) InNmi = false;");
-            sb.AppendLine();
-            sb.AppendLine("        if (!NmiPending || InNmi || (Ppu.Ctrl & 0x80) == 0)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            if ((Ppu.Ctrl & 0x80) == 0) NmiPending = false;");
-            sb.AppendLine("            return false;");
-            sb.AppendLine("        }");
-            sb.AppendLine();
-            sb.AppendLine("        NmiPending = false;");
-            sb.AppendLine("        InNmi = true;");
-            sb.AppendLine("        NmiEnterCycles = CpuCycles;");
-            sb.AppendLine();
-            sb.AppendLine("        Push16(pc);");
-            sb.AppendLine("        Push((byte)((P & 0xEF) | 0x20));");
-            sb.AppendLine("        P = (byte)(P | 0x04);");
-            sb.AppendLine();
-            sb.AppendLine("        return true;");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("public static bool CheckIrq(ushort pc)");
-            sb.AppendLine("{");
-            sb.AppendLine("    if (!IrqPending) return false;");
-            sb.AppendLine("    if ((P & 0x04) != 0) return false;");
-            sb.AppendLine("    IrqPending = false;");
-            sb.AppendLine("    Push16(pc);");
-            sb.AppendLine("    Push((byte)((P & 0xEF) | 0x20));");
-            sb.AppendLine("    P = (byte)(P | 0x04);");
-            sb.AppendLine("    return true;");
-            sb.AppendLine("}");
-            sb.AppendLine();
+                        public static void Adc(byte v)
+                        {
+                            int aa = A; int vv = v; int c = (P & 0x01); int sum = aa + vv + c;
+                            SetOverflow(((~(aa ^ vv) & (aa ^ sum)) & 0x80) != 0);
+                            SetCarry(sum > 0xFF);
+                            A = (byte)sum; SetNZ(A);
+                        }
 
+                        public static void Sbc(byte v)
+                        {
+                            int aa = A; int vv = v; int c = (P & 0x01); int diff = aa - vv - (1 - c);
+                            SetOverflow((((aa ^ vv) & (aa ^ diff)) & 0x80) != 0);
+                            SetCarry(diff >= 0);
+                            A = (byte)diff; SetNZ(A);
+                        }
 
-            // Trap / error handling
-            sb.AppendLine("    public static void TraceInstruction(ushort pc)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        int slot = TraceWrite++ & 255;");
-            sb.AppendLine("        TraceRing[slot] = (ulong)pc | ((ulong)A << 16) | ((ulong)X << 24) | ((ulong)Y << 32) | ((ulong)SP << 40) | ((ulong)P << 48);");
-            sb.AppendLine("    }");
-            sb.AppendLine("    static void WriteTrapTrace()");
-            sb.AppendLine("    {");
-            sb.AppendLine("        try");
-            sb.AppendLine("        {");
-            sb.AppendLine("            var lines = new System.Text.StringBuilder();");
-            sb.AppendLine("            lines.AppendLine(LastError + \" cycles=\" + CpuCycles + \" instructions=\" + InsCount);");
-            sb.AppendLine("            for (int n = 0; n < TraceRing.Length; n++)");
-            sb.AppendLine("            {");
-            sb.AppendLine("                ulong r = TraceRing[(TraceWrite + n) & 255]; if (r == 0) continue;");
-            sb.AppendLine("                lines.Append(\"PC=$\").Append(((ushort)r).ToString(\"X4\")).Append(\" A=$\").Append(((byte)(r >> 16)).ToString(\"X2\")).Append(\" X=$\").Append(((byte)(r >> 24)).ToString(\"X2\")).Append(\" Y=$\").Append(((byte)(r >> 32)).ToString(\"X2\")).Append(\" SP=$\").Append(((byte)(r >> 40)).ToString(\"X2\")).Append(\" P=$\").Append(((byte)(r >> 48)).ToString(\"X2\")).AppendLine();");
-            sb.AppendLine("            }");
-            sb.AppendLine("            System.IO.File.WriteAllText(System.IO.Path.Combine(System.AppDomain.CurrentDomain.BaseDirectory, \"trap.log\"), lines.ToString());");
-            sb.AppendLine("        } catch { }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static void Trap(string message) { SetTrap(message); }");
-            sb.AppendLine("    public static void UnknownOpcode(byte op, ushort addr) { SetTrap(string.Format(\"Unknown opcode ${0:X2} at ${1:X4}\", op, addr)); }");
-            sb.AppendLine("    public static void OnCpuException(Exception ex) { SetTrap(\"CPU exception: \" + ex); }");
-            sb.AppendLine();
-            sb.AppendLine("    public static void SetTrap(string message)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        LastError = message + \" (PC=$\" + LastPC.ToString(\"X4\") + \")\";");
-            sb.AppendLine("        CpuState = \"Trap\";");
-            sb.AppendLine("        Audio.TryStop();");
-            sb.AppendLine("        WriteTrapTrace();");
-            sb.AppendLine("        if (LastTrap != LastError) { LastTrap = LastError; TrapCount++; Console.WriteLine(\"TRAP: \" + LastError); Log(\"trap\", LastError, true); }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
+                        public static void Compare(byte reg, byte v) { int diff = reg - v; SetCarry(reg >= v); SetNZ((byte)diff); }
+                        public static void Bit(byte v) { SetZero((A & v) == 0); SetOverflow((v & 0x40) != 0); SetNegative((v & 0x80) != 0); }
 
-            // Dynamic target reporting
-            sb.AppendLine("    public static void ReportDynamicTarget(ushort addr)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        if (addr < 0x8000 || addr >= 0xFFFA) return;");
-            sb.AppendLine("        lock (DynLock)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            if (!SeenDynamic.ContainsKey(addr))");
-            sb.AppendLine("            {");
-            sb.AppendLine("                SeenDynamic.Add(addr, true);");
-            sb.AppendLine("                try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.AppDomain.CurrentDomain.BaseDirectory, \"dynamic_targets.log\"), addr.ToString(\"X4\") + System.Environment.NewLine); } catch { }");
-            sb.AppendLine("            }");
-            sb.AppendLine("        }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
+                        public static ushort ReadPtrZp(byte ptr)
+                        {
+                            byte lo = Memory.Read(ptr);
+                            byte hi = Memory.Read((byte)(ptr + 1));
+                            return (ushort)(lo | (hi << 8));
+                        }
+
+                        public static ushort AddrXInd(byte op) { return ReadPtrZp((byte)(op + X)); }
+                        public static ushort AddrIndY(byte op) { return (ushort)(ReadPtrZp(op) + Y); }
+
+                        public static void Push(byte v) { Memory.Write((ushort)(0x100 + SP), v); SP = (byte)(SP - 1); }
+                        public static byte Pull() { SP = (byte)(SP + 1); return Memory.Read((ushort)(0x100 + SP)); }
+                        public static void Push16(ushort v) { Push((byte)(v >> 8)); Push((byte)(v & 0xFF)); }
+                        public static ushort Pull16() { byte lo = Pull(); byte hi = Pull(); return (ushort)(lo | (hi << 8)); }
+                        public static void JsrPush(ushort returnAddress) { Push16((ushort)(returnAddress - 1)); }
+                        public static ushort RtsPull() { return (ushort)(Pull16() + 1); }
+
+                        // === Input ===
+                        public static void JoyStrobe(byte v)
+                        {
+                            bool high = (v & 1) != 0;
+                            if (JoyStrobeHigh && !high) { Joy1Latch = Joy1Buttons; Joy2Latch = Joy2Buttons; Joy1Idx = 0; Joy2Idx = 0; Log("joy-latch", "controller latched: P1=$" + Joy1Latch.ToString("X2"), false); }
+                            JoyStrobeHigh = high;
+                        }
+
+                        public static byte JoyRead1() { if (JoyStrobeHigh) return (byte)(Joy1Buttons & 1); int i = Joy1Idx++; byte value = (byte)(0x40 | (i < 8 ? ((Joy1Latch >> i) & 1) : 1)); if ((value & 1) != 0) Log("joy-read", "P1 serial read bit " + i + " = 1", false); return value; }
+                        public static byte JoyRead2() { if (JoyStrobeHigh) return (byte)(Joy2Buttons & 1); int i = Joy2Idx++; return (byte)(0x40 | (i < 8 ? ((Joy2Latch >> i) & 1) : 1)); }
+
+                        // === Throttle ===
+                        public static void Throttle()
+                        {
+                            if (!ThrottleEnabled) return;
+                            long freq = System.Diagnostics.Stopwatch.Frequency;
+                            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+                            long elapsedCycles = (now - ClockStart) * 1789773L / freq;
+                            long ahead = CpuCycles - elapsedCycles;
+                            if (ahead <= 1789L) return;
+                            // Never reset the clock when CPU is ahead: that was an unlimited-fast-forward path.
+                            long targetTimestamp = ClockStart + (CpuCycles - 1789L) * freq / 1789773L;
+                            long maxTs = now + 50000L * freq / 1000000L;
+                            if (targetTimestamp > maxTs) targetTimestamp = maxTs;
+                            long t;
+                            while ((t = System.Diagnostics.Stopwatch.GetTimestamp()) < targetTimestamp)
+                            {
+                                long leftUs = (targetTimestamp - t) * 1000000L / freq;
+                                if (leftUs > 1500L) System.Threading.Thread.Sleep(1);
+                                else System.Threading.Thread.SpinWait(50);
+                            }
+                        }
+
+                        public static void ThrottleFrame()
+                        {
+                            if (!ThrottleEnabled) return;
+                            long freq = System.Diagnostics.Stopwatch.Frequency;
+                            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+                            long target = FrameClockStart + Ppu.FrameCount * freq / 60L;
+                            // After a debugger pause/window stall, resynchronise rather than freezing for stale time.
+                            if (target < now - freq) { FrameClockStart = now - Ppu.FrameCount * freq / 60L; return; }
+                            while ((now = System.Diagnostics.Stopwatch.GetTimestamp()) < target)
+                            {
+                                long leftMs = (target - now) * 1000L / freq;
+                                if (leftMs > 1) Thread.Sleep((int)Math.Min(leftMs - 1, 10)); else Thread.SpinWait(80);
+                            }
+                        }
+
+                        // === Cycles and interrupts ===
+                        public static void AdvanceCycles(int cycles)
+                        {
+                            CpuCycles += cycles;
+                            Apu.ClockCpu(cycles);
+                            Ppu.Clock();
+                        }
+
+                        public static bool CheckNmi(ushort pc)
+                        {
+                            if (CpuCycles >= NextThrottleCycle) { NextThrottleCycle = CpuCycles + 2048; Throttle(); }
+                            if (VblankClearCycle != 0 && CpuCycles >= VblankClearCycle) { Ppu.Status = (byte)(Ppu.Status & 0x1F); VblankClearCycle = 0; }
+
+                            if (CpuCycles >= NextVblankCycle)
+                            {
+                                NextVblankCycle += 29780;
+                                VblankClearCycle = CpuCycles + 2273;
+                                Ppu.FrameCount++;
+                                ThrottleFrame();
+                                NmiPending = true;
+                                Ppu.Status = (byte)(Ppu.Status | 0x80);
+                                Ppu.BeginFrame();
+                                Log("nmi", "vblank/frame=" + Ppu.FrameCount + " cycles=" + CpuCycles + " pc=$" + pc.ToString("X4"), false);
+                            }
+
+                            if (InNmi && (CpuCycles - NmiEnterCycles) > 1500000L) InNmi = false;
+
+                            if (!NmiPending || InNmi || (Ppu.Ctrl & 0x80) == 0)
+                            {
+                                if ((Ppu.Ctrl & 0x80) == 0) NmiPending = false;
+                                return false;
+                            }
+
+                            NmiPending = false;
+                            InNmi = true;
+                            NmiEnterCycles = CpuCycles;
+
+                            Push16(pc);
+                            Push((byte)((P & 0xEF) | 0x20));
+                            P = (byte)(P | 0x04);
+
+                            return true;
+                        }
+
+                        public static bool CheckIrq(ushort pc)
+                        {
+                            if (!IrqPending) return false;
+                            if ((P & 0x04) != 0) return false;
+                            IrqPending = false;
+                            Push16(pc);
+                            Push((byte)((P & 0xEF) | 0x20));
+                            P = (byte)(P | 0x04);
+                            return true;
+                        }
+
+                        // === Trap handling ===
+                        public static void TraceInstruction(ushort pc)
+                        {
+                            int slot = TraceWrite++ & 255;
+                            TraceRing[slot] = (ulong)pc | ((ulong)A << 16) | ((ulong)X << 24) | ((ulong)Y << 32) | ((ulong)SP << 40) | ((ulong)P << 48);
+                        }
+
+                        static void WriteTrapTrace()
+                        {
+                            try
+                            {
+                                var lines = new System.Text.StringBuilder();
+                                lines.AppendLine(LastError + " cycles=" + CpuCycles + " instructions=" + InsCount);
+                                for (int n = 0; n < TraceRing.Length; n++)
+                                {
+                                    ulong r = TraceRing[(TraceWrite + n) & 255]; if (r == 0) continue;
+                                    lines.Append("PC=$").Append(((ushort)r).ToString("X4")).Append(" A=$").Append(((byte)(r >> 16)).ToString("X2")).Append(" X=$").Append(((byte)(r >> 24)).ToString("X2")).Append(" Y=$").Append(((byte)(r >> 32)).ToString("X2")).Append(" SP=$").Append(((byte)(r >> 40)).ToString("X2")).Append(" P=$").Append(((byte)(r >> 48)).ToString("X2")).AppendLine();
+                                }
+                                System.IO.File.WriteAllText(System.IO.Path.Combine(System.AppDomain.CurrentDomain.BaseDirectory, "trap.log"), lines.ToString());
+                            } catch { }
+                        }
+
+                        public static void Trap(string message) { SetTrap(message); }
+                        public static void UnknownOpcode(byte op, ushort addr) { SetTrap(string.Format("Unknown opcode ${0:X2} at ${1:X4}", op, addr)); }
+                        public static void OnCpuException(Exception ex) { SetTrap("CPU exception: " + ex); }
+
+                        public static void SetTrap(string message)
+                        {
+                            LastError = message + " (PC=$" + LastPC.ToString("X4") + ")";
+                            CpuState = "Trap";
+                            Audio.TryStop();
+                            WriteTrapTrace();
+                            if (LastTrap != LastError) { LastTrap = LastError; TrapCount++; Console.WriteLine("TRAP: " + LastError); Log("trap", LastError, true); }
+                        }
+
+                        public static void ReportDynamicTarget(ushort addr)
+                        {
+                            if (addr < 0x8000 || addr >= 0xFFFA) return;
+                            lock (DynLock)
+                            {
+                                if (!SeenDynamic.ContainsKey(addr))
+                                {
+                                    SeenDynamic.Add(addr, true);
+                                    try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.AppDomain.CurrentDomain.BaseDirectory, "dynamic_targets.log"), addr.ToString("X4") + System.Environment.NewLine); } catch { }
+                                }
+                            }
+                        }
+
+                """));
+
+            AppendIconCapture(sb);
+        }
+
+        /// <summary>
+        /// Emits the screenshot-to-icon feature.
+        ///
+        /// The generated game owns the framebuffer, so it is the only place
+        /// that can capture a representative frame. After a configurable delay
+        /// (5 s by default, long enough for the title screen to settle) it
+        /// writes a multi-resolution ICO next to itself. NesLifter then embeds
+        /// that ICO into the apphost on the next build, so a re-lift gives the
+        /// game its own face without the user supplying artwork.
+        /// </summary>
+        private void AppendIconCapture(StringBuilder sb)
+        {
+            sb.Append(Raw("""
+                        /// <summary>
+                        /// Grabs one candidate frame and keeps it if it beats the best so far.
+                        /// Returns true when the capture window has closed.
+                        /// </summary>
+                        public static bool SampleIconCandidate()
+                        {
+                            try
+                            {
+                                if (CaptureIconSeconds <= 0) return true;
+
+                                IconSamples++;
+
+                                // Do not score the first few samples: the game is still
+                                // uploading its palette and nametables.
+                                if (IconSamples > 4)
+                                {
+                                    Ppu.RenderScreen();
+                                    int score = ScoreFrame(Ppu.Screen);
+
+                                    if (score > IconBestScore)
+                                    {
+                                        IconBestScore = score;
+                                        if (IconBest == null) IconBest = new byte[Ppu.Screen.Length];
+                                        Buffer.BlockCopy(Ppu.Screen, 0, IconBest, 0, Ppu.Screen.Length);
+                                    }
+                                }
+
+                                // 250 ms per sample.
+                                return IconSamples * 250 >= CaptureIconSeconds * 1000;
+                            }
+                            catch (Exception ex)
+                            {
+                                Log("icon-sample-fail", ex.Message, true);
+                                return true;
+                            }
+                        }
+
+                        /// <summary>
+                        /// Rough "how interesting is this frame" metric: distinct colours plus
+                        /// non-backdrop coverage. A flat fade-in scores near zero, a title
+                        /// screen scores high.
+                        /// </summary>
+                        static int ScoreFrame(byte[] screen)
+                        {
+                            int[] seen = new int[256];
+                            int distinct = 0;
+                            int nonBackdrop = 0;
+                            int backdrop = screen[0] | (screen[1] << 8) | (screen[2] << 16);
+
+                            for (int i = 0; i < screen.Length; i += 4)
+                            {
+                                int rgb = screen[i] | (screen[i + 1] << 8) | (screen[i + 2] << 16);
+                                int key = (int)(((uint)rgb * 2654435761u) >> 24) & 0xFF;
+                                seen[key]++;
+                                if (rgb != backdrop) nonBackdrop++;
+                            }
+
+                            for (int i = 0; i < seen.Length; i++)
+                                if (seen[i] > 32) distinct++;
+
+                            // Reward variety, then coverage. Coverage alone would favour a
+                            // full-screen text page over a colourful title screen.
+                            return distinct * 1000 + (nonBackdrop * 100) / (256 * 240);
+                        }
+
+                        /// <summary>
+                        /// Writes the best captured frame as a multi-resolution ICO.
+                        /// Called once, when the sampling window closes.
+                        /// </summary>
+                        public static void SaveIcon()
+                        {
+                            try
+                            {
+                                if (IconBest == null)
+                                {
+                                    Ppu.RenderScreen();
+                                    WriteIco(IconTargetPath(), Ppu.Screen, 256, 240);
+                                }
+                                else
+                                {
+                                    WriteIco(IconTargetPath(), IconBest, 256, 240);
+                                }
+
+                                Log("icon", "icon written: " + IconTargetPath() + " (score " + IconBestScore + ")", true);
+                                Console.WriteLine("icon: " + IconTargetPath());
+                            }
+                            catch (Exception ex)
+                            {
+                                Log("icon-fail", ex.Message, true);
+                            }
+                        }
+
+                        static string IconTargetPath()
+                        {
+                            if (!string.IsNullOrEmpty(IconOutputPath)) return IconOutputPath;
+                            return System.IO.Path.Combine(System.AppDomain.CurrentDomain.BaseDirectory, GameName + ".icon.ico");
+                        }
+
+                        /// <summary>
+                        /// Minimal ICO writer: 16..256 px, PNG for large sizes and
+                        /// 32-bpp DIB for small ones, letterboxed rather than stretched.
+                        /// </summary>
+                        static void WriteIco(string path, byte[] bgra, int width, int height)
+                        {
+                            int[] sizes = new int[] { 16, 20, 24, 32, 40, 48, 64, 128, 256 };
+                            System.Collections.Generic.List<byte[]> frames = new System.Collections.Generic.List<byte[]>();
+                            System.Collections.Generic.List<int> frameSizes = new System.Collections.Generic.List<int>();
+
+                            foreach (int size in sizes)
+                            {
+                                byte[] pixels = new byte[size * size * 4];
+
+                                // Nearest-neighbour: the source is 8-bit pixel art.
+                                for (int y = 0; y < size; y++)
+                                {
+                                    int sy = y * height / size;
+
+                                    for (int x = 0; x < size; x++)
+                                    {
+                                        int sx = x * width / size;
+                                        int src = (sy * width + sx) * 4;
+                                        int dst = (y * size + x) * 4;
+                                        pixels[dst] = bgra[src];
+                                        pixels[dst + 1] = bgra[src + 1];
+                                        pixels[dst + 2] = bgra[src + 2];
+                                        pixels[dst + 3] = 0xFF;
+                                    }
+                                }
+
+                                frames.Add(size >= 128 ? EncodePngIcon(pixels, size) : EncodeDibIcon(pixels, size));
+                                frameSizes.Add(size);
+                            }
+
+                            using (System.IO.FileStream fs = new System.IO.FileStream(path, System.IO.FileMode.Create, System.IO.FileAccess.Write))
+                            using (System.IO.BinaryWriter bw = new System.IO.BinaryWriter(fs))
+                            {
+                                bw.Write((ushort)0);
+                                bw.Write((ushort)1);
+                                bw.Write((ushort)frames.Count);
+
+                                int offset = 6 + 16 * frames.Count;
+
+                                for (int i = 0; i < frames.Count; i++)
+                                {
+                                    int size = frameSizes[i];
+                                    bw.Write((byte)(size >= 256 ? 0 : size));
+                                    bw.Write((byte)(size >= 256 ? 0 : size));
+                                    bw.Write((byte)0);
+                                    bw.Write((byte)0);
+                                    bw.Write((ushort)1);
+                                    bw.Write((ushort)32);
+                                    bw.Write(frames[i].Length);
+                                    bw.Write(offset);
+                                    offset += frames[i].Length;
+                                }
+
+                                foreach (byte[] frame in frames) bw.Write(frame);
+                            }
+                        }
+
+                        static byte[] EncodePngIcon(byte[] bgra, int size)
+                        {
+                            using (Bitmap bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb))
+                            {
+                                for (int y = 0; y < size; y++)
+                                    for (int x = 0; x < size; x++)
+                                    {
+                                        int i = (y * size + x) * 4;
+                                        bmp.SetPixel(x, y, Color.FromArgb(255, bgra[i + 2], bgra[i + 1], bgra[i]));
+                                    }
+
+                                using (System.IO.MemoryStream ms = new System.IO.MemoryStream())
+                                {
+                                    bmp.Save(ms, ImageFormat.Png);
+                                    return ms.ToArray();
+                                }
+                            }
+                        }
+
+                        static byte[] EncodeDibIcon(byte[] bgra, int size)
+                        {
+                            int andStride = ((size + 31) / 32) * 4;
+                            int andSize = andStride * size;
+
+                            using (System.IO.MemoryStream ms = new System.IO.MemoryStream())
+                            using (System.IO.BinaryWriter bw = new System.IO.BinaryWriter(ms))
+                            {
+                                bw.Write(40);
+                                bw.Write(size);
+                                bw.Write(size * 2);
+                                bw.Write((ushort)1);
+                                bw.Write((ushort)32);
+                                bw.Write(0);
+                                bw.Write(size * size * 4 + andSize);
+                                bw.Write(0); bw.Write(0); bw.Write(0); bw.Write(0);
+
+                                // DIB rows are bottom-up and BGRA, which is already our order.
+                                for (int y = size - 1; y >= 0; y--)
+                                    bw.Write(bgra, y * size * 4, size * 4);
+
+                                bw.Write(new byte[andSize]);
+                                bw.Flush();
+                                return ms.ToArray();
+                            }
+                        }
+
+                """));
         }
 
         // ================================================================
@@ -698,194 +907,204 @@ namespace NesLifter.Lifting
 
         private void AppendInterpreter(StringBuilder sb)
         {
-            // OpLen table
-            sb.Append("    public static readonly byte[] OpLen = new byte[256]{");
+            AppendOpcodeTable(sb, "OpLen", info => info?.Len ?? 1);
+            AppendOpcodeTable(sb, "OpCycles", info => info?.Cycles ?? 1);
+            AppendOpcodeTable(sb, "OpMnem", info => MnemIdFor(info));
+            AppendOpcodeTable(sb, "OpMode", info => info == null ? 0 : (int)info.Mode);
+
+            sb.Append(Raw("""
+                        /// <summary>
+                        /// Does this CPU address resolve to a lifted block under the
+                        /// *current* bank layout? The interpreter uses this to hand
+                        /// control back to the generated code.
+                        /// </summary>
+                        public static bool IsStaticLabel(ushort a)
+                        {
+                            return IsLifted(MapperStub.ToOffset(a));
+                        }
+
+                        static bool IsLifted(int offset)
+                        {
+                            switch (offset)
+                            {
+                    """));
+
+            foreach (int offset in _emitted)
+                sb.AppendLine("                case 0x" + offset.ToString("X6") + ": return true;");
+
+            sb.Append(Raw("""
+                                default: return false;
+                            }
+                        }
+
+                        static byte ReadOp(byte mode, ushort pc, byte imm)
+                        {
+                            switch (mode)
+                            {
+                                case 1: return A;
+                                case 2: return imm;
+                                case 3: return Memory.Read(imm);
+                                case 4: return Memory.Read((byte)(imm + X));
+                                case 5: return Memory.Read((byte)(imm + Y));
+                                case 6: return Memory.Read(Memory.Read16((ushort)(pc + 1)));
+                                case 7: return Memory.Read(unchecked((ushort)(Memory.Read16((ushort)(pc + 1)) + X)));
+                                case 8: return Memory.Read(unchecked((ushort)(Memory.Read16((ushort)(pc + 1)) + Y)));
+                                case 10: return Memory.Read(AddrXInd(imm));
+                                case 11: return Memory.Read(AddrIndY(imm));
+                                default: return 0;
+                            }
+                        }
+
+                        static ushort AddrOp(byte mode, ushort pc, byte imm)
+                        {
+                            switch (mode)
+                            {
+                                case 3: return imm;
+                                case 4: return (byte)(imm + X);
+                                case 5: return (byte)(imm + Y);
+                                case 6: return Memory.Read16((ushort)(pc + 1));
+                                case 7: return unchecked((ushort)(Memory.Read16((ushort)(pc + 1)) + X));
+                                case 8: return unchecked((ushort)(Memory.Read16((ushort)(pc + 1)) + Y));
+                                case 10: return AddrXInd(imm);
+                                case 11: return AddrIndY(imm);
+                                default: return 0;
+                            }
+                        }
+
+                        /// <summary>
+                        /// Executes 6502 directly until it lands on a lifted block.
+                        /// This is the safety net for code the static analysis could
+                        /// not prove reachable; every address it consumes is reported
+                        /// so the next lift can inline it.
+                        /// </summary>
+                        public static bool Interpret()
+                        {
+                            ushort pc = DispatchTarget;
+                            while (true)
+                            {
+                                // Executing RAM or I/O is never legitimate: it means an
+                                // address was computed wrongly. Fail with a precise
+                                // message instead of walking zero-filled memory until it
+                                // hits the vector table.
+                                if (pc < 0x4020)
+                                {
+                                    SetTrap("Execution entered non-code space at $" + pc.ToString("X4") + " (RAM/IO). This is a lifter bug: report the ROM and this address.");
+                                    return false;
+                                }
+
+                                if (CheckNmi(pc)) { DispatchTarget = NmiVector; return true; }
+                                if (IsStaticLabel(pc)) { DispatchTarget = pc; return true; }
+
+                                byte op = Memory.Read(pc);
+                                LastPC = pc; TraceInstruction(pc); InsCount++; AdvanceCycles(OpCycles[op]);
+                                byte mnem = OpMnem[op];
+                                byte mode = OpMode[op];
+                                byte len = OpLen[op];
+                                byte imm = (len >= 2) ? Memory.Read((ushort)(pc + 1)) : (byte)0;
+
+                                // Control flow
+                                switch (mnem)
+                                {
+                                    case 44: { ushort tgt; if (mode == 9) { ushort ptr = Memory.Read16((ushort)(pc + 1)); ushort loAddr = ptr; ushort hiAddr = (ushort)((ptr & 0xFF00) | ((ptr + 1) & 0x00FF)); tgt = (ushort)(Memory.Read(loAddr) | (Memory.Read(hiAddr) << 8)); } else { tgt = Memory.Read16((ushort)(pc + 1)); } if (IsStaticLabel(tgt)) { DispatchTarget = tgt; return true; } pc = tgt; continue; }
+                                    case 45: { JsrPush((ushort)(pc + 3)); ushort tgt = Memory.Read16((ushort)(pc + 1)); if (IsStaticLabel(tgt)) { DispatchTarget = tgt; return true; } pc = tgt; continue; }
+                                    case 46: { ushort tgt = RtsPull(); if (IsStaticLabel(tgt)) { DispatchTarget = tgt; return true; } pc = tgt; continue; }
+                                    case 47: { P = (byte)((Pull() & 0xEF) | 0x20); ushort tgt = Pull16(); InNmi = false; if (IsStaticLabel(tgt)) { DispatchTarget = tgt; return true; } pc = tgt; continue; }
+                                    case 48: { Push16((ushort)(pc + 2)); Push((byte)(P | 0x30)); P = (byte)(P | 0x04); ushort tgt = Memory.Read16(0xFFFE); if (IsStaticLabel(tgt)) { DispatchTarget = tgt; return true; } pc = tgt; continue; }
+                                    case 49: { bool c; switch (op) { case 0x10: c = (P & 0x80) == 0; break; case 0x30: c = (P & 0x80) != 0; break; case 0x50: c = (P & 0x40) == 0; break; case 0x70: c = (P & 0x40) != 0; break; case 0x90: c = (P & 0x01) == 0; break; case 0xB0: c = (P & 0x01) != 0; break; case 0xD0: c = (P & 0x02) == 0; break; case 0xF0: c = (P & 0x02) != 0; break; default: c = false; break; } ushort nxt = c ? (ushort)(pc + 2 + (sbyte)imm) : (ushort)(pc + 2); if (IsStaticLabel(nxt)) { DispatchTarget = nxt; return true; } pc = nxt; continue; }
+                                }
+
+                                // Normal instructions
+                                byte val = ReadOp(mode, pc, imm);
+                                switch (mnem)
+                                {
+                                    case 1: A = val; SetNZ(A); break;
+                                    case 2: X = val; SetNZ(X); break;
+                                    case 3: Y = val; SetNZ(Y); break;
+                                    case 4: Memory.Write(AddrOp(mode, pc, imm), A); break;
+                                    case 5: Memory.Write(AddrOp(mode, pc, imm), X); break;
+                                    case 6: Memory.Write(AddrOp(mode, pc, imm), Y); break;
+                                    case 7: X = A; SetNZ(X); break;
+                                    case 8: Y = A; SetNZ(Y); break;
+                                    case 9: A = X; SetNZ(A); break;
+                                    case 10: A = Y; SetNZ(A); break;
+                                    case 11: SP = X; break;
+                                    case 12: X = SP; SetNZ(X); break;
+                                    case 13: X = (byte)(X + 1); SetNZ(X); break;
+                                    case 14: Y = (byte)(Y + 1); SetNZ(Y); break;
+                                    case 15: X = (byte)(X - 1); SetNZ(X); break;
+                                    case 16: Y = (byte)(Y - 1); SetNZ(Y); break;
+                                    case 17: Adc(val); break;
+                                    case 18: Sbc(val); break;
+                                    case 19: Compare(A, val); break;
+                                    case 20: Compare(X, val); break;
+                                    case 21: Compare(Y, val); break;
+                                    case 22: A = (byte)(A & val); SetNZ(A); break;
+                                    case 23: A = (byte)(A | val); SetNZ(A); break;
+                                    case 24: A = (byte)(A ^ val); SetNZ(A); break;
+                                    case 25: Bit(val); break;
+                                    case 26: if (mode == 1) A = Asl(A); else { ushort a = AddrOp(mode, pc, imm); Memory.Write(a, Asl(Memory.Read(a))); } break;
+                                    case 27: if (mode == 1) A = Lsr(A); else { ushort a = AddrOp(mode, pc, imm); Memory.Write(a, Lsr(Memory.Read(a))); } break;
+                                    case 28: if (mode == 1) A = Rol(A); else { ushort a = AddrOp(mode, pc, imm); Memory.Write(a, Rol(Memory.Read(a))); } break;
+                                    case 29: if (mode == 1) A = Ror(A); else { ushort a = AddrOp(mode, pc, imm); Memory.Write(a, Ror(Memory.Read(a))); } break;
+                                    case 30: { ushort a = AddrOp(mode, pc, imm); byte t = (byte)(Memory.Read(a) + 1); SetNZ(t); Memory.Write(a, t); } break;
+                                    case 31: { ushort a = AddrOp(mode, pc, imm); byte t = (byte)(Memory.Read(a) - 1); SetNZ(t); Memory.Write(a, t); } break;
+                                    case 32: P = (byte)(P & 0xFE); break;
+                                    case 33: P = (byte)(P | 0x01); break;
+                                    case 34: P = (byte)(P & 0xFB); break;
+                                    case 35: P = (byte)(P | 0x04); break;
+                                    case 36: P = (byte)(P & 0xBF); break;
+                                    case 37: P = (byte)(P & 0xF7); break;
+                                    case 38: P = (byte)(P | 0x08); break;
+                                    case 39: Push(A); break;
+                                    case 40: A = Pull(); SetNZ(A); break;
+                                    case 41: Push((byte)(P | 0x30)); break;
+                                    case 42: P = (byte)((Pull() & 0xEF) | 0x20); break;
+                                    case 43: break;
+                                    case 50: A = X = val; SetNZ(A); break;
+                                    case 51: Memory.Write(AddrOp(mode, pc, imm), (byte)(A & X)); break;
+                                    case 52: { ushort a = AddrOp(mode, pc, imm); byte t = (byte)(Memory.Read(a) - 1); Memory.Write(a, t); Compare(A, t); } break;
+                                    case 53: { ushort a = AddrOp(mode, pc, imm); byte t = (byte)(Memory.Read(a) + 1); Memory.Write(a, t); Sbc(t); } break;
+                                    case 54: { ushort a = AddrOp(mode, pc, imm); byte t = Asl(Memory.Read(a)); Memory.Write(a, t); A = (byte)(A | t); SetNZ(A); } break;
+                                    case 55: { ushort a = AddrOp(mode, pc, imm); byte t = Rol(Memory.Read(a)); Memory.Write(a, t); A = (byte)(A & t); SetNZ(A); } break;
+                                    case 56: { ushort a = AddrOp(mode, pc, imm); byte t = Lsr(Memory.Read(a)); Memory.Write(a, t); A = (byte)(A ^ t); SetNZ(A); } break;
+                                    case 57: { ushort a = AddrOp(mode, pc, imm); byte t = Ror(Memory.Read(a)); Memory.Write(a, t); Adc(t); } break;
+                                    case 58: A = (byte)(A & val); SetCarry((A & 0x80) != 0); SetNZ(A); break;
+                                    case 59: A = Lsr((byte)(A & val)); break;
+                                    case 60: A = Ror((byte)(A & val)); break;
+                                    case 61: A = (byte)((A | 0xEE) & X & val); SetNZ(A); break;
+                                    case 62: A = (byte)((A | 0xEE) & val); X = A; SetNZ(A); break;
+                                    case 63: { int t = (A & X) - val; X = (byte)t; SetCarry(t >= 0); SetNZ(X); } break;
+                                    case 64: Memory.Write(AddrOp(mode, pc, imm), Y); break;
+                                    case 65: SP = (byte)(SP & val); A = SP; X = SP; SetNZ(SP); break;
+                                    case 66: Memory.Write(AddrOp(mode, pc, imm), (byte)(A & X)); break;
+                                    case 67: DispatchTarget = pc; return false;
+                                    default: DispatchTarget = pc; return false;
+                                }
+
+                                pc = (ushort)(pc + len);
+                            }
+                        }
+
+                """));
+        }
+
+        /// <summary>
+        /// Emits one <c>byte[256]</c> opcode table. Tables are data, not text, so
+        /// they are written on one line and left unformatted on purpose.
+        /// </summary>
+        private static void AppendOpcodeTable(StringBuilder sb, string name, Func<OpInfo?, int> selector)
+        {
+            sb.Append("    public static readonly byte[] " + name + " = new byte[256]{");
+
             for (int i = 0; i < 256; i++)
             {
-                if (i > 0) sb.Append(",");
-                OpInfo oi = Cpu6502.Table[i];
-                int len = (oi == null) ? 1 : oi.Len;
-                sb.Append(len.ToString(CultureInfo.InvariantCulture));
+                if (i > 0)
+                    sb.Append(',');
+
+                sb.Append(selector(Cpu6502.Table[i]).ToString(CultureInfo.InvariantCulture));
             }
+
             sb.AppendLine("};");
-
-            // OpCycles table
-            sb.Append("    public static readonly byte[] OpCycles = new byte[256]{");
-            for (int i = 0; i < 256; i++)
-            {
-                if (i > 0) sb.Append(",");
-                OpInfo oi = Cpu6502.Table[i];
-                int cyc = (oi == null) ? 1 : oi.Cycles;
-                sb.Append(cyc.ToString(CultureInfo.InvariantCulture));
-            }
-            sb.AppendLine("};");
-
-            // OpMnem table
-            sb.Append("    public static readonly byte[] OpMnem = new byte[256]{");
-            for (int i = 0; i < 256; i++)
-            {
-                if (i > 0) sb.Append(",");
-                sb.Append(MnemIdFor(Cpu6502.Table[i]).ToString(CultureInfo.InvariantCulture));
-            }
-            sb.AppendLine("};");
-
-            // OpMode table
-            sb.Append("    public static readonly byte[] OpMode = new byte[256]{");
-            for (int i = 0; i < 256; i++)
-            {
-                if (i > 0) sb.Append(",");
-                OpInfo oi = Cpu6502.Table[i];
-                int m = (oi == null) ? 0 : (int)oi.Mode;
-                sb.Append(m.ToString(CultureInfo.InvariantCulture));
-            }
-            sb.AppendLine("};");
-
-            // IsStaticLabel
-            sb.AppendLine("    public static bool IsStaticLabel(ushort a)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        switch (a) {");
-            foreach (ushort a in _emitted)
-                sb.AppendLine("            case 0x" + a.ToString("X4") + ": return true;");
-            sb.AppendLine("            default: return false;");
-            sb.AppendLine("        }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-
-            // ReadOp
-            sb.AppendLine("    static byte ReadOp(byte mode, ushort pc, byte imm)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        switch (mode) {");
-            sb.AppendLine("            case 1: return A;");
-            sb.AppendLine("            case 2: return imm;");
-            sb.AppendLine("            case 3: return Memory.Read(imm);");
-            sb.AppendLine("            case 4: return Memory.Read((byte)(imm + X));");
-            sb.AppendLine("            case 5: return Memory.Read((byte)(imm + Y));");
-            sb.AppendLine("            case 6: return Memory.Read(Memory.Read16((ushort)(pc + 1)));");
-            sb.AppendLine("            case 7: return Memory.Read(unchecked((ushort)(Memory.Read16((ushort)(pc + 1)) + X)));");
-            sb.AppendLine("            case 8: return Memory.Read(unchecked((ushort)(Memory.Read16((ushort)(pc + 1)) + Y)));");
-            sb.AppendLine("            case 10: return Memory.Read(AddrXInd(imm));");
-            sb.AppendLine("            case 11: return Memory.Read(AddrIndY(imm));");
-            sb.AppendLine("            default: return 0;");
-            sb.AppendLine("        }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-
-            // AddrOp
-            sb.AppendLine("    static ushort AddrOp(byte mode, ushort pc, byte imm)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        switch (mode) {");
-            sb.AppendLine("            case 3: return imm;");
-            sb.AppendLine("            case 4: return (byte)(imm + X);");
-            sb.AppendLine("            case 5: return (byte)(imm + Y);");
-            sb.AppendLine("            case 6: return Memory.Read16((ushort)(pc + 1));");
-            sb.AppendLine("            case 7: return unchecked((ushort)(Memory.Read16((ushort)(pc + 1)) + X));");
-            sb.AppendLine("            case 8: return unchecked((ushort)(Memory.Read16((ushort)(pc + 1)) + Y));");
-            sb.AppendLine("            case 10: return AddrXInd(imm);");
-            sb.AppendLine("            case 11: return AddrIndY(imm);");
-            sb.AppendLine("            default: return 0;");
-            sb.AppendLine("        }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-
-            // Interpret
-            sb.AppendLine("    public static bool Interpret()");
-            sb.AppendLine("    {");
-            sb.AppendLine("        ushort pc = DispatchTarget;");
-            sb.AppendLine("        while (true)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            if (CheckNmi(pc)) { DispatchTarget = NmiVector; return true; }");
-            sb.AppendLine("            if (IsStaticLabel(pc)) { DispatchTarget = pc; return true; }");
-            sb.AppendLine("            byte op = Memory.Read(pc);");
-            sb.AppendLine("            LastPC = pc; TraceInstruction(pc); InsCount++; AdvanceCycles(OpCycles[op]);");
-            sb.AppendLine("            byte mnem = OpMnem[op];");
-            sb.AppendLine("            byte mode = OpMode[op];");
-            sb.AppendLine("            byte len = OpLen[op];");
-            sb.AppendLine("            byte imm = (len >= 2) ? Memory.Read((ushort)(pc + 1)) : (byte)0;");
-            sb.AppendLine();
-
-            // Control flow
-            sb.AppendLine("            switch (mnem) {");
-            sb.AppendLine("                case 44: { ushort tgt; if (mode == 9) { ushort ptr = Memory.Read16((ushort)(pc + 1)); ushort loAddr = ptr; ushort hiAddr = (ushort)((ptr & 0xFF00) | ((ptr + 1) & 0x00FF)); tgt = (ushort)(Memory.Read(loAddr) | (Memory.Read(hiAddr) << 8)); } else { tgt = Memory.Read16((ushort)(pc + 1)); } if (IsStaticLabel(tgt)) { DispatchTarget = tgt; return true; } pc = tgt; continue; }");
-            sb.AppendLine("                case 45: { JsrPush((ushort)(pc + 3)); ushort tgt = Memory.Read16((ushort)(pc + 1)); if (IsStaticLabel(tgt)) { DispatchTarget = tgt; return true; } pc = tgt; continue; }");
-            sb.AppendLine("                case 46: { ushort tgt = RtsPull(); if (IsStaticLabel(tgt)) { DispatchTarget = tgt; return true; } pc = tgt; continue; }");
-            sb.AppendLine("                case 47: { P = (byte)((Pull() & 0xEF) | 0x20); ushort tgt = Pull16(); InNmi = false; if (IsStaticLabel(tgt)) { DispatchTarget = tgt; return true; } pc = tgt; continue; }");
-            sb.AppendLine("                case 48: { Push16((ushort)(pc + 2)); Push((byte)(P | 0x30)); P = (byte)(P | 0x04); ushort tgt = Memory.Read16(0xFFFE); if (IsStaticLabel(tgt)) { DispatchTarget = tgt; return true; } pc = tgt; continue; }");
-            sb.AppendLine("                case 49: { bool c; switch (op) { case 0x10: c = (P & 0x80) == 0; break; case 0x30: c = (P & 0x80) != 0; break; case 0x50: c = (P & 0x40) == 0; break; case 0x70: c = (P & 0x40) != 0; break; case 0x90: c = (P & 0x01) == 0; break; case 0xB0: c = (P & 0x01) != 0; break; case 0xD0: c = (P & 0x02) == 0; break; case 0xF0: c = (P & 0x02) != 0; break; default: c = false; break; } ushort nxt = c ? (ushort)(pc + 2 + (sbyte)imm) : (ushort)(pc + 2); if (IsStaticLabel(nxt)) { DispatchTarget = nxt; return true; } pc = nxt; continue; }");
-            sb.AppendLine("            }");
-            sb.AppendLine();
-
-            // Normal instructions
-            sb.AppendLine("            byte val = ReadOp(mode, pc, imm);");
-            sb.AppendLine("            switch (mnem) {");
-            sb.AppendLine("                case 1: A = val; SetNZ(A); break;");
-            sb.AppendLine("                case 2: X = val; SetNZ(X); break;");
-            sb.AppendLine("                case 3: Y = val; SetNZ(Y); break;");
-            sb.AppendLine("                case 4: Memory.Write(AddrOp(mode, pc, imm), A); break;");
-            sb.AppendLine("                case 5: Memory.Write(AddrOp(mode, pc, imm), X); break;");
-            sb.AppendLine("                case 6: Memory.Write(AddrOp(mode, pc, imm), Y); break;");
-            sb.AppendLine("                case 7: X = A; SetNZ(X); break;");
-            sb.AppendLine("                case 8: Y = A; SetNZ(Y); break;");
-            sb.AppendLine("                case 9: A = X; SetNZ(A); break;");
-            sb.AppendLine("                case 10: A = Y; SetNZ(A); break;");
-            sb.AppendLine("                case 11: SP = X; break;");
-            sb.AppendLine("                case 12: X = SP; SetNZ(X); break;");
-            sb.AppendLine("                case 13: X = (byte)(X + 1); SetNZ(X); break;");
-            sb.AppendLine("                case 14: Y = (byte)(Y + 1); SetNZ(Y); break;");
-            sb.AppendLine("                case 15: X = (byte)(X - 1); SetNZ(X); break;");
-            sb.AppendLine("                case 16: Y = (byte)(Y - 1); SetNZ(Y); break;");
-            sb.AppendLine("                case 17: Adc(val); break;");
-            sb.AppendLine("                case 18: Sbc(val); break;");
-            sb.AppendLine("                case 19: Compare(A, val); break;");
-            sb.AppendLine("                case 20: Compare(X, val); break;");
-            sb.AppendLine("                case 21: Compare(Y, val); break;");
-            sb.AppendLine("                case 22: A = (byte)(A & val); SetNZ(A); break;");
-            sb.AppendLine("                case 23: A = (byte)(A | val); SetNZ(A); break;");
-            sb.AppendLine("                case 24: A = (byte)(A ^ val); SetNZ(A); break;");
-            sb.AppendLine("                case 25: Bit(val); break;");
-            sb.AppendLine("                case 26: if (mode == 1) A = Asl(A); else { ushort a = AddrOp(mode, pc, imm); Memory.Write(a, Asl(Memory.Read(a))); } break;");
-            sb.AppendLine("                case 27: if (mode == 1) A = Lsr(A); else { ushort a = AddrOp(mode, pc, imm); Memory.Write(a, Lsr(Memory.Read(a))); } break;");
-            sb.AppendLine("                case 28: if (mode == 1) A = Rol(A); else { ushort a = AddrOp(mode, pc, imm); Memory.Write(a, Rol(Memory.Read(a))); } break;");
-            sb.AppendLine("                case 29: if (mode == 1) A = Ror(A); else { ushort a = AddrOp(mode, pc, imm); Memory.Write(a, Ror(Memory.Read(a))); } break;");
-            sb.AppendLine("                case 30: { ushort a = AddrOp(mode, pc, imm); byte t = (byte)(Memory.Read(a) + 1); SetNZ(t); Memory.Write(a, t); } break;");
-            sb.AppendLine("                case 31: { ushort a = AddrOp(mode, pc, imm); byte t = (byte)(Memory.Read(a) - 1); SetNZ(t); Memory.Write(a, t); } break;");
-            sb.AppendLine("                case 32: P = (byte)(P & 0xFE); break;");
-            sb.AppendLine("                case 33: P = (byte)(P | 0x01); break;");
-            sb.AppendLine("                case 34: P = (byte)(P & 0xFB); break;");
-            sb.AppendLine("                case 35: P = (byte)(P | 0x04); break;");
-            sb.AppendLine("                case 36: P = (byte)(P & 0xBF); break;");
-            sb.AppendLine("                case 37: P = (byte)(P & 0xF7); break;");
-            sb.AppendLine("                case 38: P = (byte)(P | 0x08); break;");
-            sb.AppendLine("                case 39: Push(A); break;");
-            sb.AppendLine("                case 40: A = Pull(); SetNZ(A); break;");
-            sb.AppendLine("                case 41: Push((byte)(P | 0x30)); break;");
-            sb.AppendLine("                case 42: P = (byte)((Pull() & 0xEF) | 0x20); break;");
-            sb.AppendLine("                case 43: break;");
-            sb.AppendLine("                case 50: A = X = val; SetNZ(A); break;");
-            sb.AppendLine("                case 51: Memory.Write(AddrOp(mode, pc, imm), (byte)(A & X)); break;");
-            sb.AppendLine("                case 52: { ushort a = AddrOp(mode, pc, imm); byte t = (byte)(Memory.Read(a) - 1); Memory.Write(a, t); Compare(A, t); } break;");
-            sb.AppendLine("                case 53: { ushort a = AddrOp(mode, pc, imm); byte t = (byte)(Memory.Read(a) + 1); Memory.Write(a, t); Sbc(t); } break;");
-            sb.AppendLine("                case 54: { ushort a = AddrOp(mode, pc, imm); byte t = Asl(Memory.Read(a)); Memory.Write(a, t); A = (byte)(A | t); SetNZ(A); } break;");
-            sb.AppendLine("                case 55: { ushort a = AddrOp(mode, pc, imm); byte t = Rol(Memory.Read(a)); Memory.Write(a, t); A = (byte)(A & t); SetNZ(A); } break;");
-            sb.AppendLine("                case 56: { ushort a = AddrOp(mode, pc, imm); byte t = Lsr(Memory.Read(a)); Memory.Write(a, t); A = (byte)(A ^ t); SetNZ(A); } break;");
-            sb.AppendLine("                case 57: { ushort a = AddrOp(mode, pc, imm); byte t = Ror(Memory.Read(a)); Memory.Write(a, t); Adc(t); } break;");
-            sb.AppendLine("                case 58: A = (byte)(A & val); SetCarry((A & 0x80) != 0); SetNZ(A); break;");
-            sb.AppendLine("                case 59: A = Lsr((byte)(A & val)); break;");
-            sb.AppendLine("                case 60: A = Ror((byte)(A & val)); break;");
-            sb.AppendLine("                case 61: A = (byte)((A | 0xEE) & X & val); SetNZ(A); break;");
-            sb.AppendLine("                case 62: A = (byte)((A | 0xEE) & val); X = A; SetNZ(A); break;");
-            sb.AppendLine("                case 63: { int t = (A & X) - val; X = (byte)t; SetCarry(t >= 0); SetNZ(X); } break;");
-            sb.AppendLine("                case 64: Memory.Write(AddrOp(mode, pc, imm), Y); break;");
-            sb.AppendLine("                case 65: SP = (byte)(SP & val); A = SP; X = SP; SetNZ(SP); break;");
-            sb.AppendLine("                case 66: Memory.Write(AddrOp(mode, pc, imm), (byte)(A & X)); break;");
-            sb.AppendLine("                case 67: DispatchTarget = pc; return false;");
-            sb.AppendLine("                default: DispatchTarget = pc; return false;");
-            sb.AppendLine("            }");
-            sb.AppendLine("            pc = (ushort)(pc + len);");
-            sb.AppendLine("        }");
-            sb.AppendLine("        DispatchTarget = pc;");
-            sb.AppendLine("        return false;");
-            sb.AppendLine("    }");
-            sb.AppendLine();
         }
 
         // ================================================================
@@ -894,47 +1113,49 @@ namespace NesLifter.Lifting
 
         private void AppendMemory(StringBuilder sb)
         {
-            sb.AppendLine("static class Memory");
-            sb.AppendLine("{");
-            sb.AppendLine("    public static void Reset()");
-            sb.AppendLine("    {");
-            sb.AppendLine("        Array.Clear(Runtime.Ram, 0, Runtime.Ram.Length);");
-            sb.AppendLine("        Array.Clear(Runtime.Wram, 0, Runtime.Wram.Length);");
-            sb.AppendLine("        Array.Clear(Runtime.ChrRam, 0, Runtime.ChrRam.Length);");
-            sb.AppendLine("        MapperStub.Reset();");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static byte Read(ushort addr)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        if (addr < 0x2000) return Runtime.Ram[addr & 0x07FF];");
-            sb.AppendLine("        if (addr < 0x4000) return Ppu.ReadReg((ushort)(0x2000 + (addr & 7)));");
-            sb.AppendLine("        if (addr < 0x4020) return Apu.ReadReg(addr);");
-            sb.AppendLine("        return MapperStub.Read(addr);");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static void Write(ushort addr, byte value)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        if (addr < 0x2000) { Runtime.Ram[addr & 0x07FF] = value; return; }");
-            sb.AppendLine("        if (addr < 0x4000) { Ppu.WriteReg((ushort)(0x2000 + (addr & 7)), value); return; }");
-            sb.AppendLine("        if (addr < 0x4020)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            if (addr == 0x4014) { Ppu.DmaOam(value); return; }");
-            sb.AppendLine("            Apu.WriteReg(addr, value); return;");
-            sb.AppendLine("        }");
-            sb.AppendLine("        MapperStub.Write(addr, value);");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static ushort Read16(ushort addr)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        return (ushort)(Read(addr) | (Read((ushort)(addr + 1)) << 8));");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static byte ReadPrg(ushort addr)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        return MapperStub.ReadPrg(addr);");
-            sb.AppendLine("    }");
-            sb.AppendLine("}");
-            sb.AppendLine();
+            sb.Append(Raw("""
+                static class Memory
+                {
+                    public static void Reset()
+                    {
+                        Array.Clear(Runtime.Ram, 0, Runtime.Ram.Length);
+                        Array.Clear(Runtime.Wram, 0, Runtime.Wram.Length);
+                        Array.Clear(Runtime.ChrRam, 0, Runtime.ChrRam.Length);
+                        MapperStub.Reset();
+                    }
+
+                    public static byte Read(ushort addr)
+                    {
+                        if (addr < 0x2000) return Runtime.Ram[addr & 0x07FF];
+                        if (addr < 0x4000) return Ppu.ReadReg((ushort)(0x2000 + (addr & 7)));
+                        if (addr < 0x4020) return Apu.ReadReg(addr);
+                        return MapperStub.Read(addr);
+                    }
+
+                    public static void Write(ushort addr, byte value)
+                    {
+                        if (addr < 0x2000) { Runtime.Ram[addr & 0x07FF] = value; return; }
+                        if (addr < 0x4000) { Ppu.WriteReg((ushort)(0x2000 + (addr & 7)), value); return; }
+                        if (addr < 0x4020)
+                        {
+                            if (addr == 0x4014) { Ppu.DmaOam(value); return; }
+                            Apu.WriteReg(addr, value); return;
+                        }
+                        MapperStub.Write(addr, value);
+                    }
+
+                    public static ushort Read16(ushort addr)
+                    {
+                        return (ushort)(Read(addr) | (Read((ushort)(addr + 1)) << 8));
+                    }
+
+                    public static byte ReadPrg(ushort addr)
+                    {
+                        return MapperStub.ReadPrg(addr);
+                    }
+                }
+
+                """));
         }
 
         // ================================================================
@@ -943,439 +1164,447 @@ namespace NesLifter.Lifting
 
         private void AppendPpu(StringBuilder sb)
         {
-            sb.AppendLine("static class Ppu");
-            sb.AppendLine("{");
-            sb.AppendLine("    public static volatile byte Ctrl, Mask, Status, OamAddr, ScrollX, ScrollY;");
-            sb.AppendLine("    public static bool WToggle;");
-            sb.AppendLine("    public static volatile ushort VRamAddr;");
-            sb.AppendLine("    public static byte DataBuffer;");
-            sb.AppendLine("    public static byte[] VRam = new byte[0x4000];");
-            sb.AppendLine("    public static byte[] Oam = new byte[256];");
-            sb.AppendLine("    public static byte[] Palette = new byte[32];");
-            sb.AppendLine("    // Per-pixel background opacity for the PPU sprite-priority bit.");
-            sb.AppendLine("    static byte[] BackgroundOpaque = new byte[256 * 240];");
-            sb.AppendLine("    sealed class RenderState");
-            sb.AppendLine("    {");
-            sb.AppendLine("        public readonly byte[] VRam = new byte[0x4000], Oam = new byte[256], Palette = new byte[32];");
-            sb.AppendLine("        public byte Ctrl, Mask; public int Mirroring, SplitY, ScrollX0, ScrollY0, BaseNt0, ScrollX1, ScrollY1, BaseNt1; public bool SplitActive;");
-            sb.AppendLine("        public readonly int[] LineScrollX = new int[240], LineScrollY = new int[240], LineBaseNt = new int[240];");
-            sb.AppendLine("    }");
-            sb.AppendLine("    // Front is immutable for the renderer; CPU fills Back and swaps references only after the copy.");
-            sb.AppendLine("    static RenderState RenderFront = new RenderState(), RenderBack = new RenderState();");
-            sb.AppendLine("    public static byte[] Screen = new byte[256 * 240 * 4];");
-            sb.AppendLine("    public static int FrameCount;");
-            sb.AppendLine("    public static int SplitY;");
-            sb.AppendLine("    public static int ScrollX0, ScrollY0, BaseNt0;");
-            sb.AppendLine("    public static int ScrollX1, ScrollY1, BaseNt1;");
-            sb.AppendLine("    public static long FrameStartCycles;");
-            sb.AppendLine("    public static bool Sprite0Polled;");
-            sb.AppendLine("    public static volatile bool FrameReady;");
-            sb.AppendLine("    static int _sprite0Y;");
-            sb.AppendLine("    public static int TempAddr, RefreshAddr, XOffset;");
-            sb.AppendLine("    public static bool SplitActive;");
-            sb.AppendLine("    static int LastCapturedScanline = -1;");
-            sb.AppendLine("    static readonly int[] LiveLineScrollX = new int[240], LiveLineScrollY = new int[240], LiveLineBaseNt = new int[240];");
-            sb.AppendLine();
-            sb.AppendLine("    public static int[] NesPalette = new int[64]");
-            sb.AppendLine("    {");
-            sb.AppendLine("        0x7C7C7C, 0x0000FC, 0x0000BC, 0x4428BC, 0x940084, 0xA80020, 0xA81000, 0x881400,");
-            sb.AppendLine("        0x503000, 0x007800, 0x006800, 0x005800, 0x004058, 0x000000, 0x000000, 0x000000,");
-            sb.AppendLine("        0xBCBCBC, 0x0078F8, 0x0058F8, 0x6844FC, 0xD800CC, 0xE40058, 0xF83800, 0xE45C10,");
-            sb.AppendLine("        0xAC7C00, 0x00B800, 0x00A800, 0x00A844, 0x008888, 0x000000, 0x000000, 0x000000,");
-            sb.AppendLine("        0xF8F8F8, 0x3CBCFC, 0x6888FC, 0x9878F8, 0xF878F8, 0xF85898, 0xF87858, 0xFCA044,");
-            sb.AppendLine("        0xF8B800, 0xB8F818, 0x58D854, 0x58F898, 0x00E8D8, 0x787878, 0x000000, 0x000000,");
-            sb.AppendLine("        0xFCFCFC, 0xA4E4FC, 0xB8B8F8, 0xD8B8F8, 0xF8B8F8, 0xF8A4C0, 0xF0D0B0, 0xFCE0A8,");
-            sb.AppendLine("        0xF8D878, 0xD8F878, 0xB8F8B8, 0xB8F8D8, 0x00FCFC, 0xF8D8F8, 0x000000, 0x000000");
-            sb.AppendLine("    };");
-            sb.AppendLine();
-            sb.AppendLine("    public static void Reset()");
-            sb.AppendLine("    {");
-            sb.AppendLine("        Ctrl = Mask = OamAddr = ScrollX = ScrollY = 0;");
-            // At power-on the PPU is not in VBlank. SMB waits for this edge
-            // before initializing the title screen and VRAM.
-            sb.AppendLine("        Status = 0;");
-            sb.AppendLine("        WToggle = false;");
-            sb.AppendLine("        VRamAddr = 0;");
-            sb.AppendLine("        DataBuffer = 0;");
-            sb.AppendLine("        FrameCount = 0;");
-            sb.AppendLine("        Array.Clear(VRam, 0, VRam.Length);");
-            sb.AppendLine("        Array.Clear(Oam, 0, Oam.Length);");
-            sb.AppendLine("        Array.Clear(Palette, 0, Palette.Length);");
-            sb.AppendLine("        Array.Clear(BackgroundOpaque, 0, BackgroundOpaque.Length);");
-            sb.AppendLine("        RenderFront = new RenderState(); RenderBack = new RenderState();");
-            sb.AppendLine("        Array.Clear(Screen, 0, Screen.Length);");
-            sb.AppendLine("        Array.Clear(LiveLineScrollX, 0, LiveLineScrollX.Length); Array.Clear(LiveLineScrollY, 0, LiveLineScrollY.Length); Array.Clear(LiveLineBaseNt, 0, LiveLineBaseNt.Length); LastCapturedScanline = -1;");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static byte ReadReg(ushort reg)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        switch (reg & 7)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            case 2:");
-            sb.AppendLine("            {");
-            sb.AppendLine("                int sl = CurrentScanline();");
-            sb.AppendLine("                if (sl >= 0 && sl < 240)");
-            sb.AppendLine("                {");
-            sb.AppendLine("                    if (!Sprite0Polled) Sprite0Polled = true;");
-            sb.AppendLine("                    if ((Status & 0x40) == 0 && Sprite0HitsAt(sl)) Status = (byte)(Status | 0x40);");
-            sb.AppendLine("                    if ((Status & 0x20) == 0) EvaluateSpriteOverflow(sl);");
-            sb.AppendLine("                }");
-            sb.AppendLine("                byte s = Status;");
-            sb.AppendLine("                Status = (byte)(Status & 0x1F);");
-            sb.AppendLine("                WToggle = false;");
-            sb.AppendLine("                return s;");
-            sb.AppendLine("            }");
-            sb.AppendLine("            case 4: return Oam[OamAddr];");
-            sb.AppendLine("            case 7:");
-            sb.AppendLine("            {");
-            sb.AppendLine("                ushort addr = (ushort)(VRamAddr & 0x3FFF);");
-            sb.AppendLine("                byte data = ReadVram(addr);");
-            sb.AppendLine("                byte ret;");
-            sb.AppendLine("                if (addr >= 0x3F00) { ret = data; DataBuffer = ReadVram((ushort)(addr - 0x1000)); }");
-            sb.AppendLine("                else { ret = DataBuffer; DataBuffer = data; }");
-            sb.AppendLine("                VRamAddr = (ushort)(VRamAddr + ((Ctrl & 0x04) != 0 ? 32 : 1)); RefreshAddr = VRamAddr;");
-            sb.AppendLine("                return ret;");
-            sb.AppendLine("            }");
-            sb.AppendLine("            default: return 0;");
-            sb.AppendLine("        }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static void WriteReg(ushort reg, byte value)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        switch (reg & 7)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            case 0: Ctrl = value; TempAddr = (TempAddr & 0xF3FF) | ((value & 3) << 10); break;");
-            sb.AppendLine("            case 1: Mask = value; break;");
-            sb.AppendLine("            case 3: OamAddr = value; break;");
-            sb.AppendLine("            case 4: Oam[OamAddr] = value; OamAddr = (byte)(OamAddr + 1); break;");
-            sb.AppendLine("            case 5:");
-            sb.AppendLine("                if (!WToggle) { ScrollX = value; XOffset = value & 7; TempAddr = (TempAddr & 0xFFE0) | (value >> 3); }");
-            sb.AppendLine("                else { ScrollY = value; TempAddr = (TempAddr & 0x8C1F) | ((value & ~7) << 2) | ((value & 7) << 12); }");
-            sb.AppendLine("                { int sx5, sy5, nt5; Decode(TempAddr, XOffset, out sx5, out sy5, out nt5); int sl5 = CurrentScanline(); if (sl5 < 0 || sl5 >= 240) { ScrollX0 = sx5; ScrollY0 = sy5; BaseNt0 = nt5; ScrollX1 = sx5; ScrollY1 = sy5; BaseNt1 = nt5; } else { ScrollX1 = sx5; ScrollY1 = sy5; BaseNt1 = nt5; SplitActive = true; SplitY = sl5; } }");
-            sb.AppendLine("                WToggle = !WToggle;");
-            sb.AppendLine("                break;");
-            sb.AppendLine("            case 6:");
-            sb.AppendLine("                if (!WToggle) { TempAddr = (TempAddr & 0x00FF) | ((value & 0x3F) << 8); }");
-            sb.AppendLine("                else");
-            sb.AppendLine("                {");
-            sb.AppendLine("                    TempAddr = (TempAddr & 0xFF00) | value;");
-            sb.AppendLine("                    VRamAddr = (ushort)TempAddr; RefreshAddr = TempAddr;");
-            sb.AppendLine("                    int sl6 = CurrentScanline();");
-            sb.AppendLine("                    if (sl6 >= 0 && sl6 < 240)");
-            sb.AppendLine("                    {");
-            sb.AppendLine("                        int sx, sy, nt;");
-            sb.AppendLine("                        Decode(RefreshAddr, XOffset, out sx, out sy, out nt);");
-            sb.AppendLine("                        ScrollX1 = sx; ScrollY1 = sy; BaseNt1 = nt;");
-            sb.AppendLine("                        SplitActive = true; SplitY = sl6;");
-            sb.AppendLine("                    }");
-            sb.AppendLine("                }");
-            sb.AppendLine("                WToggle = !WToggle;");
-            sb.AppendLine("                break;");
-            sb.AppendLine("            case 7: WriteVram(VRamAddr, value); VRamAddr = (ushort)(VRamAddr + ((Ctrl & 0x04) != 0 ? 32 : 1)); RefreshAddr = VRamAddr; break;");
-            sb.AppendLine("        }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static void DmaOam(byte page)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        int baseAddr = page << 8;");
-            sb.AppendLine("        for (int i = 0; i < 256; i++) Oam[i] = Memory.Read((ushort)(baseAddr + i));");
-            sb.AppendLine("        OamAddr = 0;");
-            sb.AppendLine("    }");
-            sb.AppendLine();
+            sb.Append(Raw("""
+                static class Ppu
+                {
+                    public static volatile byte Ctrl, Mask, Status, OamAddr, ScrollX, ScrollY;
+                    public static bool WToggle;
+                    public static volatile ushort VRamAddr;
+                    public static byte DataBuffer;
+                    public static byte[] VRam = new byte[0x4000];
+                    public static byte[] Oam = new byte[256];
+                    public static byte[] Palette = new byte[32];
+                    // Per-pixel background opacity for the PPU sprite-priority bit.
+                    static byte[] BackgroundOpaque = new byte[256 * 240];
 
-            // === VRAM helpers ===
-            sb.AppendLine("static void Decode(int raddr, int xoff, out int sx, out int sy, out int nt)");
-            sb.AppendLine("{");
-            sb.AppendLine("    sx = (raddr & 0x1F) * 8 + xoff;");
-            sb.AppendLine("    sy = (((raddr >> 5) & 0x1F) * 8) + ((raddr >> 12) & 7);");
-            sb.AppendLine("    nt = (raddr >> 10) & 3;");
-            sb.AppendLine("}");
-            sb.AppendLine();
-            sb.AppendLine("static ushort MirrorName(ushort addr)");
-            sb.AppendLine("{");
-            sb.AppendLine("    int table = (addr >> 10) & 3;");
-            sb.AppendLine("    int offset = addr & 0x3FF;");
-            sb.AppendLine("    int m = Runtime.Mirroring;");
-            sb.AppendLine("    if (m == 1) { if (table == 2) table = 0; else if (table == 3) table = 1; }");
-            sb.AppendLine("    else if (m == 0) { if (table == 1) table = 0; else if (table >= 2) table = 1; }");
-            sb.AppendLine("    else if (m == 3) table = 0;");
-            sb.AppendLine("    else if (m == 4) table = 1;");
-            sb.AppendLine("    return (ushort)(0x2000 + table * 0x400 + offset);");
-            sb.AppendLine("}");
-            sb.AppendLine();
-            sb.AppendLine("public static int CurrentScanline()");
-            sb.AppendLine("{");
-            sb.AppendLine("    long c = Runtime.CpuCycles - FrameStartCycles;");
-            sb.AppendLine("    int sl = (int)(c / 114);");
-            sb.AppendLine("    // During VBlank this is intentionally negative; $2005/$2006 writes then establish next-frame base scroll.");
-            sb.AppendLine("    if (sl > 261) sl = 261;");
-            sb.AppendLine("    return sl;");
-            sb.AppendLine("}");
-            sb.AppendLine();
-            sb.AppendLine("public static void Clock()");
-            sb.AppendLine("{");
-            sb.AppendLine("    int sl = CurrentScanline(); if (sl < 0 || sl >= 240) return;");
-            sb.AppendLine("    if (LastCapturedScanline < 0) RefreshAddr = TempAddr;");
-            sb.AppendLine("    while (LastCapturedScanline < sl)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        int y = ++LastCapturedScanline, sx, sy, nt; Decode(RefreshAddr, XOffset, out sx, out sy, out nt);");
-            sb.AppendLine("        // Renderer addresses pixels as y + scrollY. v already contains this line's Y, so store a relative offset.");
-            sb.AppendLine("        LiveLineScrollX[y] = sx; LiveLineScrollY[y] = sy - y; if (LiveLineScrollY[y] < 0) LiveLineScrollY[y] += 480;");
-            sb.AppendLine("        // nt is likewise the current line's table; remove the vertical wrap that RenderScreen will add back.");
-            sb.AppendLine("        LiveLineBaseNt[y] = nt ^ (((sy >> 8) & 1) << 1);");
-            sb.AppendLine("        if (MapperStub.HasIrq) MapperStub.ClockScanline();");
-            sb.AppendLine("        // FCEU Fixit2: copy coarse X + horizontal nametable from t at dot 257.");
-            sb.AppendLine("        RefreshAddr = (RefreshAddr & 0xFBE0) | (TempAddr & 0x041F);");
-            sb.AppendLine("        // FCEU Fixit1: increment fine/coarse Y and toggle the vertical nametable on wrap.");
-            sb.AppendLine("        if ((RefreshAddr & 0x7000) == 0x7000) { RefreshAddr ^= 0x7000; if ((RefreshAddr & 0x03E0) == 0x03A0) RefreshAddr ^= 0x0BA0; else if ((RefreshAddr & 0x03E0) == 0x03E0) RefreshAddr ^= 0x03E0; else RefreshAddr += 0x20; } else RefreshAddr += 0x1000;");
-            sb.AppendLine("    }");
-            sb.AppendLine("}");
-            sb.AppendLine();
-            sb.AppendLine("static int MirrorTableLive(int t)");
-            sb.AppendLine("{");
-            sb.AppendLine("    int m = Runtime.Mirroring;");
-            sb.AppendLine("    if (m == 1) { if (t == 2) t = 0; else if (t == 3) t = 1; }");
-            sb.AppendLine("    else if (m == 0) { if (t == 1) t = 0; else if (t >= 2) t = 1; }");
-            sb.AppendLine("    else if (m == 3) t = 0; else if (m == 4) t = 1;");
-            sb.AppendLine("    return t;");
-            sb.AppendLine("}");
-            sb.AppendLine();
-            sb.AppendLine("static bool Sprite0HitsAt(int scanline)");
-            sb.AppendLine("{");
-            sb.AppendLine("    if ((Mask & 0x18) != 0x18) return false;");
-            sb.AppendLine("    int sy = Oam[0] + 1, sx = Oam[3]; int height = (Ctrl & 0x20) != 0 ? 16 : 8;");
-            sb.AppendLine("    int row = scanline - sy; if (row < 0 || row >= height || sx >= 255) return false;");
-            sb.AppendLine("    int tile = Oam[1], attr = Oam[2]; if ((attr & 0x80) != 0) row = height - 1 - row;");
-            sb.AppendLine("    int pat = (Ctrl & 0x08) != 0 ? 0x1000 : 0x0000;");
-            sb.AppendLine("    if (height == 16) { pat = (tile & 1) != 0 ? 0x1000 : 0; tile &= 0xFE; if (row >= 8) { tile++; row -= 8; } }");
-            sb.AppendLine("    byte slo = MapperStub.ReadChrByte(pat + tile * 16 + row), shi = MapperStub.ReadChrByte(pat + tile * 16 + row + 8);");
-            sb.AppendLine("    int wy = scanline + ScrollY0, ntY = (wy >> 8) & 1, cy = (wy >> 3) & 0x1F, fy = wy & 7;");
-            sb.AppendLine("    for (int px = 0; px < 8 && sx + px < 255; px++)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        int spBit = (attr & 0x40) != 0 ? px : 7 - px; if ((((slo >> spBit) & 1) | ((shi >> spBit) & 1)) == 0) continue;");
-            sb.AppendLine("        // Left-edge clipping applies to sprite-0 as well: with bit 2 clear the");
-            sb.AppendLine("        // leftmost 8 pixels show the backdrop only, so no hit can occur there.");
-            sb.AppendLine("        if ((Mask & 0x04) == 0 && sx + px < 8) continue;");
-            sb.AppendLine("        int wx = sx + px + ScrollX0, nt = (BaseNt0 ^ ((ntY << 1) | ((wx >> 8) & 1))) & 3;");
-            sb.AppendLine("        int ntBase = 0x2000 + MirrorTableLive(nt) * 0x400, cx = (wx >> 3) & 0x1F;");
-            sb.AppendLine("        int bgTile = VRam[ntBase + cy * 32 + cx], bit = 7 - (wx & 7), bp = ((Ctrl & 0x10) != 0 ? 0x1000 : 0) + bgTile * 16 + fy;");
-            sb.AppendLine("        byte blo = MapperStub.ReadChrByte(bp), bhi = MapperStub.ReadChrByte(bp + 8);");
-            sb.AppendLine("        if ((((blo >> bit) & 1) | ((bhi >> bit) & 1)) != 0) return true;");
-            sb.AppendLine("    }");
-            sb.AppendLine("    return false;");
-            sb.AppendLine("}");
-            sb.AppendLine();
-            sb.AppendLine("/// <summary>");
-            sb.AppendLine("/// Sets the sprite-overflow flag when more than eight sprites land on one");
-            sb.AppendLine("/// scanline. The flag is sticky until $2002 is read, exactly like hardware;");
-            sb.AppendLine("/// the hardware bug of reporting sprite 0 is not reproduced.");
-            sb.AppendLine("/// </summary>");
-            sb.AppendLine("static void EvaluateSpriteOverflow(int scanline)");
-            sb.AppendLine("{");
-            sb.AppendLine("    int height = (Ctrl & 0x20) != 0 ? 16 : 8;");
-            sb.AppendLine("    int found = 0;");
-            sb.AppendLine("    for (int i = 0; i < 64; i++)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        int sy = Oam[i * 4] + 1;");
-            sb.AppendLine("        if (scanline < sy || scanline >= sy + height) continue;");
-            sb.AppendLine("        if (++found > 8) { Status = (byte)(Status | 0x20); return; }");
-            sb.AppendLine("    }");
-            sb.AppendLine("}");
-            sb.AppendLine();
-            sb.AppendLine("public static void BeginFrame()");
-            sb.AppendLine("{");
-            sb.AppendLine("    // Capture the *completed* visible frame before starting its next VBlank/NMI.");
-            sb.AppendLine("    // Scroll/split must be captured with VRAM; mixing them caused the jumping horizon.");
-            sb.AppendLine("    RenderState back = RenderBack;");
-            sb.AppendLine("    Buffer.BlockCopy(VRam, 0, back.VRam, 0, VRam.Length);");
-            sb.AppendLine("    Buffer.BlockCopy(Oam, 0, back.Oam, 0, Oam.Length);");
-            sb.AppendLine("    Buffer.BlockCopy(Palette, 0, back.Palette, 0, Palette.Length);");
-            sb.AppendLine("    Buffer.BlockCopy(LiveLineScrollX, 0, back.LineScrollX, 0, 240 * sizeof(int)); Buffer.BlockCopy(LiveLineScrollY, 0, back.LineScrollY, 0, 240 * sizeof(int)); Buffer.BlockCopy(LiveLineBaseNt, 0, back.LineBaseNt, 0, 240 * sizeof(int));");
-            sb.AppendLine("    back.Ctrl = Ctrl; back.Mask = Mask; back.Mirroring = Runtime.Mirroring;");
-            sb.AppendLine("    back.SplitY = SplitY; back.ScrollX0 = ScrollX0; back.ScrollY0 = ScrollY0; back.BaseNt0 = BaseNt0;");
-            sb.AppendLine("    back.ScrollX1 = ScrollX1; back.ScrollY1 = ScrollY1; back.BaseNt1 = BaseNt1; back.SplitActive = SplitActive;");
-            sb.AppendLine("    RenderBack = RenderFront; Volatile.Write(ref RenderFront, back);");
-            sb.AppendLine("    Runtime.Log(\"ppu-scroll\", \"base=\" + back.ScrollX0 + \",\" + back.ScrollY0 + \",nt\" + back.BaseNt0 + \" split=\" + (back.SplitActive ? back.SplitY.ToString() + \":\" + back.ScrollX1 + \",\" + back.ScrollY1 + \",nt\" + back.BaseNt1 : \"off\"), false);");
-            sb.AppendLine("    FrameReady = true;");
-            sb.AppendLine("    // BeginFrame is called at VBlank start (scanline 241). Visible scanline 0 begins after VBlank.");
-            sb.AppendLine("    // The old origin was 20 scanlines early, so SMB's sprite-0 split changed scroll at the wrong row.");
-            sb.AppendLine("    FrameStartCycles = Runtime.CpuCycles + 2273;");
-            sb.AppendLine("    Sprite0Polled = false;");
-            sb.AppendLine("    int s0 = Oam[0] + 1; if (s0 < 0) s0 = 0; if (s0 > 240) s0 = 240; _sprite0Y = s0;");
-            sb.AppendLine("    SplitY = _sprite0Y;");
-            sb.AppendLine("    // NESdev PPU scrolling: at pre-render, v receives t; x supplies fine X.");
-            sb.AppendLine("    RefreshAddr = TempAddr;");
-            sb.AppendLine("    int frameX, frameY, frameNt; Decode(RefreshAddr, XOffset, out frameX, out frameY, out frameNt);");
-            sb.AppendLine("    ScrollX0 = frameX; ScrollY0 = frameY; BaseNt0 = frameNt;");
-            sb.AppendLine("    ScrollX1 = frameX; ScrollY1 = frameY; BaseNt1 = frameNt;");
-            sb.AppendLine("    SplitActive = false;");
-            sb.AppendLine("    LastCapturedScanline = -1;");
-            sb.AppendLine("}");
-            sb.AppendLine();
-            sb.AppendLine("static int MirrorTable(int t, int m)");
-            sb.AppendLine("{");
-            sb.AppendLine("    if (m == 1) { if (t == 2) t = 0; else if (t == 3) t = 1; }");
-            sb.AppendLine("    else if (m == 0) { if (t == 1) t = 0; else if (t >= 2) t = 1; }");
-            sb.AppendLine("    else if (m == 3) t = 0;");
-            sb.AppendLine("    else if (m == 4) t = 1;");
-            sb.AppendLine("    return t;");
-            sb.AppendLine("}");
-            sb.AppendLine();
-            sb.AppendLine("    static ushort NormalizeVram(ushort addr)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        addr = (ushort)(addr & 0x3FFF);");
-            sb.AppendLine("        if (addr >= 0x3000 && addr < 0x3F00) addr = (ushort)(addr - 0x1000);");
-            sb.AppendLine("        if (addr >= 0x2000 && addr < 0x3000) return MirrorName(addr);");
-            sb.AppendLine("        if (addr >= 0x3F00) { int idx = (addr - 0x3F00) & 0x1F; if ((idx & 0x13) == 0x10) idx &= 0x0F; return (ushort)(0x3F00 + idx); }");
-            sb.AppendLine("        return addr;");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    static byte ReadVram(ushort addr) { if (addr < 0x2000) return MapperStub.ReadChrByte(addr); addr = NormalizeVram(addr); if (addr >= 0x3F00) return Palette[(addr - 0x3F00) & 0x1F]; return VRam[addr]; }");
-            sb.AppendLine("    static void WriteVram(ushort addr, byte value) { if (addr < 0x2000) { MapperStub.WriteChrByte(addr, value); return; } addr = NormalizeVram(addr); if (addr >= 0x3F00) Palette[(addr - 0x3F00) & 0x1F] = value; else VRam[addr] = value; }");
-            sb.AppendLine();
+                    sealed class RenderState
+                    {
+                        public readonly byte[] VRam = new byte[0x4000], Oam = new byte[256], Palette = new byte[32];
+                        public byte Ctrl, Mask; public int Mirroring, SplitY, ScrollX0, ScrollY0, BaseNt0, ScrollX1, ScrollY1, BaseNt1; public bool SplitActive;
+                        public readonly int[] LineScrollX = new int[240], LineScrollY = new int[240], LineBaseNt = new int[240];
+                    }
 
-            // === Rendering ===
-            sb.AppendLine("public static void RenderScreen()");
-            sb.AppendLine("{");
-            sb.AppendLine("    RenderState state = Volatile.Read(ref RenderFront);");
-            sb.AppendLine("    byte[] renderVRam = state.VRam, renderOam = state.Oam, renderPalette = state.Palette;");
-            sb.AppendLine("    byte renderCtrl = state.Ctrl, renderMask = state.Mask; int renderMirroring = state.Mirroring;");
-            sb.AppendLine("    int backdrop = renderPalette[0] & 0x3F;");
-            sb.AppendLine("    FillScreen(backdrop);");
-            sb.AppendLine("    Array.Clear(BackgroundOpaque, 0, BackgroundOpaque.Length);");
-            sb.AppendLine("    bool showBG = (renderMask & 0x08) != 0;");
-            sb.AppendLine("    bool showSpr = (renderMask & 0x10) != 0;");
-            sb.AppendLine("    if (!showBG && !showSpr) return;");
-            sb.AppendLine("    int[] mt = new int[4];");
-            sb.AppendLine("    for (int i = 0; i < 4; i++) mt[i] = MirrorTable(i, renderMirroring);");
-            sb.AppendLine("    int patternBase = (renderCtrl & 0x10) != 0 ? 0x1000 : 0x0000;");
-            sb.AppendLine("    int sprPatternBase = (renderCtrl & 0x08) != 0 ? 0x1000 : 0x0000;");
-            sb.AppendLine("    bool bigSpr = (renderCtrl & 0x20) != 0;");
-            sb.AppendLine("    if (showBG)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        bool clipLeftBg = (renderMask & 0x02) == 0;");
-            sb.AppendLine("        for (int y = 0; y < 240; y++)");
-            sb.AppendLine("            {");
-            sb.AppendLine("                int sx = state.LineScrollX[y], sy = state.LineScrollY[y], bnt = state.LineBaseNt[y];");
-            sb.AppendLine("                int ty = y + sy;");
-            sb.AppendLine("                int ntY = (ty >> 8) & 1;");
-            sb.AppendLine("                int cy = (ty >> 3) & 0x1F;");
-            sb.AppendLine("                int fy = ty & 7;");
-            sb.AppendLine("                int rowOff = y * 256;");
-            sb.AppendLine("                for (int x = 0; x < 256; x++)");
-            sb.AppendLine("                {");
-            sb.AppendLine("                    if (clipLeftBg && x < 8) continue;");
-            sb.AppendLine("                    int tx = x + sx;");
-            sb.AppendLine("                    int nt = (bnt ^ ((ntY << 1) | ((tx >> 8) & 1))) & 3;");
-            sb.AppendLine("                    int ntBase = 0x2000 + mt[nt] * 0x400;");
-            sb.AppendLine("                    int cx = (tx >> 3) & 0x1F;");
-            sb.AppendLine("                    byte tile = renderVRam[ntBase + cy * 32 + cx];");
-            sb.AppendLine("                    int attr = renderVRam[ntBase + 0x3C0 + (cy >> 2) * 8 + (cx >> 2)];");
-            sb.AppendLine("                    int pal = (attr >> (((cy & 2) << 1) | (cx & 2))) & 3;");
-            sb.AppendLine("                    int paddr = patternBase + tile * 16 + fy;");
-            sb.AppendLine("                    // MMC2 latches its CHR banks from the tiles fetched here.");
-            sb.AppendLine("                    if (MapperStub.HasChrLatch) MapperStub.LatchChr(paddr, tile);");
-            sb.AppendLine("                    byte low = MapperStub.ReadChrByte(paddr);");
-            sb.AppendLine("                    byte high = MapperStub.ReadChrByte(paddr + 8);");
-            sb.AppendLine("                    int bit = 7 - (tx & 7);");
-            sb.AppendLine("                    int color = ((low >> bit) & 1) | (((high >> bit) & 1) << 1);");
-            sb.AppendLine("                    if (color == 0) continue;");
-            sb.AppendLine("                    BackgroundOpaque[rowOff + x] = 1;");
-            sb.AppendLine("                    int rgb = NesPalette[renderPalette[(1 + pal * 4 + (color - 1)) & 0x1F] & 0x3F];");
-            sb.AppendLine("                    int off = (rowOff + x) * 4;");
-            sb.AppendLine("                    Screen[off] = (byte)(rgb & 0xFF);");
-            sb.AppendLine("                    Screen[off + 1] = (byte)((rgb >> 8) & 0xFF);");
-            sb.AppendLine("                    Screen[off + 2] = (byte)((rgb >> 16) & 0xFF);");
-            sb.AppendLine("                    Screen[off + 3] = 0xFF;");
-            sb.AppendLine("                }");
-            sb.AppendLine("            }");
-            sb.AppendLine("    }");
-            sb.AppendLine("    if (showSpr)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        bool clipLeftSpr = (renderMask & 0x04) == 0;");
-            sb.AppendLine("        int[] lineCount = new int[240];");
-            sb.AppendLine("        for (int i = 0; i < 64; i++)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            int sy2 = renderOam[i * 4] + 1;");
-            sb.AppendLine("            int tile = renderOam[i * 4 + 1];");
-            sb.AppendLine("            int attr = renderOam[i * 4 + 2];");
-            sb.AppendLine("            int sx2 = renderOam[i * 4 + 3];");
-            sb.AppendLine("            if (sy2 >= 240 || sy2 <= -16) continue;");
-            sb.AppendLine("            int pal = attr & 3;");
-            sb.AppendLine("            bool flipH = (attr & 0x40) != 0;");
-            sb.AppendLine("            bool flipV = (attr & 0x80) != 0;");
-            sb.AppendLine("            int height = bigSpr ? 16 : 8;");
-            sb.AppendLine("            int tileIndex = tile;");
-            sb.AppendLine("            int patBase = sprPatternBase;");
-            sb.AppendLine("            if (bigSpr) { patBase = (tile & 1) != 0 ? 0x1000 : 0x0000; tileIndex = tile & 0xFE; }");
-            sb.AppendLine();
-            sb.AppendLine("            // The PPU evaluates sprites in OAM order and only draws the");
-            sb.AppendLine("            // first eight that intersect a scanline. Lower OAM indices are");
-            sb.AppendLine("            // drawn on top, so this loop walks OAM backwards for painter's");
-            sb.AppendLine("            // algorithm order but counts the budget forwards.");
-            sb.AppendLine("            bool visible = false;");
-            sb.AppendLine("            for (int py = 0; py < height; py++)");
-            sb.AppendLine("            {");
-            sb.AppendLine("                int probe = sy2 + py;");
-            sb.AppendLine("                if ((uint)probe >= 240) continue;");
-            sb.AppendLine("                if (lineCount[probe] >= 8) continue;");
-            sb.AppendLine("                visible = true;");
-            sb.AppendLine("                break;");
-            sb.AppendLine("            }");
-            sb.AppendLine("            if (!visible) continue;");
-            sb.AppendLine();
-            sb.AppendLine("            for (int py = 0; py < height; py++)");
-            sb.AppendLine("            {");
-            sb.AppendLine("                int screenY = sy2 + py;");
-            sb.AppendLine("                if ((uint)screenY >= 240) continue;");
-            sb.AppendLine("                if (lineCount[screenY] >= 8) continue;");
-            sb.AppendLine("                lineCount[screenY]++;");
-            sb.AppendLine("                int srcY = flipV ? (height - 1 - py) : py;");
-            sb.AppendLine("                int t = tileIndex;");
-            sb.AppendLine("                int row = srcY;");
-            sb.AppendLine("                if (bigSpr && srcY >= 8) { t = tileIndex + 1; row = srcY - 8; }");
-            sb.AppendLine("                for (int px = 0; px < 8; px++)");
-            sb.AppendLine("                {");
-            sb.AppendLine("                    int screenX = sx2 + px;");
-            sb.AppendLine("                    if ((uint)screenX >= 256) continue;");
-            sb.AppendLine("                    if (clipLeftSpr && screenX < 8) continue;");
-            sb.AppendLine("                    int srcX = flipH ? (7 - px) : px;");
-            sb.AppendLine("                    int color = GetPatternPixel(patBase, t, srcX, row);");
-            sb.AppendLine("                    if (color == 0) continue;");
-            sb.AppendLine("                    if ((attr & 0x20) != 0 && BackgroundOpaque[screenY * 256 + screenX] != 0) continue;");
-            sb.AppendLine("                    int rgb = NesPalette[renderPalette[(0x11 + pal * 4 + (color - 1)) & 0x1F] & 0x3F];");
-            sb.AppendLine("                    int off = (screenY * 256 + screenX) * 4;");
-            sb.AppendLine("                    Screen[off] = (byte)(rgb & 0xFF);");
-            sb.AppendLine("                    Screen[off + 1] = (byte)((rgb >> 8) & 0xFF);");
-            sb.AppendLine("                    Screen[off + 2] = (byte)((rgb >> 16) & 0xFF);");
-            sb.AppendLine("                    Screen[off + 3] = 0xFF;");
-            sb.AppendLine("                }");
-            sb.AppendLine("            }");
-            sb.AppendLine("        }");
-            sb.AppendLine("    }");
-            sb.AppendLine("}");
-            sb.AppendLine();
+                    // Front is immutable for the renderer; CPU fills Back and swaps references only after the copy.
+                    static RenderState RenderFront = new RenderState(), RenderBack = new RenderState();
+                    public static byte[] Screen = new byte[256 * 240 * 4];
+                    public static int FrameCount;
+                    public static int SplitY;
+                    public static int ScrollX0, ScrollY0, BaseNt0;
+                    public static int ScrollX1, ScrollY1, BaseNt1;
+                    public static long FrameStartCycles;
+                    public static bool Sprite0Polled;
+                    public static volatile bool FrameReady;
+                    static int _sprite0Y;
+                    public static int TempAddr, RefreshAddr, XOffset;
+                    public static bool SplitActive;
+                    static int LastCapturedScanline = -1;
+                    static readonly int[] LiveLineScrollX = new int[240], LiveLineScrollY = new int[240], LiveLineBaseNt = new int[240];
 
-            // === Pixel helpers ===
-            sb.AppendLine("    static void FillScreen(int colorIndex)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        int rgb = NesPalette[colorIndex & 0x3F];");
-            sb.AppendLine("        byte b = (byte)(rgb & 0xFF);");
-            sb.AppendLine("        byte g = (byte)((rgb >> 8) & 0xFF);");
-            sb.AppendLine("        byte r = (byte)((rgb >> 16) & 0xFF);");
-            sb.AppendLine("        for (int i = 0; i < Screen.Length; i += 4) { Screen[i] = b; Screen[i + 1] = g; Screen[i + 2] = r; Screen[i + 3] = 0xFF; }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("static int GetPatternPixel(int patternBase, int tile, int px, int py)");
-            sb.AppendLine("{");
-            sb.AppendLine("    int addr = patternBase + tile * 16 + py;");
-            sb.AppendLine("    byte low = MapperStub.ReadChrByte(addr);");
-            sb.AppendLine("    byte high = MapperStub.ReadChrByte(addr + 8);");
-            sb.AppendLine("    int bit = 7 - px;");
-            sb.AppendLine("    return ((low >> bit) & 1) | (((high >> bit) & 1) << 1);");
-            sb.AppendLine("}");
-            sb.AppendLine("}");
-            sb.AppendLine();
+                    public static int[] NesPalette = new int[64]
+                    {
+                        0x7C7C7C, 0x0000FC, 0x0000BC, 0x4428BC, 0x940084, 0xA80020, 0xA81000, 0x881400,
+                        0x503000, 0x007800, 0x006800, 0x005800, 0x004058, 0x000000, 0x000000, 0x000000,
+                        0xBCBCBC, 0x0078F8, 0x0058F8, 0x6844FC, 0xD800CC, 0xE40058, 0xF83800, 0xE45C10,
+                        0xAC7C00, 0x00B800, 0x00A800, 0x00A844, 0x008888, 0x000000, 0x000000, 0x000000,
+                        0xF8F8F8, 0x3CBCFC, 0x6888FC, 0x9878F8, 0xF878F8, 0xF85898, 0xF87858, 0xFCA044,
+                        0xF8B800, 0xB8F818, 0x58D854, 0x58F898, 0x00E8D8, 0x787878, 0x000000, 0x000000,
+                        0xFCFCFC, 0xA4E4FC, 0xB8B8F8, 0xD8B8F8, 0xF8B8F8, 0xF8A4C0, 0xF0D0B0, 0xFCE0A8,
+                        0xF8D878, 0xD8F878, 0xB8F8B8, 0xB8F8D8, 0x00FCFC, 0xF8D8F8, 0x000000, 0x000000
+                    };
+
+                    public static void Reset()
+                    {
+                        Ctrl = Mask = OamAddr = ScrollX = ScrollY = 0;
+                        // At power-on the PPU is not in VBlank. SMB waits for this
+                        // edge before initializing the title screen and VRAM.
+                        Status = 0;
+                        WToggle = false;
+                        VRamAddr = 0;
+                        DataBuffer = 0;
+                        FrameCount = 0;
+                        Array.Clear(VRam, 0, VRam.Length);
+                        Array.Clear(Oam, 0, Oam.Length);
+                        Array.Clear(Palette, 0, Palette.Length);
+                        Array.Clear(BackgroundOpaque, 0, BackgroundOpaque.Length);
+                        RenderFront = new RenderState(); RenderBack = new RenderState();
+                        Array.Clear(Screen, 0, Screen.Length);
+                        Array.Clear(LiveLineScrollX, 0, LiveLineScrollX.Length); Array.Clear(LiveLineScrollY, 0, LiveLineScrollY.Length); Array.Clear(LiveLineBaseNt, 0, LiveLineBaseNt.Length); LastCapturedScanline = -1;
+                    }
+
+                    public static byte ReadReg(ushort reg)
+                    {
+                        switch (reg & 7)
+                        {
+                            case 2:
+                            {
+                                int sl = CurrentScanline();
+                                if (sl >= 0 && sl < 240)
+                                {
+                                    if (!Sprite0Polled) Sprite0Polled = true;
+                                    if ((Status & 0x40) == 0 && Sprite0HitsAt(sl)) Status = (byte)(Status | 0x40);
+                                    if ((Status & 0x20) == 0) EvaluateSpriteOverflow(sl);
+                                }
+                                byte s = Status;
+                                // VBlank, sprite-0 hit and sprite overflow all clear on read.
+                                Status = (byte)(Status & 0x1F);
+                                WToggle = false;
+                                return s;
+                            }
+                            case 4: return Oam[OamAddr];
+                            case 7:
+                            {
+                                ushort addr = (ushort)(VRamAddr & 0x3FFF);
+                                byte data = ReadVram(addr);
+                                byte ret;
+                                if (addr >= 0x3F00) { ret = data; DataBuffer = ReadVram((ushort)(addr - 0x1000)); }
+                                else { ret = DataBuffer; DataBuffer = data; }
+                                VRamAddr = (ushort)(VRamAddr + ((Ctrl & 0x04) != 0 ? 32 : 1)); RefreshAddr = VRamAddr;
+                                return ret;
+                            }
+                            default: return 0;
+                        }
+                    }
+
+                    public static void WriteReg(ushort reg, byte value)
+                    {
+                        switch (reg & 7)
+                        {
+                            case 0: Ctrl = value; TempAddr = (TempAddr & 0xF3FF) | ((value & 3) << 10); break;
+                            case 1: Mask = value; break;
+                            case 3: OamAddr = value; break;
+                            case 4: Oam[OamAddr] = value; OamAddr = (byte)(OamAddr + 1); break;
+                            case 5:
+                                if (!WToggle) { ScrollX = value; XOffset = value & 7; TempAddr = (TempAddr & 0xFFE0) | (value >> 3); }
+                                else { ScrollY = value; TempAddr = (TempAddr & 0x8C1F) | ((value & ~7) << 2) | ((value & 7) << 12); }
+                                { int sx5, sy5, nt5; Decode(TempAddr, XOffset, out sx5, out sy5, out nt5); int sl5 = CurrentScanline(); if (sl5 < 0 || sl5 >= 240) { ScrollX0 = sx5; ScrollY0 = sy5; BaseNt0 = nt5; ScrollX1 = sx5; ScrollY1 = sy5; BaseNt1 = nt5; } else { ScrollX1 = sx5; ScrollY1 = sy5; BaseNt1 = nt5; SplitActive = true; SplitY = sl5; } }
+                                WToggle = !WToggle;
+                                break;
+                            case 6:
+                                if (!WToggle) { TempAddr = (TempAddr & 0x00FF) | ((value & 0x3F) << 8); }
+                                else
+                                {
+                                    TempAddr = (TempAddr & 0xFF00) | value;
+                                    VRamAddr = (ushort)TempAddr; RefreshAddr = TempAddr;
+                                    int sl6 = CurrentScanline();
+                                    if (sl6 >= 0 && sl6 < 240)
+                                    {
+                                        int sx, sy, nt;
+                                        Decode(RefreshAddr, XOffset, out sx, out sy, out nt);
+                                        ScrollX1 = sx; ScrollY1 = sy; BaseNt1 = nt;
+                                        SplitActive = true; SplitY = sl6;
+                                    }
+                                }
+                                WToggle = !WToggle;
+                                break;
+                            case 7: WriteVram(VRamAddr, value); VRamAddr = (ushort)(VRamAddr + ((Ctrl & 0x04) != 0 ? 32 : 1)); RefreshAddr = VRamAddr; break;
+                        }
+                    }
+
+                    public static void DmaOam(byte page)
+                    {
+                        int baseAddr = page << 8;
+                        for (int i = 0; i < 256; i++) Oam[i] = Memory.Read((ushort)(baseAddr + i));
+                        OamAddr = 0;
+                    }
+
+                    static void Decode(int raddr, int xoff, out int sx, out int sy, out int nt)
+                    {
+                        sx = (raddr & 0x1F) * 8 + xoff;
+                        sy = (((raddr >> 5) & 0x1F) * 8) + ((raddr >> 12) & 7);
+                        nt = (raddr >> 10) & 3;
+                    }
+
+                    static ushort MirrorName(ushort addr)
+                    {
+                        int table = (addr >> 10) & 3;
+                        int offset = addr & 0x3FF;
+                        int m = Runtime.Mirroring;
+                        if (m == 1) { if (table == 2) table = 0; else if (table == 3) table = 1; }
+                        else if (m == 0) { if (table == 1) table = 0; else if (table >= 2) table = 1; }
+                        else if (m == 3) table = 0;
+                        else if (m == 4) table = 1;
+                        return (ushort)(0x2000 + table * 0x400 + offset);
+                    }
+
+                    public static int CurrentScanline()
+                    {
+                        long c = Runtime.CpuCycles - FrameStartCycles;
+                        int sl = (int)(c / 114);
+                        // During VBlank this is intentionally negative; $2005/$2006 writes then establish next-frame base scroll.
+                        if (sl > 261) sl = 261;
+                        return sl;
+                    }
+
+                    public static void Clock()
+                    {
+                        int sl = CurrentScanline(); if (sl < 0 || sl >= 240) return;
+                        if (LastCapturedScanline < 0) RefreshAddr = TempAddr;
+                        while (LastCapturedScanline < sl)
+                        {
+                            int y = ++LastCapturedScanline, sx, sy, nt; Decode(RefreshAddr, XOffset, out sx, out sy, out nt);
+                            // Renderer addresses pixels as y + scrollY. v already contains this line's Y, so store a relative offset.
+                            LiveLineScrollX[y] = sx; LiveLineScrollY[y] = sy - y; if (LiveLineScrollY[y] < 0) LiveLineScrollY[y] += 480;
+                            // nt is likewise the current line's table; remove the vertical wrap that RenderScreen will add back.
+                            LiveLineBaseNt[y] = nt ^ (((sy >> 8) & 1) << 1);
+                            if (MapperStub.HasIrq) MapperStub.ClockScanline();
+                            // FCEU Fixit2: copy coarse X + horizontal nametable from t at dot 257.
+                            RefreshAddr = (RefreshAddr & 0xFBE0) | (TempAddr & 0x041F);
+                            // FCEU Fixit1: increment fine/coarse Y and toggle the vertical nametable on wrap.
+                            if ((RefreshAddr & 0x7000) == 0x7000) { RefreshAddr ^= 0x7000; if ((RefreshAddr & 0x03E0) == 0x03A0) RefreshAddr ^= 0x0BA0; else if ((RefreshAddr & 0x03E0) == 0x03E0) RefreshAddr ^= 0x03E0; else RefreshAddr += 0x20; } else RefreshAddr += 0x1000;
+                        }
+                    }
+
+                    static int MirrorTableLive(int t)
+                    {
+                        int m = Runtime.Mirroring;
+                        if (m == 1) { if (t == 2) t = 0; else if (t == 3) t = 1; }
+                        else if (m == 0) { if (t == 1) t = 0; else if (t >= 2) t = 1; }
+                        else if (m == 3) t = 0; else if (m == 4) t = 1;
+                        return t;
+                    }
+
+                    static bool Sprite0HitsAt(int scanline)
+                    {
+                        if ((Mask & 0x18) != 0x18) return false;
+                        int sy = Oam[0] + 1, sx = Oam[3]; int height = (Ctrl & 0x20) != 0 ? 16 : 8;
+                        int row = scanline - sy; if (row < 0 || row >= height || sx >= 255) return false;
+                        int tile = Oam[1], attr = Oam[2]; if ((attr & 0x80) != 0) row = height - 1 - row;
+                        int pat = (Ctrl & 0x08) != 0 ? 0x1000 : 0x0000;
+                        if (height == 16) { pat = (tile & 1) != 0 ? 0x1000 : 0; tile &= 0xFE; if (row >= 8) { tile++; row -= 8; } }
+                        byte slo = MapperStub.ReadChrByte(pat + tile * 16 + row), shi = MapperStub.ReadChrByte(pat + tile * 16 + row + 8);
+                        int wy = scanline + ScrollY0, ntY = (wy >> 8) & 1, cy = (wy >> 3) & 0x1F, fy = wy & 7;
+                        for (int px = 0; px < 8 && sx + px < 255; px++)
+                        {
+                            int spBit = (attr & 0x40) != 0 ? px : 7 - px; if ((((slo >> spBit) & 1) | ((shi >> spBit) & 1)) == 0) continue;
+                            // Left-edge clipping applies to sprite-0 as well: with bit 2 clear the
+                            // leftmost 8 pixels show the backdrop only, so no hit can occur there.
+                            if ((Mask & 0x04) == 0 && sx + px < 8) continue;
+                            int wx = sx + px + ScrollX0, nt = (BaseNt0 ^ ((ntY << 1) | ((wx >> 8) & 1))) & 3;
+                            int ntBase = 0x2000 + MirrorTableLive(nt) * 0x400, cx = (wx >> 3) & 0x1F;
+                            int bgTile = VRam[ntBase + cy * 32 + cx], bit = 7 - (wx & 7), bp = ((Ctrl & 0x10) != 0 ? 0x1000 : 0) + bgTile * 16 + fy;
+                            byte blo = MapperStub.ReadChrByte(bp), bhi = MapperStub.ReadChrByte(bp + 8);
+                            if ((((blo >> bit) & 1) | ((bhi >> bit) & 1)) != 0) return true;
+                        }
+                        return false;
+                    }
+
+                    /// <summary>
+                    /// Sets the sprite-overflow flag when more than eight sprites land on one
+                    /// scanline. The flag is sticky until $2002 is read, exactly like hardware;
+                    /// the hardware bug of reporting sprite 0 is not reproduced.
+                    /// </summary>
+                    static void EvaluateSpriteOverflow(int scanline)
+                    {
+                        int height = (Ctrl & 0x20) != 0 ? 16 : 8;
+                        int found = 0;
+                        for (int i = 0; i < 64; i++)
+                        {
+                            int sy = Oam[i * 4] + 1;
+                            if (scanline < sy || scanline >= sy + height) continue;
+                            if (++found > 8) { Status = (byte)(Status | 0x20); return; }
+                        }
+                    }
+
+                    public static void BeginFrame()
+                    {
+                        // Capture the *completed* visible frame before starting its next VBlank/NMI.
+                        // Scroll/split must be captured with VRAM; mixing them caused the jumping horizon.
+                        RenderState back = RenderBack;
+                        Buffer.BlockCopy(VRam, 0, back.VRam, 0, VRam.Length);
+                        Buffer.BlockCopy(Oam, 0, back.Oam, 0, Oam.Length);
+                        Buffer.BlockCopy(Palette, 0, back.Palette, 0, Palette.Length);
+                        Buffer.BlockCopy(LiveLineScrollX, 0, back.LineScrollX, 0, 240 * sizeof(int)); Buffer.BlockCopy(LiveLineScrollY, 0, back.LineScrollY, 0, 240 * sizeof(int)); Buffer.BlockCopy(LiveLineBaseNt, 0, back.LineBaseNt, 0, 240 * sizeof(int));
+                        back.Ctrl = Ctrl; back.Mask = Mask; back.Mirroring = Runtime.Mirroring;
+                        back.SplitY = SplitY; back.ScrollX0 = ScrollX0; back.ScrollY0 = ScrollY0; back.BaseNt0 = BaseNt0;
+                        back.ScrollX1 = ScrollX1; back.ScrollY1 = ScrollY1; back.BaseNt1 = BaseNt1; back.SplitActive = SplitActive;
+                        RenderBack = RenderFront; Volatile.Write(ref RenderFront, back);
+                        Runtime.Log("ppu-scroll", "base=" + back.ScrollX0 + "," + back.ScrollY0 + ",nt" + back.BaseNt0 + " split=" + (back.SplitActive ? back.SplitY.ToString() + ":" + back.ScrollX1 + "," + back.ScrollY1 + ",nt" + back.BaseNt1 : "off"), false);
+                        FrameReady = true;
+                        // BeginFrame is called at VBlank start (scanline 241). Visible scanline 0 begins after VBlank.
+                        // The old origin was 20 scanlines early, so SMB's sprite-0 split changed scroll at the wrong row.
+                        FrameStartCycles = Runtime.CpuCycles + 2273;
+                        Sprite0Polled = false;
+                        int s0 = Oam[0] + 1; if (s0 < 0) s0 = 0; if (s0 > 240) s0 = 240; _sprite0Y = s0;
+                        SplitY = _sprite0Y;
+                        // NESdev PPU scrolling: at pre-render, v receives t; x supplies fine X.
+                        RefreshAddr = TempAddr;
+                        int frameX, frameY, frameNt; Decode(RefreshAddr, XOffset, out frameX, out frameY, out frameNt);
+                        ScrollX0 = frameX; ScrollY0 = frameY; BaseNt0 = frameNt;
+                        ScrollX1 = frameX; ScrollY1 = frameY; BaseNt1 = frameNt;
+                        SplitActive = false;
+                        LastCapturedScanline = -1;
+                    }
+
+                    static int MirrorTable(int t, int m)
+                    {
+                        if (m == 1) { if (t == 2) t = 0; else if (t == 3) t = 1; }
+                        else if (m == 0) { if (t == 1) t = 0; else if (t >= 2) t = 1; }
+                        else if (m == 3) t = 0;
+                        else if (m == 4) t = 1;
+                        return t;
+                    }
+
+                    static ushort NormalizeVram(ushort addr)
+                    {
+                        addr = (ushort)(addr & 0x3FFF);
+                        if (addr >= 0x3000 && addr < 0x3F00) addr = (ushort)(addr - 0x1000);
+                        if (addr >= 0x2000 && addr < 0x3000) return MirrorName(addr);
+                        if (addr >= 0x3F00) { int idx = (addr - 0x3F00) & 0x1F; if ((idx & 0x13) == 0x10) idx &= 0x0F; return (ushort)(0x3F00 + idx); }
+                        return addr;
+                    }
+
+                    static byte ReadVram(ushort addr) { if (addr < 0x2000) return MapperStub.ReadChrByte(addr); addr = NormalizeVram(addr); if (addr >= 0x3F00) return Palette[(addr - 0x3F00) & 0x1F]; return VRam[addr]; }
+                    static void WriteVram(ushort addr, byte value) { if (addr < 0x2000) { MapperStub.WriteChrByte(addr, value); return; } addr = NormalizeVram(addr); if (addr >= 0x3F00) Palette[(addr - 0x3F00) & 0x1F] = value; else VRam[addr] = value; }
+
+                    // === Rendering ===
+                    public static void RenderScreen()
+                    {
+                        RenderState state = Volatile.Read(ref RenderFront);
+                        byte[] renderVRam = state.VRam, renderOam = state.Oam, renderPalette = state.Palette;
+                        byte renderCtrl = state.Ctrl, renderMask = state.Mask; int renderMirroring = state.Mirroring;
+                        int backdrop = renderPalette[0] & 0x3F;
+                        FillScreen(backdrop);
+                        Array.Clear(BackgroundOpaque, 0, BackgroundOpaque.Length);
+                        bool showBG = (renderMask & 0x08) != 0;
+                        bool showSpr = (renderMask & 0x10) != 0;
+                        if (!showBG && !showSpr) return;
+                        int[] mt = new int[4];
+                        for (int i = 0; i < 4; i++) mt[i] = MirrorTable(i, renderMirroring);
+                        int patternBase = (renderCtrl & 0x10) != 0 ? 0x1000 : 0x0000;
+                        int sprPatternBase = (renderCtrl & 0x08) != 0 ? 0x1000 : 0x0000;
+                        bool bigSpr = (renderCtrl & 0x20) != 0;
+
+                        if (showBG)
+                        {
+                            bool clipLeftBg = (renderMask & 0x02) == 0;
+                            for (int y = 0; y < 240; y++)
+                            {
+                                int sx = state.LineScrollX[y], sy = state.LineScrollY[y], bnt = state.LineBaseNt[y];
+                                int ty = y + sy;
+                                int ntY = (ty >> 8) & 1;
+                                int cy = (ty >> 3) & 0x1F;
+                                int fy = ty & 7;
+                                int rowOff = y * 256;
+
+                                for (int x = 0; x < 256; x++)
+                                {
+                                    if (clipLeftBg && x < 8) continue;
+                                    int tx = x + sx;
+                                    int nt = (bnt ^ ((ntY << 1) | ((tx >> 8) & 1))) & 3;
+                                    int ntBase = 0x2000 + mt[nt] * 0x400;
+                                    int cx = (tx >> 3) & 0x1F;
+                                    byte tile = renderVRam[ntBase + cy * 32 + cx];
+                                    int attr = renderVRam[ntBase + 0x3C0 + (cy >> 2) * 8 + (cx >> 2)];
+                                    int pal = (attr >> (((cy & 2) << 1) | (cx & 2))) & 3;
+                                    int paddr = patternBase + tile * 16 + fy;
+
+                                    // MMC2 latches its CHR banks from the tiles fetched here.
+                                    if (MapperStub.HasChrLatch) MapperStub.LatchChr(paddr, tile);
+
+                                    byte low = MapperStub.ReadChrByte(paddr);
+                                    byte high = MapperStub.ReadChrByte(paddr + 8);
+                                    int bit = 7 - (tx & 7);
+                                    int color = ((low >> bit) & 1) | (((high >> bit) & 1) << 1);
+                                    if (color == 0) continue;
+                                    BackgroundOpaque[rowOff + x] = 1;
+                                    int rgb = NesPalette[renderPalette[(1 + pal * 4 + (color - 1)) & 0x1F] & 0x3F];
+                                    int off = (rowOff + x) * 4;
+                                    Screen[off] = (byte)(rgb & 0xFF);
+                                    Screen[off + 1] = (byte)((rgb >> 8) & 0xFF);
+                                    Screen[off + 2] = (byte)((rgb >> 16) & 0xFF);
+                                    Screen[off + 3] = 0xFF;
+                                }
+                            }
+                        }
+
+                        if (showSpr)
+                        {
+                            bool clipLeftSpr = (renderMask & 0x04) == 0;
+                            int[] lineCount = new int[240];
+
+                            for (int i = 0; i < 64; i++)
+                            {
+                                int sy2 = renderOam[i * 4] + 1;
+                                int tile = renderOam[i * 4 + 1];
+                                int attr = renderOam[i * 4 + 2];
+                                int sx2 = renderOam[i * 4 + 3];
+                                if (sy2 >= 240 || sy2 <= -16) continue;
+                                int pal = attr & 3;
+                                bool flipH = (attr & 0x40) != 0;
+                                bool flipV = (attr & 0x80) != 0;
+                                int height = bigSpr ? 16 : 8;
+                                int tileIndex = tile;
+                                int patBase = sprPatternBase;
+                                if (bigSpr) { patBase = (tile & 1) != 0 ? 0x1000 : 0x0000; tileIndex = tile & 0xFE; }
+
+                                // The PPU evaluates sprites in OAM order and only draws the
+                                // first eight that intersect a scanline. Lower OAM indices are
+                                // drawn on top, so the budget is counted forwards here and the
+                                // painter's order is handled by drawing index 0 last.
+                                bool visible = false;
+                                for (int py = 0; py < height; py++)
+                                {
+                                    int probe = sy2 + py;
+                                    if ((uint)probe >= 240) continue;
+                                    if (lineCount[probe] >= 8) continue;
+                                    visible = true;
+                                    break;
+                                }
+                                if (!visible) continue;
+
+                                for (int py = 0; py < height; py++)
+                                {
+                                    int screenY = sy2 + py;
+                                    if ((uint)screenY >= 240) continue;
+                                    if (lineCount[screenY] >= 8) continue;
+                                    lineCount[screenY]++;
+                                    int srcY = flipV ? (height - 1 - py) : py;
+                                    int t = tileIndex;
+                                    int row = srcY;
+                                    if (bigSpr && srcY >= 8) { t = tileIndex + 1; row = srcY - 8; }
+
+                                    for (int px = 0; px < 8; px++)
+                                    {
+                                        int screenX = sx2 + px;
+                                        if ((uint)screenX >= 256) continue;
+                                        if (clipLeftSpr && screenX < 8) continue;
+                                        int srcX = flipH ? (7 - px) : px;
+                                        int color = GetPatternPixel(patBase, t, srcX, row);
+                                        if (color == 0) continue;
+                                        if ((attr & 0x20) != 0 && BackgroundOpaque[screenY * 256 + screenX] != 0) continue;
+                                        int rgb = NesPalette[renderPalette[(0x11 + pal * 4 + (color - 1)) & 0x1F] & 0x3F];
+                                        int off = (screenY * 256 + screenX) * 4;
+                                        Screen[off] = (byte)(rgb & 0xFF);
+                                        Screen[off + 1] = (byte)((rgb >> 8) & 0xFF);
+                                        Screen[off + 2] = (byte)((rgb >> 16) & 0xFF);
+                                        Screen[off + 3] = 0xFF;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // === Pixel helpers ===
+                    static void FillScreen(int colorIndex)
+                    {
+                        int rgb = NesPalette[colorIndex & 0x3F];
+                        byte b = (byte)(rgb & 0xFF);
+                        byte g = (byte)((rgb >> 8) & 0xFF);
+                        byte r = (byte)((rgb >> 16) & 0xFF);
+                        for (int i = 0; i < Screen.Length; i += 4) { Screen[i] = b; Screen[i + 1] = g; Screen[i + 2] = r; Screen[i + 3] = 0xFF; }
+                    }
+
+                    static int GetPatternPixel(int patternBase, int tile, int px, int py)
+                    {
+                        int addr = patternBase + tile * 16 + py;
+                        byte low = MapperStub.ReadChrByte(addr);
+                        byte high = MapperStub.ReadChrByte(addr + 8);
+                        int bit = 7 - px;
+                        return ((low >> bit) & 1) | (((high >> bit) & 1) << 1);
+                    }
+                }
+
+                """));
         }
 
         // ================================================================
@@ -1384,242 +1613,270 @@ namespace NesLifter.Lifting
 
         private void AppendApu(StringBuilder sb)
         {
-            sb.AppendLine("static class Apu");
-            sb.AppendLine("{");
-            sb.AppendLine("public static volatile int Env1, Env2, EnvN;");
-            sb.AppendLine("public static volatile int EnvDiv1, EnvDiv2, EnvDivN;");
-            sb.AppendLine("public static volatile bool EnvStart1, EnvStart2, EnvStartN;");
-            sb.AppendLine("public static byte[] Regs = new byte[0x18];");
-            sb.AppendLine("public static volatile int Period1, Period2, PeriodT;");
-            sb.AppendLine("public static volatile int Len1, Len2, LenT, LenN;");
-            sb.AppendLine("public static volatile int LinT;");
-            sb.AppendLine("public static volatile bool LinReload;");
-            sb.AppendLine("static int _lenDiv;");
-            sb.AppendLine("static int _frameCycleAcc;");
-            sb.AppendLine("public static readonly int[] LengthTable = new int[32] {10,254,20,2,40,4,80,6,160,8,60,10,14,12,26,14,12,16,24,18,48,20,96,22,192,24,72,26,16,28,32,30};");
-            sb.AppendLine("public static void Reset()");
-            sb.AppendLine("{");
-            sb.AppendLine("    Env1 = Env2 = EnvN = 0;");
-            sb.AppendLine("    EnvDiv1 = EnvDiv2 = EnvDivN = 0;");
-            sb.AppendLine("    EnvStart1 = EnvStart2 = EnvStartN = false;");
-            sb.AppendLine("    Array.Clear(Regs, 0, Regs.Length);");
-            sb.AppendLine("    Period1 = Period2 = PeriodT = 0; Len1 = Len2 = LenT = LenN = 0; LinT = 0; LinReload = false; _lenDiv = 0; _frameCycleAcc = 0;");
-            sb.AppendLine("    if (!Runtime.Headless) Audio.TryStart();");            sb.AppendLine("}");
-            sb.AppendLine("public static byte ReadReg(ushort addr)");
-            sb.AppendLine("{");
-            sb.AppendLine("    if (addr == 0x4016) return Runtime.JoyRead1();");
-            sb.AppendLine("    if (addr == 0x4017) return Runtime.JoyRead2();");
-            sb.AppendLine("    if (addr == 0x4015) return 0;");
-            sb.AppendLine("    if (addr >= 0x4000 && addr <= 0x4017) return Regs[addr - 0x4000];");
-            sb.AppendLine("    return 0;");
-            sb.AppendLine("}");
-            sb.AppendLine("public static void WriteReg(ushort addr, byte value)");
-            sb.AppendLine("{");
-            sb.AppendLine("    if (addr == 0x4016) { Runtime.JoyStrobe(value); Regs[addr - 0x4000] = value; return; }");
-            sb.AppendLine("    if (addr >= 0x4000 && addr <= 0x4017) Regs[addr - 0x4000] = value;");
-            sb.AppendLine("    switch (addr)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        case 0x4003: Period1 = ((value & 7) << 8) | Regs[0x02]; Len1 = LengthTable[(value >> 3) & 0x1F]; EnvStart1 = true; break;");
-            sb.AppendLine("        case 0x4007: Period2 = ((value & 7) << 8) | Regs[0x06]; Len2 = LengthTable[(value >> 3) & 0x1F]; EnvStart2 = true; break;");
-            sb.AppendLine("        case 0x400B: PeriodT = ((value & 7) << 8) | Regs[0x0A]; LenT = LengthTable[(value >> 3) & 0x1F]; LinReload = true; break;");
-            sb.AppendLine("        case 0x400F: LenN = LengthTable[(value >> 3) & 0x1F]; EnvStartN = true; break;");
-            sb.AppendLine("        case 0x4015:");
-            sb.AppendLine("            if ((value & 1) == 0) Len1 = 0;");
-            sb.AppendLine("            if ((value & 2) == 0) Len2 = 0;");
-            sb.AppendLine("            if ((value & 4) == 0) LenT = 0;");
-            sb.AppendLine("            if ((value & 8) == 0) LenN = 0;");
-            sb.AppendLine("            Audio.OnStatusChange(value);");
-            sb.AppendLine("            break;");
-            sb.AppendLine("    }");
-            sb.AppendLine("}");
-            sb.AppendLine("public static void ClockCpu(int cycles)");
-            sb.AppendLine("{");
-            sb.AppendLine("    // NTSC APU quarter-frame clock: 1,789,773 / 240 ≈ 7,457 CPU cycles.");
-            sb.AppendLine("    _frameCycleAcc += cycles;");
-            sb.AppendLine("    while (_frameCycleAcc >= 7457) { _frameCycleAcc -= 7457; Clock240(); }");
-            sb.AppendLine("}");
-            sb.AppendLine("public static void Clock240()");
-            sb.AppendLine("{");
-            sb.AppendLine("    if (EnvStart1) { EnvStart1 = false; Env1 = 15; EnvDiv1 = 0; }");
-            sb.AppendLine("    else { if (++EnvDiv1 >= ((Regs[0x00] & 0x0F) + 1)) { EnvDiv1 = 0; if (Env1 > 0) Env1--; else if ((Regs[0x00] & 0x20) != 0) Env1 = 15; } }");
-            sb.AppendLine("    if (EnvStart2) { EnvStart2 = false; Env2 = 15; EnvDiv2 = 0; }");
-            sb.AppendLine("    else { if (++EnvDiv2 >= ((Regs[0x04] & 0x0F) + 1)) { EnvDiv2 = 0; if (Env2 > 0) Env2--; else if ((Regs[0x04] & 0x20) != 0) Env2 = 15; } }");
-            sb.AppendLine("    if (EnvStartN) { EnvStartN = false; EnvN = 15; EnvDivN = 0; }");
-            sb.AppendLine("    else { if (++EnvDivN >= ((Regs[0x0C] & 0x0F) + 1)) { EnvDivN = 0; if (EnvN > 0) EnvN--; else if ((Regs[0x0C] & 0x20) != 0) EnvN = 15; } }");
-            sb.AppendLine("    if (LinReload) LinT = Regs[0x08] & 0x7F;");
-            sb.AppendLine("    else if (LinT > 0) LinT--;");
-            sb.AppendLine("    if ((Regs[0x08] & 0x80) == 0) LinReload = false;");
-            sb.AppendLine("    _lenDiv++;");
-            sb.AppendLine("    if (_lenDiv >= 2)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        _lenDiv = 0;");
-            sb.AppendLine("        if (Len1 > 0 && (Regs[0x00] & 0x20) == 0) Len1--;");
-            sb.AppendLine("        if (Len2 > 0 && (Regs[0x04] & 0x20) == 0) Len2--;");
-            sb.AppendLine("        if (LenT > 0 && (Regs[0x08] & 0x80) == 0) LenT--;");
-            sb.AppendLine("        if (LenN > 0 && (Regs[0x0C] & 0x20) == 0) LenN--;");
-            sb.AppendLine("    }");
-            sb.AppendLine("}");
-            sb.AppendLine("public static bool Sq1On() { return (Regs[0x15] & 1) != 0 && Len1 > 0; }");
-            sb.AppendLine("public static bool Sq2On() { return (Regs[0x15] & 2) != 0 && Len2 > 0; }");
-            sb.AppendLine("public static bool TriOn() { return (Regs[0x15] & 4) != 0 && LenT > 0 && LinT > 0; }");
-            sb.AppendLine("public static bool NoiOn() { return (Regs[0x15] & 8) != 0 && LenN > 0; }");
-            sb.AppendLine("}");
-            sb.AppendLine();
+            sb.Append(Raw("""
+                static class Apu
+                {
+                    public static volatile int Env1, Env2, EnvN;
+                    public static volatile int EnvDiv1, EnvDiv2, EnvDivN;
+                    public static volatile bool EnvStart1, EnvStart2, EnvStartN;
+                    public static byte[] Regs = new byte[0x18];
+                    public static volatile int Period1, Period2, PeriodT;
+                    public static volatile int Len1, Len2, LenT, LenN;
+                    public static volatile int LinT;
+                    public static volatile bool LinReload;
+                    static int _lenDiv;
+                    static int _frameCycleAcc;
+                    public static readonly int[] LengthTable = new int[32] {10,254,20,2,40,4,80,6,160,8,60,10,14,12,26,14,12,16,24,18,48,20,96,22,192,24,72,26,16,28,32,30};
+
+                    public static void Reset()
+                    {
+                        Env1 = Env2 = EnvN = 0;
+                        EnvDiv1 = EnvDiv2 = EnvDivN = 0;
+                        EnvStart1 = EnvStart2 = EnvStartN = false;
+                        Array.Clear(Regs, 0, Regs.Length);
+                        Period1 = Period2 = PeriodT = 0; Len1 = Len2 = LenT = LenN = 0; LinT = 0; LinReload = false; _lenDiv = 0; _frameCycleAcc = 0;
+                        if (!Runtime.Headless) Audio.TryStart();
+                    }
+
+                    public static byte ReadReg(ushort addr)
+                    {
+                        if (addr == 0x4016) return Runtime.JoyRead1();
+                        if (addr == 0x4017) return Runtime.JoyRead2();
+                        if (addr == 0x4015) return 0;
+                        if (addr >= 0x4000 && addr <= 0x4017) return Regs[addr - 0x4000];
+                        return 0;
+                    }
+
+                    public static void WriteReg(ushort addr, byte value)
+                    {
+                        if (addr == 0x4016) { Runtime.JoyStrobe(value); Regs[addr - 0x4000] = value; return; }
+                        if (addr >= 0x4000 && addr <= 0x4017) Regs[addr - 0x4000] = value;
+
+                        switch (addr)
+                        {
+                            case 0x4003: Period1 = ((value & 7) << 8) | Regs[0x02]; Len1 = LengthTable[(value >> 3) & 0x1F]; EnvStart1 = true; break;
+                            case 0x4007: Period2 = ((value & 7) << 8) | Regs[0x06]; Len2 = LengthTable[(value >> 3) & 0x1F]; EnvStart2 = true; break;
+                            case 0x400B: PeriodT = ((value & 7) << 8) | Regs[0x0A]; LenT = LengthTable[(value >> 3) & 0x1F]; LinReload = true; break;
+                            case 0x400F: LenN = LengthTable[(value >> 3) & 0x1F]; EnvStartN = true; break;
+                            case 0x4015:
+                                if ((value & 1) == 0) Len1 = 0;
+                                if ((value & 2) == 0) Len2 = 0;
+                                if ((value & 4) == 0) LenT = 0;
+                                if ((value & 8) == 0) LenN = 0;
+                                Audio.OnStatusChange(value);
+                                break;
+                        }
+                    }
+
+                    public static void ClockCpu(int cycles)
+                    {
+                        // NTSC APU quarter-frame clock: 1,789,773 / 240 в‰€ 7,457 CPU cycles.
+                        _frameCycleAcc += cycles;
+                        while (_frameCycleAcc >= 7457) { _frameCycleAcc -= 7457; Clock240(); }
+                    }
+
+                    public static void Clock240()
+                    {
+                        if (EnvStart1) { EnvStart1 = false; Env1 = 15; EnvDiv1 = 0; }
+                        else { if (++EnvDiv1 >= ((Regs[0x00] & 0x0F) + 1)) { EnvDiv1 = 0; if (Env1 > 0) Env1--; else if ((Regs[0x00] & 0x20) != 0) Env1 = 15; } }
+                        if (EnvStart2) { EnvStart2 = false; Env2 = 15; EnvDiv2 = 0; }
+                        else { if (++EnvDiv2 >= ((Regs[0x04] & 0x0F) + 1)) { EnvDiv2 = 0; if (Env2 > 0) Env2--; else if ((Regs[0x04] & 0x20) != 0) Env2 = 15; } }
+                        if (EnvStartN) { EnvStartN = false; EnvN = 15; EnvDivN = 0; }
+                        else { if (++EnvDivN >= ((Regs[0x0C] & 0x0F) + 1)) { EnvDivN = 0; if (EnvN > 0) EnvN--; else if ((Regs[0x0C] & 0x20) != 0) EnvN = 15; } }
+                        if (LinReload) LinT = Regs[0x08] & 0x7F;
+                        else if (LinT > 0) LinT--;
+                        if ((Regs[0x08] & 0x80) == 0) LinReload = false;
+                        _lenDiv++;
+                        if (_lenDiv >= 2)
+                        {
+                            _lenDiv = 0;
+                            if (Len1 > 0 && (Regs[0x00] & 0x20) == 0) Len1--;
+                            if (Len2 > 0 && (Regs[0x04] & 0x20) == 0) Len2--;
+                            if (LenT > 0 && (Regs[0x08] & 0x80) == 0) LenT--;
+                            if (LenN > 0 && (Regs[0x0C] & 0x20) == 0) LenN--;
+                        }
+                    }
+
+                    public static bool Sq1On() { return (Regs[0x15] & 1) != 0 && Len1 > 0; }
+                    public static bool Sq2On() { return (Regs[0x15] & 2) != 0 && Len2 > 0; }
+                    public static bool TriOn() { return (Regs[0x15] & 4) != 0 && LenT > 0 && LinT > 0; }
+                    public static bool NoiOn() { return (Regs[0x15] & 8) != 0 && LenN > 0; }
+                }
+
+                """));
         }
 
         private void AppendAudio(StringBuilder sb)
         {
-            sb.AppendLine("static class Audio");
-            sb.AppendLine("{");
-            sb.AppendLine("    [StructLayout(LayoutKind.Sequential)]");
-            sb.AppendLine("    struct WAVEFORMATEX { public ushort wFormatTag; public ushort nChannels; public uint nSamplesPerSec; public uint nAvgBytesPerSec; public ushort nBlockAlign; public ushort wBitsPerSample; public ushort cbSize; }");
-            sb.AppendLine("    [StructLayout(LayoutKind.Sequential)]");
-            sb.AppendLine("    struct WAVEHDR { public IntPtr lpData; public uint dwBufferLength; public uint dwBytesRecorded; public IntPtr dwUser; public uint dwFlags; public uint dwLoops; public IntPtr lpNext; public IntPtr reserved; }");
-            sb.AppendLine("    [DllImport(\"winmm.dll\")] static extern int waveOutOpen(out IntPtr h, int dev, ref WAVEFORMATEX fmt, IntPtr cb, IntPtr inst, int flags);");
-            sb.AppendLine("    [DllImport(\"winmm.dll\")] static extern int waveOutPrepareHeader(IntPtr h, ref WAVEHDR hdr, int size);");
-            sb.AppendLine("    [DllImport(\"winmm.dll\")] static extern int waveOutWrite(IntPtr h, ref WAVEHDR hdr, int size);");
-            sb.AppendLine("    [DllImport(\"winmm.dll\")] static extern int waveOutUnprepareHeader(IntPtr h, ref WAVEHDR hdr, int size);");
-            sb.AppendLine("    [DllImport(\"winmm.dll\")] static extern int waveOutReset(IntPtr h);");
-            sb.AppendLine("    [DllImport(\"winmm.dll\")] static extern int waveOutClose(IntPtr h);");
-            sb.AppendLine();
-            sb.AppendLine("    const int SR = 22050;");
-            sb.AppendLine("    const int BLOCK = 512;");
-            sb.AppendLine("    const int NBUF = 4;");
-            sb.AppendLine("    static IntPtr _hwo;");
-            sb.AppendLine("    static bool _open;");
-            sb.AppendLine("    static Thread _thread;");
-            sb.AppendLine("    static volatile bool _run;");
-            sb.AppendLine("    static byte[][] _buf = new byte[NBUF][];");
-            sb.AppendLine("    static WAVEHDR[] _hdr = new WAVEHDR[NBUF];");
-            sb.AppendLine("    static GCHandle[] _pin = new GCHandle[NBUF];");
-            sb.AppendLine("    static bool[] _queued = new bool[NBUF];");
-            sb.AppendLine("    static float _ph1, _ph2, _phT;");
-            sb.AppendLine("    static float _dc, _lp1, _lp2;");
-            sb.AppendLine("    static int _noise = 0x7FFF;");
-            sb.AppendLine("    static int _noiseCounter;");
-            sb.AppendLine("    public static volatile int DbgAlive;");
-            sb.AppendLine("    public static volatile int DbgWrErr;");
-            sb.AppendLine("    static readonly int[] NoisePeriod = new int[16] {4,8,16,32,64,96,128,160,202,254,380,508,762,1016,2034,4068};");
-            sb.AppendLine("    static readonly float[] DutyF = new float[4] {0.125f,0.25f,0.5f,0.75f};");
-            sb.AppendLine("    static readonly int[] TriangleWave = new int[32] {");
-            sb.AppendLine("        15,14,13,12,11,10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,");
-            sb.AppendLine("         0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15");
-            sb.AppendLine("    };");
-            sb.AppendLine();
-            sb.AppendLine("    public static void OnStatusChange(byte v) { }");
-            sb.AppendLine();
-            sb.AppendLine("    public static void TryStart()");
-            sb.AppendLine("    {");
-            sb.AppendLine("        try");
-            sb.AppendLine("        {");
-            sb.AppendLine("            if (_open) return;");
-            sb.AppendLine("            WAVEFORMATEX fmt = new WAVEFORMATEX();");
-            sb.AppendLine("            fmt.wFormatTag = 1; fmt.nChannels = 1; fmt.nSamplesPerSec = SR; fmt.wBitsPerSample = 8; fmt.nBlockAlign = 1; fmt.nAvgBytesPerSec = SR; fmt.cbSize = 0;");
-            sb.AppendLine("            int r = waveOutOpen(out _hwo, -1, ref fmt, IntPtr.Zero, IntPtr.Zero, 0);");
-            sb.AppendLine("            if (r != 0) return;");
-            sb.AppendLine("            _open = true;");
-            sb.AppendLine("            int hdrSize = Marshal.SizeOf(typeof(WAVEHDR));");
-            sb.AppendLine("            for (int i = 0; i < NBUF; i++)");
-            sb.AppendLine("            {");
-            sb.AppendLine("                _buf[i] = new byte[BLOCK];");
-            sb.AppendLine("                _pin[i] = GCHandle.Alloc(_buf[i], GCHandleType.Pinned);");
-            sb.AppendLine("                _hdr[i] = new WAVEHDR();");
-            sb.AppendLine("                _hdr[i].lpData = _pin[i].AddrOfPinnedObject();");
-            sb.AppendLine("                _hdr[i].dwBufferLength = BLOCK;");
-            sb.AppendLine("                waveOutPrepareHeader(_hwo, ref _hdr[i], hdrSize);");
-            sb.AppendLine("            }");
-            sb.AppendLine("            _run = true;");
-            sb.AppendLine("            _thread = new Thread(new ThreadStart(ThreadProc));");
-            sb.AppendLine("            _thread.IsBackground = true;");
-            sb.AppendLine("            _thread.Start();");
-            sb.AppendLine("        }");
-            sb.AppendLine("        catch { _open = false; }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    public static void TryStop()");
-            sb.AppendLine("    {");
-            sb.AppendLine("        try");
-            sb.AppendLine("        {");
-            sb.AppendLine("            _run = false;");
-            sb.AppendLine("            if (_open)");
-            sb.AppendLine("            {");
-            sb.AppendLine("                waveOutReset(_hwo);");
-            sb.AppendLine("                int hdrSize = Marshal.SizeOf(typeof(WAVEHDR));");
-            sb.AppendLine("                for (int i = 0; i < NBUF; i++) { try { waveOutUnprepareHeader(_hwo, ref _hdr[i], hdrSize); } catch { } if (_pin[i].IsAllocated) _pin[i].Free(); }");
-            sb.AppendLine("                waveOutClose(_hwo);");
-            sb.AppendLine("                _open = false;");
-            sb.AppendLine("            }");
-            sb.AppendLine("        }");
-            sb.AppendLine("        catch { }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    static void ThreadProc()");
-            sb.AppendLine("    {");
-            sb.AppendLine("        int hdrSize; try { hdrSize = Marshal.SizeOf(typeof(WAVEHDR)); } catch { hdrSize = 32; }");
-            sb.AppendLine("        int idx = 0;");
-            sb.AppendLine("        while (_run)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            try");
-            sb.AppendLine("            {");
-            sb.AppendLine("                DbgAlive = Environment.TickCount;");
-            sb.AppendLine("                if (_queued[idx])");
-            sb.AppendLine("                {");
-            sb.AppendLine("                    int stuck = 0;");
-            sb.AppendLine("                    while (_run && (_hdr[idx].dwFlags & 1) == 0)");
-            sb.AppendLine("                    {");
-            sb.AppendLine("                        Thread.Sleep(1); stuck++;");
-            sb.AppendLine("                        if (stuck > 2000) { try { waveOutReset(_hwo); } catch { } break; }");
-            sb.AppendLine("                    }");
-            sb.AppendLine("                    if (!_run) break;");
-            sb.AppendLine("                }");
-            sb.AppendLine("                Fill(_buf[idx]);");
-            sb.AppendLine("                int wr = waveOutWrite(_hwo, ref _hdr[idx], hdrSize);");
-            sb.AppendLine("                if (wr == 0) { _queued[idx] = true; idx = (idx + 1) & (NBUF - 1); }");
-            sb.AppendLine("                else { DbgWrErr = wr; Thread.Sleep(2); }");
-            sb.AppendLine("            }");
-            sb.AppendLine("            catch { Thread.Sleep(5); }");
-            sb.AppendLine("        }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    static void Fill(byte[] b)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        int per1 = Apu.Period1 + 1;");
-            sb.AppendLine("        int per2 = Apu.Period2 + 1;");
-            sb.AppendLine("        int perT = Apu.PeriodT + 1;");
-            sb.AppendLine("        int nperIdx = Apu.Regs[0xE] & 0xF; int nper = NoisePeriod[nperIdx];");
-            sb.AppendLine("        int nmode = (Apu.Regs[0xE] & 0x80) != 0 ? 6 : 1;");
-            sb.AppendLine("        float f1 = per1 > 8 ? (1789773f / (16f * per1)) : 0f;");
-            sb.AppendLine("        float f2 = per2 > 8 ? (1789773f / (16f * per2)) : 0f;");
-            sb.AppendLine("        float fT = perT > 1 ? (1789773f / (32f * perT)) : 0f;");
-            sb.AppendLine("        int v1 = Apu.Sq1On() ? ((Apu.Regs[0] & 0x10) != 0 ? (Apu.Regs[0] & 0x0F) : Apu.Env1) : 0;");
-            sb.AppendLine("        int v2 = Apu.Sq2On() ? ((Apu.Regs[4] & 0x10) != 0 ? (Apu.Regs[4] & 0x0F) : Apu.Env2) : 0;");
-            sb.AppendLine("        int vT = Apu.TriOn() ? 12 : 0;");
-            sb.AppendLine("        int vN = Apu.NoiOn() ? ((Apu.Regs[0xC] & 0x10) != 0 ? (Apu.Regs[0xC] & 0x0F) : Apu.EnvN) : 0;");
-            sb.AppendLine("        float d1f = DutyF[(Apu.Regs[0] >> 6) & 3];");
-            sb.AppendLine("        float d2f = DutyF[(Apu.Regs[4] >> 6) & 3];");
-            sb.AppendLine("        for (int i = 0; i < b.Length; i++)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            int pulse = 0;");
-            sb.AppendLine("            if (v1 != 0 && f1 > 0f) { _ph1 += f1 / SR; if (_ph1 >= 1f) _ph1 -= 1f; if (_ph1 < d1f) pulse += v1; }");
-            sb.AppendLine("            if (v2 != 0 && f2 > 0f) { _ph2 += f2 / SR; if (_ph2 >= 1f) _ph2 -= 1f; if (_ph2 < d2f) pulse += v2; }");
-            sb.AppendLine("            float tin = 0f;");
-            sb.AppendLine("            if (vT != 0 && fT > 0f) { _phT += fT / SR; if (_phT >= 1f) _phT -= 1f; int ti = (int)(_phT * 32f); if (ti >= 32) ti = 31; tin += TriangleWave[ti] / 8227f; }");
-            sb.AppendLine("            if (vN != 0) { _noiseCounter++; if (_noiseCounter >= nper) { _noiseCounter = 0; int bit = (_noise & 1) ^ ((_noise >> nmode) & 1); _noise = (_noise >> 1) | (bit << 14); } if ((_noise & 1) == 0) tin += vN / 12241f; }");
-            sb.AppendLine("            float pulseOut = (pulse == 0) ? 0f : (95.52f / (8128f / pulse + 100f));");
-            sb.AppendLine("            float tndOut   = (tin == 0f) ? 0f : (159.79f / (1f / tin + 100f));");
-            sb.AppendLine("            float outv = pulseOut + tndOut;");
-            sb.AppendLine("            _dc += (outv - _dc) * 0.002f;");
-            sb.AppendLine("            float s0 = outv - _dc;");
-            sb.AppendLine("            _lp1 += 0.85f * (s0 - _lp1);");
-            sb.AppendLine("            _lp2 += 0.85f * (_lp1 - _lp2);");
-            sb.AppendLine("            int sample = 128 + (int)(_lp2 * 240f);");
-            sb.AppendLine("            if (sample < 0) sample = 0;");
-            sb.AppendLine("            if (sample > 255) sample = 255;");
-            sb.AppendLine("            b[i] = (byte)sample;");
-            sb.AppendLine("        }");
-            sb.AppendLine("    }");
-            sb.AppendLine("}");
-            sb.AppendLine();
+            sb.Append(Raw("""
+                static class Audio
+                {
+                    [StructLayout(LayoutKind.Sequential)]
+                    struct WAVEFORMATEX { public ushort wFormatTag; public ushort nChannels; public uint nSamplesPerSec; public uint nAvgBytesPerSec; public ushort nBlockAlign; public ushort wBitsPerSample; public ushort cbSize; }
+
+                    [StructLayout(LayoutKind.Sequential)]
+                    struct WAVEHDR { public IntPtr lpData; public uint dwBufferLength; public uint dwBytesRecorded; public IntPtr dwUser; public uint dwFlags; public uint dwLoops; public IntPtr lpNext; public IntPtr reserved; }
+
+                    [DllImport("winmm.dll")] static extern int waveOutOpen(out IntPtr h, int dev, ref WAVEFORMATEX fmt, IntPtr cb, IntPtr inst, int flags);
+                    [DllImport("winmm.dll")] static extern int waveOutPrepareHeader(IntPtr h, ref WAVEHDR hdr, int size);
+                    [DllImport("winmm.dll")] static extern int waveOutWrite(IntPtr h, ref WAVEHDR hdr, int size);
+                    [DllImport("winmm.dll")] static extern int waveOutUnprepareHeader(IntPtr h, ref WAVEHDR hdr, int size);
+                    [DllImport("winmm.dll")] static extern int waveOutReset(IntPtr h);
+                    [DllImport("winmm.dll")] static extern int waveOutClose(IntPtr h);
+
+                    const int SR = 22050;
+                    const int BLOCK = 512;
+                    const int NBUF = 4;
+                    static IntPtr _hwo;
+                    static bool _open;
+                    static Thread _thread;
+                    static volatile bool _run;
+                    static byte[][] _buf = new byte[NBUF][];
+                    static WAVEHDR[] _hdr = new WAVEHDR[NBUF];
+                    static GCHandle[] _pin = new GCHandle[NBUF];
+                    static bool[] _queued = new bool[NBUF];
+                    static float _ph1, _ph2, _phT;
+                    static float _dc, _lp1, _lp2;
+                    static int _noise = 0x7FFF;
+                    static int _noiseCounter;
+                    public static volatile int DbgAlive;
+                    public static volatile int DbgWrErr;
+                    static readonly int[] NoisePeriod = new int[16] {4,8,16,32,64,96,128,160,202,254,380,508,762,1016,2034,4068};
+                    static readonly float[] DutyF = new float[4] {0.125f,0.25f,0.5f,0.75f};
+                    static readonly int[] TriangleWave = new int[32] {
+                        15,14,13,12,11,10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
+                         0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15
+                    };
+
+                    public static void OnStatusChange(byte v) { }
+
+                    public static void TryStart()
+                    {
+                        try
+                        {
+                            if (_open) return;
+                            WAVEFORMATEX fmt = new WAVEFORMATEX();
+                            fmt.wFormatTag = 1; fmt.nChannels = 1; fmt.nSamplesPerSec = SR; fmt.wBitsPerSample = 8; fmt.nBlockAlign = 1; fmt.nAvgBytesPerSec = SR; fmt.cbSize = 0;
+                            int r = waveOutOpen(out _hwo, -1, ref fmt, IntPtr.Zero, IntPtr.Zero, 0);
+                            if (r != 0) return;
+                            _open = true;
+
+                            int hdrSize = Marshal.SizeOf(typeof(WAVEHDR));
+
+                            for (int i = 0; i < NBUF; i++)
+                            {
+                                _buf[i] = new byte[BLOCK];
+                                _pin[i] = GCHandle.Alloc(_buf[i], GCHandleType.Pinned);
+                                _hdr[i] = new WAVEHDR();
+                                _hdr[i].lpData = _pin[i].AddrOfPinnedObject();
+                                _hdr[i].dwBufferLength = BLOCK;
+                                waveOutPrepareHeader(_hwo, ref _hdr[i], hdrSize);
+                            }
+
+                            _run = true;
+                            _thread = new Thread(new ThreadStart(ThreadProc));
+                            _thread.IsBackground = true;
+                            _thread.Start();
+                        }
+                        catch { _open = false; }
+                    }
+
+                    public static void TryStop()
+                    {
+                        try
+                        {
+                            _run = false;
+
+                            if (_open)
+                            {
+                                waveOutReset(_hwo);
+                                int hdrSize = Marshal.SizeOf(typeof(WAVEHDR));
+                                for (int i = 0; i < NBUF; i++) { try { waveOutUnprepareHeader(_hwo, ref _hdr[i], hdrSize); } catch { } if (_pin[i].IsAllocated) _pin[i].Free(); }
+                                waveOutClose(_hwo);
+                                _open = false;
+                            }
+                        }
+                        catch { }
+                    }
+
+                    static void ThreadProc()
+                    {
+                        int hdrSize; try { hdrSize = Marshal.SizeOf(typeof(WAVEHDR)); } catch { hdrSize = 32; }
+                        int idx = 0;
+
+                        while (_run)
+                        {
+                            try
+                            {
+                                DbgAlive = Environment.TickCount;
+
+                                if (_queued[idx])
+                                {
+                                    int stuck = 0;
+                                    while (_run && (_hdr[idx].dwFlags & 1) == 0)
+                                    {
+                                        Thread.Sleep(1); stuck++;
+                                        if (stuck > 2000) { try { waveOutReset(_hwo); } catch { } break; }
+                                    }
+                                    if (!_run) break;
+                                }
+
+                                Fill(_buf[idx]);
+                                int wr = waveOutWrite(_hwo, ref _hdr[idx], hdrSize);
+                                if (wr == 0) { _queued[idx] = true; idx = (idx + 1) & (NBUF - 1); }
+                                else { DbgWrErr = wr; Thread.Sleep(2); }
+                            }
+                            catch { Thread.Sleep(5); }
+                        }
+                    }
+
+                    static void Fill(byte[] b)
+                    {
+                        int per1 = Apu.Period1 + 1;
+                        int per2 = Apu.Period2 + 1;
+                        int perT = Apu.PeriodT + 1;
+                        int nperIdx = Apu.Regs[0xE] & 0xF; int nper = NoisePeriod[nperIdx];
+                        int nmode = (Apu.Regs[0xE] & 0x80) != 0 ? 6 : 1;
+                        float f1 = per1 > 8 ? (1789773f / (16f * per1)) : 0f;
+                        float f2 = per2 > 8 ? (1789773f / (16f * per2)) : 0f;
+                        float fT = perT > 1 ? (1789773f / (32f * perT)) : 0f;
+                        int v1 = Apu.Sq1On() ? ((Apu.Regs[0] & 0x10) != 0 ? (Apu.Regs[0] & 0x0F) : Apu.Env1) : 0;
+                        int v2 = Apu.Sq2On() ? ((Apu.Regs[4] & 0x10) != 0 ? (Apu.Regs[4] & 0x0F) : Apu.Env2) : 0;
+                        int vT = Apu.TriOn() ? 12 : 0;
+                        int vN = Apu.NoiOn() ? ((Apu.Regs[0xC] & 0x10) != 0 ? (Apu.Regs[0xC] & 0x0F) : Apu.EnvN) : 0;
+                        float d1f = DutyF[(Apu.Regs[0] >> 6) & 3];
+                        float d2f = DutyF[(Apu.Regs[4] >> 6) & 3];
+
+                        for (int i = 0; i < b.Length; i++)
+                        {
+                            int pulse = 0;
+                            if (v1 != 0 && f1 > 0f) { _ph1 += f1 / SR; if (_ph1 >= 1f) _ph1 -= 1f; if (_ph1 < d1f) pulse += v1; }
+                            if (v2 != 0 && f2 > 0f) { _ph2 += f2 / SR; if (_ph2 >= 1f) _ph2 -= 1f; if (_ph2 < d2f) pulse += v2; }
+
+                            float tin = 0f;
+                            if (vT != 0 && fT > 0f) { _phT += fT / SR; if (_phT >= 1f) _phT -= 1f; int ti = (int)(_phT * 32f); if (ti >= 32) ti = 31; tin += TriangleWave[ti] / 8227f; }
+                            if (vN != 0) { _noiseCounter++; if (_noiseCounter >= nper) { _noiseCounter = 0; int bit = (_noise & 1) ^ ((_noise >> nmode) & 1); _noise = (_noise >> 1) | (bit << 14); } if ((_noise & 1) == 0) tin += vN / 12241f; }
+
+                            float pulseOut = (pulse == 0) ? 0f : (95.52f / (8128f / pulse + 100f));
+                            float tndOut   = (tin == 0f) ? 0f : (159.79f / (1f / tin + 100f));
+                            float outv = pulseOut + tndOut;
+
+                            // Gentle DC blocking and two one-pole low-passes: the NES output
+                            // is famously harsh, and this is what makes it listenable.
+                            _dc += (outv - _dc) * 0.002f;
+                            float s0 = outv - _dc;
+                            _lp1 += 0.85f * (s0 - _lp1);
+                            _lp2 += 0.85f * (_lp1 - _lp2);
+
+                            int sample = 128 + (int)(_lp2 * 240f);
+                            if (sample < 0) sample = 0;
+                            if (sample > 255) sample = 255;
+                            b[i] = (byte)sample;
+                        }
+                    }
+                }
+
+                """));
         }
 
         // ================================================================
@@ -1633,153 +1890,186 @@ namespace NesLifter.Lifting
 
         private void AppendForm(StringBuilder sb)
         {
-            sb.AppendLine("class PpuForm : Form");
-            sb.AppendLine("{");
-            sb.AppendLine("    private System.Windows.Forms.Timer _timer;");
-            sb.AppendLine("    private Bitmap _front;");
-            sb.AppendLine("    private Bitmap _work;");
-            sb.AppendLine("    private Thread _renderThread;");
-            sb.AppendLine("    private volatile bool _closing;");
-            sb.AppendLine();
-            sb.AppendLine("    public PpuForm()");
-            sb.AppendLine("    {");
-            sb.AppendLine("        Text = \"NES Lifted: \" + Runtime.GameName;");
-            sb.AppendLine("        ClientSize = new Size(256 * 2, 240 * 2);");
-            sb.AppendLine("        FormBorderStyle = FormBorderStyle.FixedSingle;");
-            sb.AppendLine("        MaximizeBox = false;");
-            sb.AppendLine("        StartPosition = FormStartPosition.CenterScreen;");
-            sb.AppendLine("        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);");
-            sb.AppendLine();
-            sb.AppendLine("        _front = new Bitmap(256, 240, PixelFormat.Format32bppArgb);");
-            sb.AppendLine("        _work = new Bitmap(256, 240, PixelFormat.Format32bppArgb);");
-            sb.AppendLine();
-            sb.AppendLine("        _timer = new System.Windows.Forms.Timer();");
-            sb.AppendLine("        _timer.Interval = 33;");
-            sb.AppendLine("        _timer.Tick += delegate(object sender, EventArgs e)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            Invalidate();");
-            sb.AppendLine("        };");
-            sb.AppendLine("        _timer.Start();");
-            sb.AppendLine();
-            sb.AppendLine("        _renderThread = new Thread(new ThreadStart(RenderLoop));");
-            sb.AppendLine("        _renderThread.IsBackground = true;");
-            sb.AppendLine("        _renderThread.Priority = ThreadPriority.BelowNormal;");
-            sb.AppendLine("        _renderThread.Start();");
-            sb.AppendLine();
-            sb.AppendLine("        this.KeyPreview = true;");
-            sb.AppendLine("        this.KeyDown += delegate(object s, KeyEventArgs ke) { SetJoyKey(ke.KeyCode, true); ke.SuppressKeyPress = true; };");
-            sb.AppendLine("        this.KeyUp += delegate(object s, KeyEventArgs ke) { SetJoyKey(ke.KeyCode, false); };");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    void RenderLoop()");
-            sb.AppendLine("    {");
-            sb.AppendLine("        const int MaxFps = 30;");
-            sb.AppendLine("        long freq = System.Diagnostics.Stopwatch.Frequency;");
-            sb.AppendLine("        long nextFrame = System.Diagnostics.Stopwatch.GetTimestamp();");
-            sb.AppendLine("        while (!_closing)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            try");
-            sb.AppendLine("            {");
-            sb.AppendLine("                if (!Ppu.FrameReady) { Thread.Sleep(2); continue; }");
-            sb.AppendLine("                Ppu.FrameReady = false;");
-            sb.AppendLine("                Ppu.RenderScreen();");
-            sb.AppendLine("                BlitTo(_work);");
-            sb.AppendLine("                DrawOsd(_work);");
-            sb.AppendLine("                Bitmap ready = _work;");
-            sb.AppendLine("                _work = Interlocked.Exchange(ref _front, ready);");
-            sb.AppendLine("                // Do not queue stale NES frames: CPU may produce 60 Hz, presentation is adaptive up to 30 Hz.");
-            sb.AppendLine("                nextFrame += freq / MaxFps;");
-            sb.AppendLine("                long now = System.Diagnostics.Stopwatch.GetTimestamp();");
-            sb.AppendLine("                if (nextFrame < now) nextFrame = now;");
-            sb.AppendLine("                long waitMs = (nextFrame - now) * 1000L / freq;");
-            sb.AppendLine("                if (waitMs > 0) Thread.Sleep((int)waitMs);");
-            sb.AppendLine("            }");
-            sb.AppendLine("            catch { try { Thread.Sleep(16); } catch { } }");
-            sb.AppendLine("        }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    void BlitTo(Bitmap bmp)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        if (bmp == null) return;");
-            sb.AppendLine("        Rectangle rc = new Rectangle(0, 0, 256, 240);");
-            sb.AppendLine("        BitmapData data = bmp.LockBits(rc, ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);");
-            sb.AppendLine("        try");
-            sb.AppendLine("        {");
-            sb.AppendLine("            if (data.Stride == 256 * 4) Marshal.Copy(Ppu.Screen, 0, data.Scan0, Ppu.Screen.Length);");
-            sb.AppendLine("            else for (int y = 0; y < 240; y++) { IntPtr dst = new IntPtr(data.Scan0.ToInt64() + y * data.Stride); Marshal.Copy(Ppu.Screen, y * 256 * 4, dst, 256 * 4); }");
-            sb.AppendLine("        }");
-            sb.AppendLine("        finally { bmp.UnlockBits(data); }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    void DrawOsd(Bitmap bmp)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        if (bmp == null) return;");
-            sb.AppendLine("        try");
-            sb.AppendLine("        {");
-            sb.AppendLine("            using (Graphics g = Graphics.FromImage(bmp))");
-            sb.AppendLine("            {");
-            sb.AppendLine("                string c = string.Format(\"F:{0} I:{1} T:{2}\", Ppu.FrameCount, Runtime.InsCount, Runtime.TrapCount);");
-            sb.AppendLine("                g.FillRectangle(Brushes.Black, 0, 0, 256, 15);");
-            sb.AppendLine("                g.DrawString(c, SystemFonts.DefaultFont, Brushes.Yellow, 2, 1);");
-            sb.AppendLine("                if (!string.IsNullOrEmpty(Runtime.LastError))");
-            sb.AppendLine("                {");
-            sb.AppendLine("                    string msg = Runtime.LastError; if (msg.Length > 56) msg = msg.Substring(0, 56);");
-            sb.AppendLine("                    g.FillRectangle(Brushes.Black, 0, 222, 256, 18);");
-            sb.AppendLine("                    g.DrawString(msg, SystemFonts.DefaultFont, Brushes.Red, 2, 224);");
-            sb.AppendLine("                }");
-            sb.AppendLine("            }");
-            sb.AppendLine("        }");
-            sb.AppendLine("        catch { }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    protected override void OnPaint(PaintEventArgs e)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        base.OnPaint(e);");
-            sb.AppendLine("        Bitmap b = Volatile.Read(ref _front);");
-            sb.AppendLine("        if (b != null)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            e.Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;");
-            sb.AppendLine("            e.Graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;");
-            sb.AppendLine("            e.Graphics.DrawImage(b, 0, 0, ClientSize.Width, ClientSize.Height);");
-            sb.AppendLine("        }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    static void SetJoyKey(Keys k, bool down)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        int b = KeyBit(k); if (b < 0) return;");
-            sb.AppendLine("        if (down) Runtime.Joy1Buttons = (byte)(Runtime.Joy1Buttons | (1 << b));");
-            sb.AppendLine("        else Runtime.Joy1Buttons = (byte)(Runtime.Joy1Buttons & ~(1 << b));");
-            sb.AppendLine("        Runtime.Log(\"key-\" + b + \"-\" + down, (down ? \"KeyDown \" : \"KeyUp \") + k + \" -> NES bit \" + b + \"; P1=$\" + Runtime.Joy1Buttons.ToString(\"X2\"), false);");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    static int KeyBit(Keys k)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        switch (k)");
-            sb.AppendLine("        {");
-            sb.AppendLine("            case Keys.X: return 0;");
-            sb.AppendLine("            case Keys.Z: return 1;");
-            sb.AppendLine("            case Keys.Back: case Keys.ShiftKey: case Keys.LShiftKey: case Keys.RShiftKey: return 2;");
-            sb.AppendLine("            case Keys.Enter: return 3;");
-            sb.AppendLine("            case Keys.Up: return 4;");
-            sb.AppendLine("            case Keys.Down: return 5;");
-            sb.AppendLine("            case Keys.Left: return 6;");
-            sb.AppendLine("            case Keys.Right: return 7;");
-            sb.AppendLine("            default: return -1;");
-            sb.AppendLine("        }");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    protected override void OnFormClosing(FormClosingEventArgs e)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        _closing = true;");
-            sb.AppendLine("        if (_renderThread != null && _renderThread.IsAlive) _renderThread.Join(500);");
-            sb.AppendLine("        base.OnFormClosing(e);");
-            sb.AppendLine("        _timer.Stop();");
-            sb.AppendLine("        Audio.TryStop();");
-            sb.AppendLine("        if (_front != null) { _front.Dispose(); _front = null; }");
-            sb.AppendLine("        if (_work != null) { _work.Dispose(); _work = null; }");
-            sb.AppendLine("    }");
-            sb.AppendLine("}");
-            sb.AppendLine();
+            sb.Append(Raw("""
+                class PpuForm : Form
+                {
+                    private System.Windows.Forms.Timer _timer;
+                    private Bitmap _front;
+                    private Bitmap _work;
+                    private Thread _renderThread;
+                    private volatile bool _closing;
+
+                    public PpuForm()
+                    {
+                        Text = "NES Lifted: " + Runtime.GameName;
+                        ClientSize = new Size(256 * 2, 240 * 2);
+                        FormBorderStyle = FormBorderStyle.FixedSingle;
+                        MaximizeBox = false;
+                        StartPosition = FormStartPosition.CenterScreen;
+                        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+
+                        _front = new Bitmap(256, 240, PixelFormat.Format32bppArgb);
+                        _work = new Bitmap(256, 240, PixelFormat.Format32bppArgb);
+
+                        _timer = new System.Windows.Forms.Timer();
+                        _timer.Interval = 33;
+                        _timer.Tick += delegate(object sender, EventArgs e)
+                        {
+                            Invalidate();
+                        };
+                        _timer.Start();
+
+                        _renderThread = new Thread(new ThreadStart(RenderLoop));
+                        _renderThread.IsBackground = true;
+                        _renderThread.Priority = ThreadPriority.BelowNormal;
+                        _renderThread.Start();
+
+                        this.KeyPreview = true;
+                        this.KeyDown += delegate(object s, KeyEventArgs ke) { SetJoyKey(ke.KeyCode, true); ke.SuppressKeyPress = true; };
+                        this.KeyUp += delegate(object s, KeyEventArgs ke) { SetJoyKey(ke.KeyCode, false); };
+
+                        // Screenshot-to-icon: sample the framebuffer for a while, then keep
+                        // the most interesting frame. A single shot at a fixed time lands
+                        // on a fade-in or a blank title screen far too often.
+                        if (Runtime.CaptureIconSeconds > 0)
+                        {
+                            System.Windows.Forms.Timer iconTimer = new System.Windows.Forms.Timer();
+                            iconTimer.Interval = 250;
+                            iconTimer.Tick += delegate(object s, EventArgs e)
+                            {
+                                if (Runtime.SampleIconCandidate())
+                                {
+                                    iconTimer.Stop();
+                                    iconTimer.Dispose();
+                                    Runtime.SaveIcon();
+                                    if (Runtime.ExitAfterIcon) Close();
+                                }
+                            };
+                            iconTimer.Start();
+                        }
+                    }
+
+                    void RenderLoop()
+                    {
+                        const int MaxFps = 30;
+                        long freq = System.Diagnostics.Stopwatch.Frequency;
+                        long nextFrame = System.Diagnostics.Stopwatch.GetTimestamp();
+
+                        while (!_closing)
+                        {
+                            try
+                            {
+                                if (!Ppu.FrameReady) { Thread.Sleep(2); continue; }
+                                Ppu.FrameReady = false;
+
+                                Ppu.RenderScreen();
+                                BlitTo(_work);
+                                DrawOsd(_work);
+
+                                Bitmap ready = _work;
+                                _work = Interlocked.Exchange(ref _front, ready);
+
+                                // Do not queue stale NES frames: CPU may produce 60 Hz,
+                                // presentation is adaptive up to 30 Hz.
+                                nextFrame += freq / MaxFps;
+                                long now = System.Diagnostics.Stopwatch.GetTimestamp();
+                                if (nextFrame < now) nextFrame = now;
+                                long waitMs = (nextFrame - now) * 1000L / freq;
+                                if (waitMs > 0) Thread.Sleep((int)waitMs);
+                            }
+                            catch { try { Thread.Sleep(16); } catch { } }
+                        }
+                    }
+
+                    void BlitTo(Bitmap bmp)
+                    {
+                        if (bmp == null) return;
+
+                        Rectangle rc = new Rectangle(0, 0, 256, 240);
+                        BitmapData data = bmp.LockBits(rc, ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+
+                        try
+                        {
+                            if (data.Stride == 256 * 4) Marshal.Copy(Ppu.Screen, 0, data.Scan0, Ppu.Screen.Length);
+                            else for (int y = 0; y < 240; y++) { IntPtr dst = new IntPtr(data.Scan0.ToInt64() + y * data.Stride); Marshal.Copy(Ppu.Screen, y * 256 * 4, dst, 256 * 4); }
+                        }
+                        finally { bmp.UnlockBits(data); }
+                    }
+
+                    void DrawOsd(Bitmap bmp)
+                    {
+                        if (bmp == null) return;
+
+                        try
+                        {
+                            using (Graphics g = Graphics.FromImage(bmp))
+                            {
+                                string c = string.Format("F:{0} I:{1} T:{2}", Ppu.FrameCount, Runtime.InsCount, Runtime.TrapCount);
+                                g.FillRectangle(Brushes.Black, 0, 0, 256, 15);
+                                g.DrawString(c, SystemFonts.DefaultFont, Brushes.Yellow, 2, 1);
+
+                                if (!string.IsNullOrEmpty(Runtime.LastError))
+                                {
+                                    string msg = Runtime.LastError; if (msg.Length > 56) msg = msg.Substring(0, 56);
+                                    g.FillRectangle(Brushes.Black, 0, 222, 256, 18);
+                                    g.DrawString(msg, SystemFonts.DefaultFont, Brushes.Red, 2, 224);
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+
+                    protected override void OnPaint(PaintEventArgs e)
+                    {
+                        base.OnPaint(e);
+
+                        Bitmap b = Volatile.Read(ref _front);
+
+                        if (b != null)
+                        {
+                            e.Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
+                            e.Graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
+                            e.Graphics.DrawImage(b, 0, 0, ClientSize.Width, ClientSize.Height);
+                        }
+                    }
+
+                    static void SetJoyKey(Keys k, bool down)
+                    {
+                        int b = KeyBit(k); if (b < 0) return;
+                        if (down) Runtime.Joy1Buttons = (byte)(Runtime.Joy1Buttons | (1 << b));
+                        else Runtime.Joy1Buttons = (byte)(Runtime.Joy1Buttons & ~(1 << b));
+                        Runtime.Log("key-" + b + "-" + down, (down ? "KeyDown " : "KeyUp ") + k + " -> NES bit " + b + "; P1=$" + Runtime.Joy1Buttons.ToString("X2"), false);
+                    }
+
+                    static int KeyBit(Keys k)
+                    {
+                        switch (k)
+                        {
+                            case Keys.X: return 0;
+                            case Keys.Z: return 1;
+                            case Keys.Back: case Keys.ShiftKey: case Keys.LShiftKey: case Keys.RShiftKey: return 2;
+                            case Keys.Enter: return 3;
+                            case Keys.Up: return 4;
+                            case Keys.Down: return 5;
+                            case Keys.Left: return 6;
+                            case Keys.Right: return 7;
+                            default: return -1;
+                        }
+                    }
+
+                    protected override void OnFormClosing(FormClosingEventArgs e)
+                    {
+                        _closing = true;
+                        if (_renderThread != null && _renderThread.IsAlive) _renderThread.Join(500);
+                        base.OnFormClosing(e);
+                        _timer.Stop();
+                        Audio.TryStop();
+                        if (_front != null) { _front.Dispose(); _front = null; }
+                        if (_work != null) { _work.Dispose(); _work = null; }
+                    }
+                }
+
+                """));
         }
 
         // ================================================================
@@ -1791,14 +2081,14 @@ namespace NesLifter.Lifting
             if (inst.Control == OpControl.Invalid)
             {
                 Line(sb, "Runtime.UnknownOpcode(0x" + inst.Opcode.ToString("X2") + ", 0x" + inst.Address.ToString("X4") + ");");
-                EmitGoto(sb, inst.Fallthrough);
+                EmitGoto(sb, inst.FallthroughOffset, inst.Fallthrough);
                 return;
             }
 
             switch (inst.Control)
             {
                 case OpControl.Branch: EmitBranch(sb, inst); return;
-                case OpControl.Jmp: EmitGoto(sb, inst.Target); return;
+                case OpControl.Jmp: EmitGoto(sb, inst.TargetOffset, inst.Target); return;
                 case OpControl.JmpInd: EmitIndirectJump(sb, inst); return;
                 case OpControl.Jsr: EmitJsr(sb, inst); return;
                 case OpControl.Rts: EmitRts(sb); return;
@@ -1811,32 +2101,43 @@ namespace NesLifter.Lifting
             if (inst.Info != null && inst.Info.Mn == "KIL")
                 return;
 
-            EmitGoto(sb, inst.Fallthrough);
+            EmitGoto(sb, inst.FallthroughOffset, inst.Fallthrough);
         }
 
         private void EmitBranch(StringBuilder sb, Instruction inst)
         {
             string cond = GetBranchCondition(inst.Info?.Mn ?? "???");
-            Line(sb, "if (" + cond + ")");
+
+            // A branch can leave the current bank view; in that case the target
+            // offset is not part of the lifted set and we must dispatch instead.
+            bool targetLifted = inst.TargetOffset >= 0 && _labels.Contains(inst.TargetOffset);
+
+            Line(sb, $"if ({cond})");
             Line(sb, "{");
-            if (_labels.ContainsKey(inst.Target))
-                EmitGoto(sb, inst.Target);
+
+            if (targetLifted)
+            {
+                EmitGoto(sb, inst.TargetOffset, inst.Target);
+            }
             else
             {
-                Line(sb, "Runtime.Trap(\"Missing branch target $" + inst.Target.ToString("X4") + "\");");
-                EmitGoto(sb, inst.Fallthrough);
+                Line(sb, $"Runtime.Trap(\"Missing branch target ${inst.Target:X4}\");");
+                EmitGoto(sb, inst.FallthroughOffset, inst.Fallthrough);
             }
+
             Line(sb, "}");
             Line(sb, "else");
             Line(sb, "{");
-            EmitGoto(sb, inst.Fallthrough);
+            EmitGoto(sb, inst.FallthroughOffset, inst.Fallthrough);
             Line(sb, "}");
         }
 
         private void EmitJsr(StringBuilder sb, Instruction inst)
         {
-            Line(sb, "Runtime.JsrPush(0x" + inst.Fallthrough.ToString("X4") + ");");
-            EmitGoto(sb, inst.Target);
+            // The return address pushed on the 6502 stack is a CPU address; RTS
+            // pulls it back and the dispatcher resolves it to an offset.
+            Line(sb, $"Runtime.JsrPush(0x{inst.Fallthrough:X4});");
+            EmitGoto(sb, inst.TargetOffset, inst.Target);
         }
 
         private void EmitRts(StringBuilder sb)
@@ -1855,8 +2156,7 @@ namespace NesLifter.Lifting
 
         private void EmitBrk(StringBuilder sb, Instruction inst)
         {
-            ushort pcPlus2 = (ushort)(inst.Address + 2);
-            Line(sb, "Runtime.Push16(0x" + pcPlus2.ToString("X4") + ");");
+            Line(sb, $"Runtime.Push16(0x{inst.Address + 2:X4});");
             Line(sb, "Runtime.Push((byte)(Runtime.P | 0x30));");
             Line(sb, "Runtime.P = (byte)(Runtime.P | 0x04);");
             Line(sb, "Runtime.DispatchTarget = Memory.Read16(0xFFFE);");
@@ -1865,84 +2165,101 @@ namespace NesLifter.Lifting
 
         private void EmitIndirectJump(StringBuilder sb, Instruction inst)
         {
+            // The 6502 indirect jump wraps inside the page; reproduce that with
+            // a masked high byte rather than a plain +1.
             ushort ptr = inst.Operand;
-            ushort loAddr = ptr;
             ushort hiAddr = (ushort)((ptr & 0xFF00) | ((ptr + 1) & 0x00FF));
-            Line(sb, "Runtime.DispatchTarget = (ushort)(Memory.Read(0x" + loAddr.ToString("X4") + ") | (Memory.Read(0x" + hiAddr.ToString("X4") + ") << 8));");
+
+            Line(sb, $"Runtime.DispatchTarget = (ushort)(Memory.Read(0x{ptr:X4}) | (Memory.Read(0x{hiAddr:X4}) << 8));");
             Line(sb, "goto Dispatch;");
         }
 
-        private void EmitGoto(StringBuilder sb, ushort addr)
+        /// <summary>
+        /// Emits a jump to a block. <paramref name="offset"/> is the PRG offset
+        /// of the destination; when it is lifted, the jump is a direct
+        /// <c>goto</c>, otherwise control goes through the dispatcher so the
+        /// runtime can resolve the address against the current bank.
+        /// </summary>
+        private void EmitGoto(StringBuilder sb, int offset, ushort address)
         {
-            if (_labels.ContainsKey(addr))
+            if (offset >= 0 && _labels.Contains(offset))
             {
-                Line(sb, "goto L" + addr.ToString("X4") + ";");
+                Line(sb, $"goto {Label(offset)};");
+                return;
             }
-            else
-            {
-                Line(sb, "Runtime.DispatchTarget = 0x" + addr.ToString("X4") + ";");
-                Line(sb, "goto Dispatch;");
-            }
+
+            Line(sb, $"Runtime.DispatchTarget = 0x{address:X4};");
+            Line(sb, "goto Dispatch;");
         }
 
         private void EmitOperation(StringBuilder sb, Instruction inst)
         {
             if (inst.Info == null)
             {
-                Line(sb, "Runtime.UnknownOpcode(0x" + inst.Opcode.ToString("X2") + ", 0x" + inst.Address.ToString("X4") + ");");
+                Line(sb, $"Runtime.UnknownOpcode(0x{inst.Opcode:X2}, 0x{inst.Address:X4});");
                 return;
             }
 
             string mn = inst.Info.Mn;
-            AddrMode mode = inst.Info.Mode;
             string read = GetReadExpr(inst);
-            string addrExpr = GetAddressExpr(inst);
+            string addr = GetAddressExpr(inst);
 
             switch (mn)
             {
-                case "LDA": Line(sb, "Runtime.A = " + read + "; Runtime.SetNZ(Runtime.A);"); break;
-                case "LDX": Line(sb, "Runtime.X = " + read + "; Runtime.SetNZ(Runtime.X);"); break;
-                case "LDY": Line(sb, "Runtime.Y = " + read + "; Runtime.SetNZ(Runtime.Y);"); break;
-                case "STA": Line(sb, "Memory.Write(" + addrExpr + ", Runtime.A);"); break;
-                case "STX": Line(sb, "Memory.Write(" + addrExpr + ", Runtime.X);"); break;
-                case "STY": Line(sb, "Memory.Write(" + addrExpr + ", Runtime.Y);"); break;
+                // --- Loads / stores ---
+                case "LDA": Line(sb, $"Runtime.A = {read}; Runtime.SetNZ(Runtime.A);"); break;
+                case "LDX": Line(sb, $"Runtime.X = {read}; Runtime.SetNZ(Runtime.X);"); break;
+                case "LDY": Line(sb, $"Runtime.Y = {read}; Runtime.SetNZ(Runtime.Y);"); break;
+                case "STA": Line(sb, $"Memory.Write({addr}, Runtime.A);"); break;
+                case "STX": Line(sb, $"Memory.Write({addr}, Runtime.X);"); break;
+                case "STY": Line(sb, $"Memory.Write({addr}, Runtime.Y);"); break;
+
+                // --- Transfers ---
                 case "TAX": Line(sb, "Runtime.X = Runtime.A; Runtime.SetNZ(Runtime.X);"); break;
                 case "TAY": Line(sb, "Runtime.Y = Runtime.A; Runtime.SetNZ(Runtime.Y);"); break;
                 case "TXA": Line(sb, "Runtime.A = Runtime.X; Runtime.SetNZ(Runtime.A);"); break;
                 case "TYA": Line(sb, "Runtime.A = Runtime.Y; Runtime.SetNZ(Runtime.A);"); break;
                 case "TXS": Line(sb, "Runtime.SP = Runtime.X;"); break;
                 case "TSX": Line(sb, "Runtime.X = Runtime.SP; Runtime.SetNZ(Runtime.X);"); break;
+
+                // --- Increments / decrements on registers ---
                 case "INX": Line(sb, "Runtime.X = (byte)(Runtime.X + 1); Runtime.SetNZ(Runtime.X);"); break;
                 case "INY": Line(sb, "Runtime.Y = (byte)(Runtime.Y + 1); Runtime.SetNZ(Runtime.Y);"); break;
                 case "DEX": Line(sb, "Runtime.X = (byte)(Runtime.X - 1); Runtime.SetNZ(Runtime.X);"); break;
                 case "DEY": Line(sb, "Runtime.Y = (byte)(Runtime.Y - 1); Runtime.SetNZ(Runtime.Y);"); break;
-                case "ADC": Line(sb, "Runtime.Adc(" + read + ");"); break;
-                case "SBC": Line(sb, "Runtime.Sbc(" + read + ");"); break;
-                case "CMP": Line(sb, "Runtime.Compare(Runtime.A, " + read + ");"); break;
-                case "CPX": Line(sb, "Runtime.Compare(Runtime.X, " + read + ");"); break;
-                case "CPY": Line(sb, "Runtime.Compare(Runtime.Y, " + read + ");"); break;
-                case "AND": Line(sb, "Runtime.A = (byte)(Runtime.A & " + read + "); Runtime.SetNZ(Runtime.A);"); break;
-                case "ORA": Line(sb, "Runtime.A = (byte)(Runtime.A | " + read + "); Runtime.SetNZ(Runtime.A);"); break;
-                case "EOR": Line(sb, "Runtime.A = (byte)(Runtime.A ^ " + read + "); Runtime.SetNZ(Runtime.A);"); break;
-                case "BIT": Line(sb, "Runtime.Bit(" + read + ");"); break;
+
+                // --- Arithmetic / logic ---
+                case "ADC": Line(sb, $"Runtime.Adc({read});"); break;
+                case "SBC": Line(sb, $"Runtime.Sbc({read});"); break;
+                case "CMP": Line(sb, $"Runtime.Compare(Runtime.A, {read});"); break;
+                case "CPX": Line(sb, $"Runtime.Compare(Runtime.X, {read});"); break;
+                case "CPY": Line(sb, $"Runtime.Compare(Runtime.Y, {read});"); break;
+                case "AND": Line(sb, $"Runtime.A = (byte)(Runtime.A & {read}); Runtime.SetNZ(Runtime.A);"); break;
+                case "ORA": Line(sb, $"Runtime.A = (byte)(Runtime.A | {read}); Runtime.SetNZ(Runtime.A);"); break;
+                case "EOR": Line(sb, $"Runtime.A = (byte)(Runtime.A ^ {read}); Runtime.SetNZ(Runtime.A);"); break;
+                case "BIT": Line(sb, $"Runtime.Bit({read});"); break;
+
+                // --- Shifts / rotates ---
                 case "ASL":
-                    if (mode == AddrMode.Acc) Line(sb, "Runtime.A = Runtime.Asl(Runtime.A);");
-                    else EmitRmw(sb, addrExpr, "Asl");
+                    if (inst.Info.Mode == AddrMode.Acc) Line(sb, "Runtime.A = Runtime.Asl(Runtime.A);");
+                    else EmitRmw(sb, addr, "Asl");
                     break;
                 case "LSR":
-                    if (mode == AddrMode.Acc) Line(sb, "Runtime.A = Runtime.Lsr(Runtime.A);");
-                    else EmitRmw(sb, addrExpr, "Lsr");
+                    if (inst.Info.Mode == AddrMode.Acc) Line(sb, "Runtime.A = Runtime.Lsr(Runtime.A);");
+                    else EmitRmw(sb, addr, "Lsr");
                     break;
                 case "ROL":
-                    if (mode == AddrMode.Acc) Line(sb, "Runtime.A = Runtime.Rol(Runtime.A);");
-                    else EmitRmw(sb, addrExpr, "Rol");
+                    if (inst.Info.Mode == AddrMode.Acc) Line(sb, "Runtime.A = Runtime.Rol(Runtime.A);");
+                    else EmitRmw(sb, addr, "Rol");
                     break;
                 case "ROR":
-                    if (mode == AddrMode.Acc) Line(sb, "Runtime.A = Runtime.Ror(Runtime.A);");
-                    else EmitRmw(sb, addrExpr, "Ror");
+                    if (inst.Info.Mode == AddrMode.Acc) Line(sb, "Runtime.A = Runtime.Ror(Runtime.A);");
+                    else EmitRmw(sb, addr, "Ror");
                     break;
-                case "INC": EmitIncDec(sb, addrExpr, true); break;
-                case "DEC": EmitIncDec(sb, addrExpr, false); break;
+                case "INC": EmitIncDec(sb, addr, inc: true); break;
+                case "DEC": EmitIncDec(sb, addr, inc: false); break;
+
+                // --- Flags ---
                 case "CLC": Line(sb, "Runtime.P = (byte)(Runtime.P & 0xFE);"); break;
                 case "SEC": Line(sb, "Runtime.P = (byte)(Runtime.P | 0x01);"); break;
                 case "CLI": Line(sb, "Runtime.P = (byte)(Runtime.P & 0xFB);"); break;
@@ -1950,78 +2267,70 @@ namespace NesLifter.Lifting
                 case "CLV": Line(sb, "Runtime.P = (byte)(Runtime.P & 0xBF);"); break;
                 case "CLD": Line(sb, "Runtime.P = (byte)(Runtime.P & 0xF7);"); break;
                 case "SED": Line(sb, "Runtime.P = (byte)(Runtime.P | 0x08);"); break;
+
+                // --- Stack ---
                 case "PHA": Line(sb, "Runtime.Push(Runtime.A);"); break;
                 case "PLA": Line(sb, "Runtime.A = Runtime.Pull(); Runtime.SetNZ(Runtime.A);"); break;
                 case "PHP": Line(sb, "Runtime.Push((byte)(Runtime.P | 0x30));"); break;
                 case "PLP": Line(sb, "Runtime.P = (byte)((Runtime.Pull() & 0xEF) | 0x20);"); break;
+
                 case "NOP": break;
-                case "LAX": Line(sb, "Runtime.A = Runtime.X = " + read + "; Runtime.SetNZ(Runtime.A);"); break;
-                case "SAX": Line(sb, "Memory.Write(" + addrExpr + ", (byte)(Runtime.A & Runtime.X));"); break;
-                case "DCP":
-                    Line(sb, "ushort rmw = " + addrExpr + ";");
-                    Line(sb, "byte tmp = (byte)(Memory.Read(rmw) - 1);");
-                    Line(sb, "Memory.Write(rmw, tmp);");
-                    Line(sb, "Runtime.Compare(Runtime.A, tmp);");
-                    break;
-                case "ISB":
-                    Line(sb, "ushort rmw = " + addrExpr + ";");
-                    Line(sb, "byte tmp = (byte)(Memory.Read(rmw) + 1);");
-                    Line(sb, "Memory.Write(rmw, tmp);");
-                    Line(sb, "Runtime.Sbc(tmp);");
-                    break;
-                case "SLO":
-                    Line(sb, "ushort rmw = " + addrExpr + ";");
-                    Line(sb, "byte tmp = Runtime.Asl(Memory.Read(rmw));");
-                    Line(sb, "Memory.Write(rmw, tmp);");
-                    Line(sb, "Runtime.A = (byte)(Runtime.A | tmp); Runtime.SetNZ(Runtime.A);");
-                    break;
-                case "RLA":
-                    Line(sb, "ushort rmw = " + addrExpr + ";");
-                    Line(sb, "byte tmp = Runtime.Rol(Memory.Read(rmw));");
-                    Line(sb, "Memory.Write(rmw, tmp);");
-                    Line(sb, "Runtime.A = (byte)(Runtime.A & tmp); Runtime.SetNZ(Runtime.A);");
-                    break;
-                case "SRE":
-                    Line(sb, "ushort rmw = " + addrExpr + ";");
-                    Line(sb, "byte tmp = Runtime.Lsr(Memory.Read(rmw));");
-                    Line(sb, "Memory.Write(rmw, tmp);");
-                    Line(sb, "Runtime.A = (byte)(Runtime.A ^ tmp); Runtime.SetNZ(Runtime.A);");
-                    break;
-                case "RRA":
-                    Line(sb, "ushort rmw = " + addrExpr + ";");
-                    Line(sb, "byte tmp = Runtime.Ror(Memory.Read(rmw));");
-                    Line(sb, "Memory.Write(rmw, tmp);");
-                    Line(sb, "Runtime.Adc(tmp);");
-                    break;
-                case "AXA": Line(sb, "Memory.Write(" + addrExpr + ", (byte)(Runtime.A & Runtime.X));"); break;
+
+                // --- Illegal opcodes: read-modify-write combinations ---
+                case "DCP": EmitIllegalRmw(sb, addr, "byte t = (byte)(Memory.Read(rmw) - 1);", "Runtime.Compare(Runtime.A, t);"); break;
+                case "ISB": EmitIllegalRmw(sb, addr, "byte t = (byte)(Memory.Read(rmw) + 1);", "Runtime.Sbc(t);"); break;
+                case "SLO": EmitIllegalRmw(sb, addr, "byte t = Runtime.Asl(Memory.Read(rmw));", "Runtime.A = (byte)(Runtime.A | t); Runtime.SetNZ(Runtime.A);"); break;
+                case "RLA": EmitIllegalRmw(sb, addr, "byte t = Runtime.Rol(Memory.Read(rmw));", "Runtime.A = (byte)(Runtime.A & t); Runtime.SetNZ(Runtime.A);"); break;
+                case "SRE": EmitIllegalRmw(sb, addr, "byte t = Runtime.Lsr(Memory.Read(rmw));", "Runtime.A = (byte)(Runtime.A ^ t); Runtime.SetNZ(Runtime.A);"); break;
+                case "RRA": EmitIllegalRmw(sb, addr, "byte t = Runtime.Ror(Memory.Read(rmw));", "Runtime.Adc(t);"); break;
+
+                // --- Illegal opcodes: register combinations ---
+                case "LAX": Line(sb, $"Runtime.A = Runtime.X = {read}; Runtime.SetNZ(Runtime.A);"); break;
+                case "SAX":
+                case "AXA": Line(sb, $"Memory.Write({addr}, (byte)(Runtime.A & Runtime.X));"); break;
+                case "SHY": Line(sb, $"Memory.Write({addr}, Runtime.Y);"); break;
+                case "ANC": Line(sb, $"Runtime.A = (byte)(Runtime.A & {read}); Runtime.SetCarry((Runtime.A & 0x80) != 0); Runtime.SetNZ(Runtime.A);"); break;
+                case "ALR": Line(sb, $"Runtime.A = Runtime.Lsr((byte)(Runtime.A & {read}));"); break;
+                case "ARR": Line(sb, $"Runtime.A = Runtime.Ror((byte)(Runtime.A & {read}));"); break;
+                case "ANE": Line(sb, $"Runtime.A = (byte)((Runtime.A | 0xEE) & Runtime.X & {read}); Runtime.SetNZ(Runtime.A);"); break;
+                case "LXA": Line(sb, $"Runtime.A = (byte)((Runtime.A | 0xEE) & {read}); Runtime.X = Runtime.A; Runtime.SetNZ(Runtime.A);"); break;
+                case "AXS": Line(sb, $"{{ int axs = (Runtime.A & Runtime.X) - {read}; Runtime.X = (byte)axs; Runtime.SetCarry(axs >= 0); Runtime.SetNZ(Runtime.X); }}"); break;
+                case "LAS": Line(sb, $"Runtime.SP = (byte)(Runtime.SP & {read}); Runtime.A = Runtime.SP; Runtime.X = Runtime.SP; Runtime.SetNZ(Runtime.SP);"); break;
+
                 case "KIL": Line(sb, "Runtime.Trap(\"KIL/HLT opcode executed\"); return;"); break;
-                case "ANC": Line(sb, "Runtime.A = (byte)(Runtime.A & " + read + "); Runtime.SetCarry((Runtime.A & 0x80) != 0); Runtime.SetNZ(Runtime.A);"); break;
-                case "ALR": Line(sb, "Runtime.A = Runtime.Lsr((byte)(Runtime.A & " + read + "));"); break;
-                case "ARR": Line(sb, "Runtime.A = Runtime.Ror((byte)(Runtime.A & " + read + "));"); break;
-                case "ANE": Line(sb, "Runtime.A = (byte)((Runtime.A | 0xEE) & Runtime.X & " + read + "); Runtime.SetNZ(Runtime.A);"); break;
-                case "LXA": Line(sb, "Runtime.A = (byte)((Runtime.A | 0xEE) & " + read + "); Runtime.X = Runtime.A; Runtime.SetNZ(Runtime.A);"); break;
-                case "AXS": Line(sb, "{ int axs = (Runtime.A & Runtime.X) - " + read + "; Runtime.X = (byte)axs; Runtime.SetCarry(axs >= 0); Runtime.SetNZ(Runtime.X); }"); break;
-                case "SHY": Line(sb, "Memory.Write(" + addrExpr + ", Runtime.Y);"); break;
-                case "LAS": Line(sb, "Runtime.SP = (byte)(Runtime.SP & " + read + "); Runtime.A = Runtime.SP; Runtime.X = Runtime.SP; Runtime.SetNZ(Runtime.SP);"); break;
+
                 default:
-                    Line(sb, "Runtime.UnknownOpcode(0x" + inst.Opcode.ToString("X2") + ", 0x" + inst.Address.ToString("X4") + ");");
+                    Line(sb, $"Runtime.UnknownOpcode(0x{inst.Opcode:X2}, 0x{inst.Address:X4});");
                     break;
             }
         }
 
-        private void EmitRmw(StringBuilder sb, string addrExpr, string helper)
+        /// <summary>
+        /// Emits the shared shape of the illegal read-modify-write opcodes:
+        /// load, transform, store, then combine with the accumulator.
+        /// </summary>
+        private void EmitIllegalRmw(StringBuilder sb, string addr, string transform, string combine)
         {
-            Line(sb, "ushort rmw = " + addrExpr + ";");
+            Line(sb, $"ushort rmw = {addr};");
+            Line(sb, transform);
+            Line(sb, "Memory.Write(rmw, t);");
+            Line(sb, combine);
+        }
+
+        private void EmitRmw(StringBuilder sb, string addr, string helper)
+        {
+            Line(sb, $"ushort rmw = {addr};");
             Line(sb, "byte tmp = Memory.Read(rmw);");
-            Line(sb, "tmp = Runtime." + helper + "(tmp);");
+            Line(sb, $"tmp = Runtime.{helper}(tmp);");
             Line(sb, "Memory.Write(rmw, tmp);");
         }
 
-        private void EmitIncDec(StringBuilder sb, string addrExpr, bool inc)
+        private void EmitIncDec(StringBuilder sb, string addr, bool inc)
         {
-            Line(sb, "ushort rmw = " + addrExpr + ";");
-            if (inc) Line(sb, "byte tmp = (byte)(Memory.Read(rmw) + 1);");
-            else Line(sb, "byte tmp = (byte)(Memory.Read(rmw) - 1);");
+            Line(sb, $"ushort rmw = {addr};");
+            Line(sb, inc
+                ? "byte tmp = (byte)(Memory.Read(rmw) + 1);"
+                : "byte tmp = (byte)(Memory.Read(rmw) - 1);");
             Line(sb, "Runtime.SetNZ(tmp);");
             Line(sb, "Memory.Write(rmw, tmp);");
         }
@@ -2076,7 +2385,7 @@ namespace NesLifter.Lifting
             }
         }
 
-        private int MnemIdFor(OpInfo info)
+        private int MnemIdFor(OpInfo? info)
         {
             if (info == null) return 0;
 
@@ -2199,31 +2508,40 @@ namespace NesLifter.Lifting
             return size;
         }
 
-        private void AppendByteArrayField(StringBuilder sb, string name, byte[] data)
+        /// <summary>
+        /// Emits a ROM byte array. This is data, not code: one line per 16 bytes
+        /// keeps the generated file's line count sane for multi-hundred-KB ROMs.
+        /// </summary>
+        private static void AppendByteArrayField(StringBuilder sb, string name, byte[] data)
         {
             if (data == null || data.Length == 0)
             {
-                sb.AppendLine("public static readonly byte[] " + name + " = new byte[0];");
+                sb.AppendLine($"    public static readonly byte[] {name} = new byte[0];");
                 return;
             }
 
-            sb.AppendLine("public static readonly byte[] " + name + " = new byte[] {");
+            sb.AppendLine($"    public static readonly byte[] {name} = new byte[] {{");
 
-            int chunk = 16;
-            for (int i = 0; i < data.Length; i += chunk)
+            const int Chunk = 16;
+
+            for (int i = 0; i < data.Length; i += Chunk)
             {
-                sb.Append("    ");
-                int end = Math.Min(i + chunk, data.Length);
+                sb.Append("        ");
+
+                int end = Math.Min(i + Chunk, data.Length);
+
                 for (int j = i; j < end; j++)
                 {
-                    sb.Append("0x" + data[j].ToString("X2"));
+                    sb.Append("0x").Append(data[j].ToString("X2"));
+
                     if (j < data.Length - 1)
                         sb.Append(", ");
                 }
+
                 sb.AppendLine();
             }
 
-            sb.AppendLine("};");
+            sb.AppendLine("    };");
         }
 
         private static string SanitizeIdentifier(string name)
@@ -2253,6 +2571,19 @@ namespace NesLifter.Lifting
         private static void Line(StringBuilder sb, string text)
         {
             sb.AppendLine("            " + text);
+        }
+
+        /// <summary>
+        /// Appends a raw string literal verbatim, normalising line endings.
+        ///
+        /// Raw literals keep braces, quotes and backslashes exactly as written,
+        /// so the emitted C# in this file is readable as C# instead of a wall of
+        /// escaped <c>\"</c> sequences. Dedentation is handled by the compiler,
+        /// which is why the literal bodies are indented with the surrounding code.
+        /// </summary>
+        private static string Raw(string text)
+        {
+            return text.Replace("\r\n", "\n").Replace("\n", Environment.NewLine) + Environment.NewLine;
         }
     }
 }

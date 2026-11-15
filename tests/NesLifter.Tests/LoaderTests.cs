@@ -226,8 +226,13 @@ public class DisassemblerTests
 
             Assert.Equal(0x8000, result.Entry);
             Assert.True(result.Instructions.Count > 0, "expected instructions");
-            Assert.Contains((ushort)0x8000, result.Instructions.Keys);
-            Assert.Contains((ushort)0x8100, result.Functions);
+
+            // Blocks are keyed by PRG offset: $8000 is offset 0 on NROM.
+            Assert.Equal(0, result.EntryOffset);
+            Assert.Contains(0, result.Instructions.Keys);
+
+            // The NMI handler sits at $8100, which is offset 0x100.
+            Assert.Contains(0x100, result.Functions);
             Assert.Empty(result.UnknownOpcodes);
         }
         finally
@@ -250,8 +255,43 @@ public class DisassemblerTests
 
             AnalysisResult result = dis.Analyze();
 
-            Assert.Contains((ushort)0x9000, result.Instructions.Keys);
+            // $9000 is PRG offset 0x1000 on a 32 KB NROM image.
+            Assert.Contains(0x1000, result.Instructions.Keys);
             Assert.Contains((ushort)0x9000, result.DynamicTargets);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void AnalysesEveryBankOfABankedCartridge()
+    {
+        // UxROM with 128 KB PRG: 8 switchable 16 KB banks. The analyser must
+        // discover code in banks the power-on layout does not map at $8000.
+        SyntheticRom.Spec spec = new SyntheticRom.Spec("banks", 2, 0x20000, 0);
+        string path = WriteTestRom(spec);
+
+        try
+        {
+            NesRom rom = NesRom.Load(path);
+
+            Disassembler powerOnOnly = new Disassembler(rom) { AnalyseAllBanks = false };
+            AnalysisResult single = powerOnOnly.Analyze();
+
+            Disassembler allBanks = new Disassembler(rom) { AnalyseAllBanks = true };
+            AnalysisResult full = allBanks.Analyze();
+
+            Assert.True(
+                full.Instructions.Count >= single.Instructions.Count,
+                "bank-aware analysis must not lose instructions");
+
+            Assert.True(full.BankViews > 1, "expected more than one bank view, got " + full.BankViews);
+
+            // Every decoded offset must land inside the PRG image.
+            foreach (int offset in full.Instructions.Keys)
+                Assert.InRange(offset, 0, rom.PrgRom.Length - 1);
         }
         finally
         {

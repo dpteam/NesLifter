@@ -273,6 +273,15 @@ public sealed class Pipeline
             return true;
         }
 
+        // Packaging: AppHost and SelfContained both need the SDK, and both go
+        // through `dotnet publish` so the SDK does the apphost binding and the
+        // icon embedding. That is more robust than hand-patching the apphost
+        // placeholder, and it is what makes `Game.exe` double-clickable.
+        if (_options.PackageMode != PackageMode.AssemblyOnly)
+        {
+            return PackageGame(code, workDir, safeName, descriptor);
+        }
+
         string dllPath = ResolveAssemblyPath(workDir, safeName);
 
         CompileResult result = _compiler.CompileDetailed(
@@ -300,6 +309,137 @@ public sealed class Pipeline
         Console.WriteLine("Run with: dotnet \"" + result.AssemblyPath + "\"");
 
         return true;
+    }
+
+    /// <summary>
+    /// Builds a launchable game through the SDK so the output is a real
+    /// <c>Game.exe</c> (optionally self-contained), with the icon embedded in
+    /// the PE resource table.
+    /// </summary>
+    private bool PackageGame(string code, string workDir, string safeName, MapperDescriptor descriptor)
+    {
+        GamePackager packager = new GamePackager();
+
+        if (!GamePackager.IsSdkAvailable())
+        {
+            Console.Error.WriteLine(
+                "The .NET SDK was not found, so `Game.exe` cannot be produced. " +
+                "Falling back to a plain assembly; re-run with --dll to silence this.");
+
+            string fallback = ResolveAssemblyPath(workDir, safeName);
+
+            CompileResult fallbackResult = _compiler.CompileDetailed(
+                code, fallback, message => Console.Error.WriteLine(message));
+
+            if (!fallbackResult.Success)
+                return false;
+
+            WriteRuntimeConfig(workDir, Path.GetFileName(fallback));
+            Console.WriteLine("Run with: dotnet \"" + fallbackResult.AssemblyPath + "\"");
+            return true;
+        }
+
+        // Prefer an icon the game captured for itself, then an explicit one,
+        // then the lifter's default.
+        string? icon = ResolveIconPath(workDir, safeName);
+
+        PackageOptions options = new PackageOptions
+        {
+            Mode = _options.PackageMode,
+            AssemblyName = safeName,
+            IconPath = icon,
+            Verbose = _options.Verbose
+        };
+
+        Console.WriteLine(
+            "Packaging: " + (_options.PackageMode == PackageMode.SelfContained
+                ? "self-contained single file (no .NET needed on the target)"
+                : "framework-dependent apphost (.exe + .dll)"));
+
+        if (icon != null)
+            Console.WriteLine("Packaging: icon = " + icon);
+
+        PackageResult result = packager.Package(code, workDir, options, message => Console.Error.WriteLine(message));
+
+        if (!result.Success)
+        {
+            Console.Error.WriteLine("Packaging failed: " + result.Error);
+            Console.Error.WriteLine("Falling back to a plain assembly.");
+
+            string fallback = ResolveAssemblyPath(workDir, safeName);
+            CompileResult fallbackResult = _compiler.CompileDetailed(
+                code, fallback, message => Console.Error.WriteLine(message));
+
+            if (!fallbackResult.Success)
+                return false;
+
+            WriteRuntimeConfig(workDir, Path.GetFileName(fallback));
+            Console.WriteLine("Run with: dotnet \"" + fallbackResult.AssemblyPath + "\"");
+            return true;
+        }
+
+        // The publish output already carries a runtimeconfig; rewrite it so the
+        // roll-forward policy matches this lifter's runtime.
+        string runtimeConfig = Path.Combine(workDir, safeName + ".runtimeconfig.json");
+
+        if (File.Exists(runtimeConfig))
+            WriteRuntimeConfig(workDir, safeName + ".dll");
+
+        long total = 0;
+
+        foreach (string file in result.Produced)
+        {
+            if (File.Exists(file))
+                total += new FileInfo(file).Length;
+        }
+
+        Console.WriteLine("Packaged: " + result.LaunchPath + " (" + Human(total) + " total)");
+        Console.WriteLine("Run with: \"" + result.LaunchPath + "\"");
+
+        return true;
+    }
+
+    /// <summary>
+    /// Picks the icon to embed: a self-captured one first, then a user-supplied
+    /// image converted on the fly, then the lifter's own default.
+    /// </summary>
+    private string? ResolveIconPath(string workDir, string safeName)
+    {
+        // 1. A screenshot the game captured on a previous run.
+        string captured = Path.Combine(workDir, safeName + ".icon.ico");
+
+        if (File.Exists(captured))
+            return captured;
+
+        // 2. An explicit image, converted to ICO.
+        if (!string.IsNullOrWhiteSpace(_options.IconPath))
+        {
+            string source = _options.IconPath!;
+
+            if (!File.Exists(source))
+            {
+                Console.Error.WriteLine("Icon not found: " + source);
+            }
+            else
+            {
+                try
+                {
+                    string target = Path.Combine(workDir, safeName + ".icon.ico");
+                    Imaging.IcoWriter.Write(source, target);
+                    Console.WriteLine("Icon converted: " + source + " -> " + target);
+                    return target;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("Could not convert icon: " + ex.Message);
+                }
+            }
+        }
+
+        // 3. The lifter's own icon, so every output at least looks deliberate.
+        string builtIn = Path.Combine(AppContext.BaseDirectory, "assets", "icon.ico");
+
+        return File.Exists(builtIn) ? builtIn : null;
     }
 
     /// <summary>
@@ -484,7 +624,7 @@ public sealed class Pipeline
         };
 
         lines.Add("[Functions]");
-        AppendAddressList(lines, model.Functions, 512);
+        AppendOffsetList(lines, model.Functions, 512);
 
         lines.Add(string.Empty);
         lines.Add("[Unknown opcodes]");
@@ -502,7 +642,6 @@ public sealed class Pipeline
         lines.Add(string.Empty);
         lines.Add("[Indirect jumps]");
         AppendAddressList(lines, model.IndirectJumps, 512);
-
         string reportPath = Path.Combine(workDir, "analysis.txt");
         File.WriteAllLines(reportPath, lines);
 
@@ -528,6 +667,30 @@ public sealed class Pipeline
             }
 
             lines.Add("0x" + address.ToString("X4"));
+            written++;
+        }
+    }
+
+    /// <summary>Writes a list of PRG ROM offsets, as reported by the analyser.</summary>
+    private static void AppendOffsetList(List<string> lines, List<int> offsets, int limit)
+    {
+        if (offsets.Count == 0)
+        {
+            lines.Add("none");
+            return;
+        }
+
+        int written = 0;
+
+        foreach (int offset in offsets)
+        {
+            if (written >= limit)
+            {
+                lines.Add("... " + (offsets.Count - limit) + " more");
+                break;
+            }
+
+            lines.Add("prg:0x" + offset.ToString("X6"));
             written++;
         }
     }

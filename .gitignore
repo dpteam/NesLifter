@@ -99,6 +99,9 @@ lifted/
 **/trap.log
 **/analysis.txt
 **/*.runtimeconfig.json
+**/*.deps.json
+**/*.icon.ico
+**/_pkg/
 
 # Publish profiles and local configuration
 *.publishsettings
@@ -128,6 +131,10 @@ publish/
 !docs/**/*.md
 !docs/**/*.svg
 !docs/**/*.png
+
+# The GUI vendors NES.css and Font Awesome under web/vendor so it works
+# offline. Those must be committed; nothing is fetched at runtime.
+!web/vendor/**
 
 # ------------------------------- OS / tools ----------------------------------
 .vsconfig

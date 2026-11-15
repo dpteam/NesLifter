@@ -26,4 +26,15 @@
     <ProjectReference Include="..\..\NesLifter.csproj" />
   </ItemGroup>
 
+  <!--
+    Same WebView2 WPF exclusion as the main project: the reference flows through
+    the ProjectReference and would otherwise reintroduce the WindowsBase 5.0.0.0
+    conflict (MSB3277) in the test build.
+  -->
+  <Target Name="RemoveWebView2WpfReference" BeforeTargets="ResolveAssemblyReferences">
+    <ItemGroup>
+      <Reference Remove="@(Reference)" Condition="'%(Filename)' == 'Microsoft.Web.WebView2.Wpf'" />
+    </ItemGroup>
+  </Target>
+
 </Project>

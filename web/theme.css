@@ -1,0 +1,476 @@
+/* =========================================================================
+   NesLifter GUI theme.
+
+   NES.css gives us the 8-bit component shapes; this layer adds the three
+   themes (light / dark / OLED), the app layout, and the handful of components
+   NES.css does not ship (panels, ROM rows, log).
+
+   All colours are custom properties so a theme is one block of overrides.
+   ========================================================================= */
+
+:root {
+    --nes-ink: #f3ecdd;
+    --nes-ink-soft: #93a7c4;
+    --nes-red: #ff4d5a;
+    --nes-red-deep: #b81f31;
+    --nes-gold: #d9a23a;
+    --nes-green: #5aff9a;
+
+    --bg: #12161f;
+    --bg-panel: #1b2436;
+    --bg-panel-alt: #161d2b;
+    --border: #2c3d5c;
+    --shadow: rgba(0, 0, 0, 0.45);
+
+    --row-hover: rgba(255, 77, 90, 0.10);
+    --row-active: rgba(255, 77, 90, 0.20);
+
+    --font-pixel: "Press Start 2P", "Courier New", monospace;
+}
+
+/* ------------------------------- themes -------------------------------- */
+
+html[data-theme="light"] {
+    --bg: #efe7d7;
+    --bg-panel: #fffaf0;
+    --bg-panel-alt: #f4ecdd;
+    --border: #c9bda3;
+    --shadow: rgba(90, 74, 48, 0.18);
+    --nes-ink: #241f17;
+    --nes-ink-soft: #6d6250;
+    --row-hover: rgba(184, 31, 49, 0.08);
+    --row-active: rgba(184, 31, 49, 0.16);
+}
+
+html[data-theme="oled"] {
+    --bg: #000000;
+    --bg-panel: #000000;
+    --bg-panel-alt: #050608;
+    --border: #1e2635;
+    --shadow: rgba(0, 0, 0, 0.9);
+    --nes-ink-soft: #6f8199;
+    --row-hover: rgba(255, 77, 90, 0.07);
+    --row-active: rgba(255, 77, 90, 0.16);
+}
+
+/* -------------------------------- base --------------------------------- */
+
+* {
+    box-sizing: border-box;
+}
+
+html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--nes-ink);
+    font-family: ui-monospace, "Cascadia Mono", "Consolas", monospace;
+    font-size: 13px;
+    overflow: hidden;
+}
+
+body {
+    display: flex;
+    flex-direction: column;
+}
+
+.spacer {
+    flex: 1 1 auto;
+}
+
+.muted {
+    color: var(--nes-ink-soft);
+    font-size: 12px;
+}
+
+/* ------------------------------- topbar -------------------------------- */
+
+.topbar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 10px 16px;
+    background: var(--bg-panel);
+    border-bottom: 3px solid var(--border);
+    flex: 0 0 auto;
+}
+
+.brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 20px;
+    letter-spacing: -0.5px;
+}
+
+.brand-bolt {
+    color: var(--nes-red);
+    font-size: 18px;
+}
+
+.brand-nes {
+    color: var(--nes-ink);
+    font-weight: 700;
+}
+
+.brand-lifter {
+    color: var(--nes-red);
+    font-weight: 700;
+}
+
+.topbar-actions {
+    margin-left: auto;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+/* NES.css buttons are very tall by default; keep the chrome compact. */
+.nes-btn.is-small {
+    padding: 6px 10px;
+    font-size: 11px;
+    margin: 0;
+}
+
+/* -------------------------------- layout -------------------------------- */
+
+.layout {
+    flex: 1 1 auto;
+    display: grid;
+    grid-template-columns: minmax(340px, 1.1fr) minmax(300px, 0.9fr);
+    grid-template-rows: minmax(0, 1fr);
+    gap: 12px;
+    padding: 12px;
+    min-height: 0;
+}
+
+.panel {
+    background: var(--bg-panel);
+    border: 3px solid var(--border);
+    border-radius: 4px;
+    box-shadow: 4px 4px 0 var(--shadow);
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    min-width: 0;
+}
+
+.panel-source {
+    grid-column: 1;
+    grid-row: 1;
+}
+
+.panel-options {
+    grid-column: 2;
+    grid-row: 1;
+    overflow-y: auto;
+}
+
+.panel-log {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    min-height: 180px;
+}
+
+.layout {
+    grid-template-rows: minmax(240px, 1.35fr) minmax(160px, 0.65fr);
+}
+
+.panel-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 0 10px;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: var(--nes-ink-soft);
+    font-weight: 600;
+}
+
+.panel-title i {
+    color: var(--nes-red);
+}
+
+/* --------------------------------- rows --------------------------------- */
+
+.row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.row-actions {
+    margin-top: auto;
+    margin-bottom: 0;
+    padding-top: 8px;
+}
+
+.row-inline {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.row-inline .nes-input {
+    flex: 1 1 auto;
+}
+
+/* NES.css inputs are enormous; bring them down to a workable size. */
+.nes-input,
+.nes-select {
+    font-size: 12px;
+    padding: 6px 8px;
+    margin: 0;
+    height: auto;
+    background: var(--bg-panel-alt);
+    color: var(--nes-ink);
+    border-image-slice: 3;
+    border-image-width: 3;
+    border-image-repeat: stretch;
+    border-image-source: var(--nes-border-image);
+}
+
+.nes-input::placeholder {
+    color: var(--nes-ink-soft);
+}
+
+.field {
+    margin-bottom: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+
+.field > label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--nes-ink-soft);
+}
+
+.nes-checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+    cursor: pointer;
+    font-size: 12px;
+    user-select: none;
+}
+
+/* NES.css draws its checkbox with a light border and a dark tick, which is
+   invisible on a dark panel. The control is re-drawn here from the input
+   itself so it themes correctly in light, dark and OLED. */
+.nes-checkbox-row input[type="checkbox"] {
+    appearance: none;
+    -webkit-appearance: none;
+    width: 16px;
+    height: 16px;
+    margin: 0;
+    flex: 0 0 16px;
+    border: 2px solid var(--nes-ink-soft);
+    background: transparent;
+    position: relative;
+    cursor: pointer;
+    transition: border-color 100ms linear, background 100ms linear;
+}
+
+.nes-checkbox-row input[type="checkbox"]:checked {
+    border-color: var(--nes-red);
+    background: var(--nes-red);
+}
+
+.nes-checkbox-row input[type="checkbox"]:checked::after {
+    content: "";
+    position: absolute;
+    left: 4px;
+    top: 0;
+    width: 4px;
+    height: 9px;
+    border: solid var(--bg-panel);
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+}
+
+.nes-checkbox-row input[type="checkbox"]:focus-visible {
+    outline: 2px solid var(--nes-gold);
+    outline-offset: 2px;
+}
+
+.nes-checkbox-row:hover input[type="checkbox"] {
+    border-color: var(--nes-red);
+}
+
+/* ------------------------------- rom list ------------------------------- */
+
+.rom-list {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    border: 2px solid var(--border);
+    background: var(--bg-panel-alt);
+    margin-bottom: 8px;
+    min-height: 80px;
+}
+
+.rom-row {
+    display: grid;
+    grid-template-columns: 22px 1fr auto auto auto;
+    gap: 8px;
+    align-items: center;
+    padding: 5px 8px;
+    cursor: pointer;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    font-size: 12px;
+}
+
+.rom-row:hover {
+    background: var(--row-hover);
+}
+
+.rom-row.selected {
+    background: var(--row-active);
+}
+
+.rom-row.unsupported .rom-name {
+    color: var(--nes-red);
+    opacity: 0.75;
+}
+
+.rom-check {
+    color: var(--nes-ink-soft);
+}
+
+.rom-row.selected .rom-check {
+    color: var(--nes-gold);
+}
+
+.rom-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.rom-mapper {
+    color: var(--nes-green);
+    font-size: 11px;
+    min-width: 32px;
+    text-align: right;
+}
+
+.rom-row.unsupported .rom-mapper {
+    color: var(--nes-red);
+}
+
+.rom-board {
+    color: var(--nes-ink-soft);
+    font-size: 11px;
+    min-width: 90px;
+}
+
+.rom-size {
+    color: var(--nes-ink-soft);
+    font-size: 11px;
+    min-width: 42px;
+    text-align: right;
+}
+
+.rom-result {
+    font-size: 11px;
+    min-width: 46px;
+    text-align: right;
+}
+
+.rom-result.ok { color: var(--nes-green); }
+.rom-result.failed { color: var(--nes-red); }
+
+.empty {
+    padding: 20px;
+    text-align: center;
+    color: var(--nes-ink-soft);
+    font-size: 12px;
+}
+
+/* --------------------------------- log ---------------------------------- */
+
+.progress-track {
+    height: 8px;
+    background: var(--bg-panel-alt);
+    border: 2px solid var(--border);
+    margin-bottom: 8px;
+    overflow: hidden;
+}
+
+.progress-fill {
+    height: 100%;
+    width: 0;
+    background: var(--nes-red);
+    transition: width 120ms linear;
+}
+
+.log {
+    flex: 1 1 auto;
+    overflow: auto;
+    margin: 0;
+    padding: 8px;
+    background: var(--bg-panel-alt);
+    border: 2px solid var(--border);
+    font-size: 11.5px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+    min-height: 60px;
+}
+
+.log .line-error { color: var(--nes-red); }
+.log .line-ok { color: var(--nes-green); }
+.log .line-head { color: var(--nes-gold); }
+.log .line-dim { color: var(--nes-ink-soft); }
+
+/* ------------------------------ scrollbars ------------------------------ */
+
+::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+}
+
+::-webkit-scrollbar-track {
+    background: var(--bg-panel-alt);
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--border);
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--nes-red-deep);
+}
+
+/* ------------------------------- busy state ----------------------------- */
+
+body.busy .nes-btn {
+    pointer-events: none;
+    opacity: 0.55;
+}
+
+body.busy #liftBtn,
+body.busy #selfTestBtn {
+    opacity: 1;
+    pointer-events: none;
+}
+
+.busy-dot::after {
+    content: "";
+    animation: dots 1.2s steps(4, end) infinite;
+}
+
+@keyframes dots {
+    0%   { content: ""; }
+    25%  { content: "."; }
+    50%  { content: ".."; }
+    75%  { content: "..."; }
+    100% { content: ""; }
+}

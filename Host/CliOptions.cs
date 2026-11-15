@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using NesLifter.Compilation;
 
 namespace NesLifter.Host;
 
@@ -19,6 +20,28 @@ public sealed class CliOptions
     public bool SkipRun;
     public bool KeepTemp;
     public int HeadlessFrames = 30;
+
+    /// <summary>How to deliver the generated game.</summary>
+    public PackageMode PackageMode = PackageMode.AppHost;
+
+    /// <summary>Custom icon for the generated executable, or null.</summary>
+    public string? IconPath;
+
+    /// <summary>Seconds before the generated game captures its own icon.</summary>
+    public int CaptureIconSeconds = 5;
+
+    /// <summary>Skip the interactive UI even when launched without arguments.</summary>
+    public bool NoTui;
+
+    /// <summary>Launch the WebView2 GUI.</summary>
+    public bool Gui;
+
+    /// <summary>
+    /// True when the user explicitly passed -r/--recursive. The interactive UIs
+    /// default to recursive scanning because a ROM library is always nested,
+    /// but an explicit flag must still win.
+    /// </summary>
+    public bool RecursiveSpecified;
 
     public List<string> UnknownArgs = new List<string>();
 
@@ -48,6 +71,7 @@ public sealed class CliOptions
             if (Is(a, "-r", "--recursive"))
             {
                 o.Recursive = true;
+                o.RecursiveSpecified = true;
                 continue;
             }
 
@@ -90,6 +114,61 @@ public sealed class CliOptions
             if (Is(a, "--keep"))
             {
                 o.KeepTemp = true;
+                continue;
+            }
+
+            if (Is(a, "--dll"))
+            {
+                o.PackageMode = PackageMode.AssemblyOnly;
+                continue;
+            }
+
+            if (Is(a, "--exe"))
+            {
+                o.PackageMode = PackageMode.AppHost;
+                continue;
+            }
+
+            if (Is(a, "--full-exe", "--self-contained", "--standalone"))
+            {
+                o.PackageMode = PackageMode.SelfContained;
+                continue;
+            }
+
+            if (Is(a, "--icon"))
+            {
+                if (i + 1 < args.Length)
+                    o.IconPath = args[++i];
+
+                continue;
+            }
+
+            if (Is(a, "--capture-icon"))
+            {
+                if (i + 1 < args.Length && int.TryParse(args[i + 1], out int iconSeconds))
+                {
+                    o.CaptureIconSeconds = iconSeconds;
+                    i++;
+                }
+
+                continue;
+            }
+
+            if (Is(a, "--no-icon"))
+            {
+                o.CaptureIconSeconds = 0;
+                continue;
+            }
+
+            if (Is(a, "--no-tui", "--cli"))
+            {
+                o.NoTui = true;
+                continue;
+            }
+
+            if (Is(a, "--gui", "--ui"))
+            {
+                o.Gui = true;
                 continue;
             }
 
@@ -136,6 +215,19 @@ public sealed class CliOptions
                 int.TryParse(framesValue, out int parsedFrames))
             {
                 o.HeadlessFrames = parsedFrames;
+                continue;
+            }
+
+            if (TryGetValue(a, "--icon", out string iconValue))
+            {
+                o.IconPath = iconValue;
+                continue;
+            }
+
+            if (TryGetValue(a, "--capture-icon", out string captureValue) &&
+                int.TryParse(captureValue, out int parsedCapture))
+            {
+                o.CaptureIconSeconds = parsedCapture;
                 continue;
             }
 

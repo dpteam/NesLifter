@@ -26,6 +26,7 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.6.0" />
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.3351.48" />
   </ItemGroup>
 
   <ItemGroup>
@@ -36,10 +37,27 @@
     <Compile Remove="tools\**\*.cs" />
     <Compile Remove="tests\**\*.cs" />
     <None Include="assets\**" CopyToOutputDirectory="PreserveNewest" />
+
+    <!-- The GUI's HTML/CSS/JS, including the vendored NES.css and Font Awesome.
+         Copied to the output so WebView2 can serve it from disk. -->
+    <None Include="web\**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="NesLifter.Tests" />
   </ItemGroup>
+
+  <!--
+    Microsoft.Web.WebView2 ships both a WinForms and a WPF assembly and the
+    package targets reference both unconditionally. The WPF one drags in
+    WindowsBase 5.0.0.0, which conflicts with the 4.0.0.0 that the shared
+    framework reference pack provides (MSB3277). NesLifter only uses the WinForms
+    control, so the WPF reference is dropped before assembly resolution.
+  -->
+  <Target Name="RemoveWebView2WpfReference" BeforeTargets="ResolveAssemblyReferences">
+    <ItemGroup>
+      <Reference Remove="@(Reference)" Condition="'%(Filename)' == 'Microsoft.Web.WebView2.Wpf'" />
+    </ItemGroup>
+  </Target>
 
 </Project>

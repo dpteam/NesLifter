@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NesLifter</title>
+<link rel="stylesheet" href="vendor/nes.css/nes.min.css">
+<link rel="stylesheet" href="vendor/fontawesome/css/all.min.css">
+<link rel="stylesheet" href="theme.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <i class="fas fa-bolt brand-bolt"></i>
+    <span class="brand-nes">Nes</span><span class="brand-lifter">Lifter</span>
+  </div>
+
+  <div class="topbar-actions">
+    <button id="themeToggle" class="nes-btn is-small" title="Cycle theme: light, dark, OLED">
+      <i class="fas fa-circle-half-stroke"></i>
+      <span id="themeLabel">Dark</span>
+    </button>
+
+    <button id="soundToggle" class="nes-btn is-small" title="Toggle interface sounds">
+      <i class="fas fa-volume-high"></i>
+    </button>
+  </div>
+</header>
+
+<main class="layout">
+
+  <!-- ============================ SOURCE ============================ -->
+  <section class="panel panel-source">
+    <h2 class="panel-title"><i class="fas fa-folder-open"></i> Cartridges</h2>
+
+    <div class="row">
+      <input id="pathInput" class="nes-input" type="text" placeholder="Path to a .nes file or a folder">
+      <button id="browseBtn" class="nes-btn" title="Browse for a folder"><i class="fas fa-folder-open"></i></button>
+      <button id="scanBtn" class="nes-btn is-primary"><i class="fas fa-magnifying-glass"></i> Scan</button>
+    </div>
+
+    <label class="nes-checkbox-row">
+      <input id="recursive" type="checkbox" checked>
+      <span>Recurse into sub-folders</span>
+    </label>
+
+    <div id="romList" class="rom-list">
+      <p class="empty">No cartridges yet. Pick a path and press Scan.</p>
+    </div>
+
+    <div class="row row-actions">
+      <button id="selectAllBtn" class="nes-btn is-small"><i class="fas fa-check-double"></i> Select all</button>
+      <button id="selectNoneBtn" class="nes-btn is-small"><i class="fas fa-xmark"></i> Clear</button>
+      <span class="spacer"></span>
+      <span id="selectionInfo" class="muted">0 selected</span>
+    </div>
+  </section>
+
+  <!-- ============================ OPTIONS =========================== -->
+  <section class="panel panel-options">
+    <h2 class="panel-title"><i class="fas fa-sliders"></i> Options</h2>
+
+    <div class="field">
+      <label for="packageMode">Package</label>
+      <select id="packageMode" class="nes-select">
+        <option value="AppHost">Game.exe + Game.dll (needs .NET)</option>
+        <option value="AssemblyOnly">Game.dll only</option>
+        <option value="SelfContained">Full .exe, self-contained (~50 MB)</option>
+      </select>
+    </div>
+
+    <div class="field">
+      <label for="iconSeconds">Screenshot icon after</label>
+      <div class="row-inline">
+        <input id="iconSeconds" class="nes-input" type="number" min="0" max="60" step="1" value="5">
+        <span class="muted">seconds (0 = off)</span>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="iconPath">Custom icon</label>
+      <div class="row-inline">
+        <input id="iconPath" class="nes-input" type="text" placeholder="any image file">
+        <button id="iconPickBtn" class="nes-btn is-small"><i class="fas fa-image"></i></button>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="outputPath">Output directory</label>
+      <input id="outputPath" class="nes-input" type="text" value="nes_lifted_output">
+    </div>
+
+    <label class="nes-checkbox-row">
+      <input id="saveSource" type="checkbox" checked>
+      <span>Keep generated C#</span>
+    </label>
+
+    <div class="row row-actions">
+      <button id="liftBtn" class="nes-btn is-success"><i class="fas fa-hammer"></i> Lift selected</button>
+      <button id="selfTestBtn" class="nes-btn is-warning"><i class="fas fa-vial"></i> Self-test</button>
+    </div>
+  </section>
+
+  <!-- ============================ LOG ============================== -->
+  <section class="panel panel-log">
+    <h2 class="panel-title">
+      <i class="fas fa-terminal"></i> Log
+      <span id="progressText" class="muted"></span>
+      <span class="spacer"></span>
+      <button id="clearLogBtn" class="nes-btn is-small"><i class="fas fa-eraser"></i></button>
+    </h2>
+
+    <div class="progress-track" hidden id="progressTrack">
+      <div class="progress-fill" id="progressFill"></div>
+    </div>
+
+    <pre id="log" class="log"></pre>
+
+    <div class="row row-actions">
+      <button id="openOutputBtn" class="nes-btn is-small"><i class="fas fa-folder"></i> Open output</button>
+      <span class="spacer"></span>
+      <span id="statusText" class="muted">Idle</span>
+    </div>
+  </section>
+
+</main>
+
+<script src="sfx.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
