@@ -13,6 +13,13 @@ namespace NesLifter.Lifting
         private readonly AnalysisResult _model;
         private readonly string _nsName;
 
+        /// <summary>
+        /// The ROM's own name, shown in the window title and in diagnostics. Kept
+        /// separate from <see cref="_nsName"/> because a namespace must be a valid
+        /// C# identifier while a title is free-form text.
+        /// </summary>
+        private readonly string _displayName;
+
         // Blocks are keyed by PRG ROM offset, not by CPU address. A byte in a
         // switchable bank appears at several addresses over the life of a
         // cartridge, but it is always the same code, so offset is the only
@@ -33,7 +40,15 @@ namespace NesLifter.Lifting
         {
             _rom = rom;
             _model = model;
+
+            // Two different names, for two different jobs. The namespace has to be
+            // a valid C# identifier, so punctuation and spaces are folded away.
+            // The title shown in the game window is free-form text, so it keeps the
+            // ROM's own name — "Legend of Zelda, The (U) (PRG0) [!]" rather than
+            // "Legend_of_Zelda__The__U___PRG0_____".
             _nsName = SanitizeIdentifier(gameName);
+            _displayName = EscapeStringLiteral(gameName ?? _nsName);
+
             _mapperDescriptor = MapperCatalog.Get(rom.Cart.Mapper);
             _mapper = new MapperRuntimeEmitter(rom.Cart);
 
@@ -203,7 +218,7 @@ namespace NesLifter.Lifting
 
                         w.AutoFlush = false;
                         w.WriteLine("# NesLifter trace: " + name);
-                        w.WriteLine("# game=" + Runtime.GameName + " mapper=" + Runtime.Mapper + " (" + Runtime.MapperName + ")");
+                        w.WriteLine("# game=" + Runtime.Title + " mapper=" + Runtime.Mapper + " (" + Runtime.MapperName + ")");
                         return w;
                     }
 
@@ -703,6 +718,13 @@ namespace NesLifter.Lifting
                 static class Runtime
                 {
                     public const string GameName = "{{_nsName}}";
+
+                    /// <summary>
+                    /// The ROM's own name, for the window title and diagnostics.
+                    /// GameName has to be a valid C# identifier, so it cannot carry
+                    /// the punctuation and spaces a title wants.
+                    /// </summary>
+                    public const string Title = "{{_displayName}}";
                     public const int Mapper = {{cart.Mapper}};
                     public const string MapperName = "{{_mapperDescriptor.Name}}";
                     public static int Mirroring = {{mir}};
@@ -1159,11 +1181,92 @@ namespace NesLifter.Lifting
                     public static int Joy2Idx;
                     public static bool JoyStrobeHigh;
 
+                    /// <summary>
+                    /// True when the cartridge ships battery-backed save RAM, which is
+                    /// what "the game remembers" means for Zelda's file slots.
+                    /// </summary>
+                    public const bool HasBatterySave = {{((_mapperDescriptor.Battery || cart.Battery) ? "true" : "false")}};
+
+                    /// <summary>Where the save file lives: next to the game, named after it.</summary>
+                    public static string SavePath
+                    {
+                        get
+                        {
+                            return System.IO.Path.Combine(
+                                System.AppDomain.CurrentDomain.BaseDirectory,
+                                GameName + ".sav");
+                        }
+                    }
+
+                    /// <summary>
+                    /// Loads battery-backed WRAM from disk, if the cartridge has any.
+                    ///
+                    /// Without this a save is only as good as the process lifetime:
+                    /// Zelda lets you create a file and pick a name, then forgets it
+                    /// on the next launch, which reads as "saving is broken" rather
+                    /// than "saving is not implemented".
+                    /// </summary>
+                    public static void LoadSave()
+                    {
+                        if (!HasBatterySave || Wram.Length == 0) return;
+
+                        try
+                        {
+                            string path = SavePath;
+
+                            if (!System.IO.File.Exists(path))
+                            {
+                                Log("save", "no save file yet: " + path, true);
+                                return;
+                            }
+
+                            byte[] data = System.IO.File.ReadAllBytes(path);
+                            int copy = Math.Min(data.Length, Wram.Length);
+
+                            Array.Copy(data, Wram, copy);
+                            Log("save", "loaded " + copy + " bytes from " + path, true);
+                        }
+                        catch (Exception ex)
+                        {
+                            Log("save-load-fail", ex.Message, true);
+                        }
+                    }
+
+                    /// <summary>
+                    /// Writes battery-backed WRAM to disk.
+                    ///
+                    /// Called on a timer rather than only at exit, because a lifted
+                    /// game can end in a trap or be killed from the task manager, and
+                    /// losing a save because of that is worse than an extra write.
+                    /// </summary>
+                    public static void SaveGame()
+                    {
+                        if (!HasBatterySave || Wram.Length == 0) return;
+
+                        try
+                        {
+                            byte[] snapshot;
+
+                            lock (SaveLock)
+                                snapshot = (byte[])Wram.Clone();
+
+                            System.IO.File.WriteAllBytes(SavePath, snapshot);
+                            Log("save", "wrote " + snapshot.Length + " bytes to " + SavePath, false);
+                        }
+                        catch (Exception ex)
+                        {
+                            Log("save-write-fail", ex.Message, true);
+                        }
+                    }
+
+                    static readonly object SaveLock = new object();
+
                     public static void Init()
                     {
                         A = 0; X = 0; Y = 0; SP = 0xFD; P = 0x24;
                         DispatchTarget = 0; CpuState = "Init";
                         Memory.Reset(); Ppu.Reset(); Apu.Reset(); MapperStub.Power();
+                        LoadSave();
                         Diag.Open();
                         Log("session", "=== game started; mapper=" + Mapper + "; log=" + LogPath + " ===", true);
                         if (Diag.Any) Log("diag", "tracing to " + Diag.Dir, true);
@@ -2142,6 +2245,20 @@ namespace NesLifter.Lifting
                     sealed class RenderState
                     {
                         public readonly byte[] VRam = new byte[0x4000], Oam = new byte[256], Palette = new byte[32];
+
+                        /// <summary>
+                        /// Snapshot of the 8 KB of CHR visible at VBlank.
+                        ///
+                        /// CHR has to be captured like VRAM, not read live. The CPU
+                        /// thread switches CHR banks continuously — that is what CHR
+                        /// banking is for — and the render thread reads the pattern
+                        /// tables while it does. Reading live means one frame is drawn
+                        /// from a mixture of old and new banks, which shows up as
+                        /// garbled tiles on whichever scanline happened to be fetched
+                        /// during a switch. Several titles showed exactly that.
+                        /// </summary>
+                        public readonly byte[] Chr = new byte[0x2000];
+
                         public byte Ctrl, Mask; public int Mirroring, SplitY, ScrollX0, ScrollY0, BaseNt0, ScrollX1, ScrollY1, BaseNt1; public bool SplitActive;
                         public readonly int[] LineScrollX = new int[240], LineScrollY = new int[240], LineBaseNt = new int[240];
                     }
@@ -2386,11 +2503,23 @@ namespace NesLifter.Lifting
                         Buffer.BlockCopy(VRam, 0, back.VRam, 0, VRam.Length);
                         Buffer.BlockCopy(Oam, 0, back.Oam, 0, Oam.Length);
                         Buffer.BlockCopy(Palette, 0, back.Palette, 0, Palette.Length);
+
+                        // CHR is snapshotted too, for the same reason as VRAM: the CPU
+                        // switches CHR banks between frames, and the renderer must see
+                        // one consistent set of pattern tables rather than whatever the
+                        // mapper happens to be pointing at while a scanline is drawn.
+                        MapperStub.SnapshotChr(back.Chr);
+
                         Buffer.BlockCopy(LiveLineScrollX, 0, back.LineScrollX, 0, 240 * sizeof(int)); Buffer.BlockCopy(LiveLineScrollY, 0, back.LineScrollY, 0, 240 * sizeof(int)); Buffer.BlockCopy(LiveLineBaseNt, 0, back.LineBaseNt, 0, 240 * sizeof(int));
                         back.Ctrl = Ctrl; back.Mask = Mask; back.Mirroring = Runtime.Mirroring;
                         back.SplitY = SplitY; back.ScrollX0 = ScrollX0; back.ScrollY0 = ScrollY0; back.BaseNt0 = BaseNt0;
                         back.ScrollX1 = ScrollX1; back.ScrollY1 = ScrollY1; back.BaseNt1 = BaseNt1; back.SplitActive = SplitActive;
                         RenderBack = RenderFront; Volatile.Write(ref RenderFront, back);
+
+                        // Flush the battery save once a second or so. Writing every
+                        // frame would thrash the disk; writing only on exit loses the
+                        // save when a game traps or the process is killed.
+                        if (Runtime.HasBatterySave && (Ppu.FrameCount % 60) == 0) Runtime.SaveGame();
                         Runtime.Log("ppu-scroll", "base=" + back.ScrollX0 + "," + back.ScrollY0 + ",nt" + back.BaseNt0 + " split=" + (back.SplitActive ? back.SplitY.ToString() + ":" + back.ScrollX1 + "," + back.ScrollY1 + ",nt" + back.BaseNt1 : "off"), false);
                         FrameReady = true;
                         // BeginFrame is called at VBlank start (scanline 241). Visible scanline 0 begins after VBlank.
@@ -2434,6 +2563,7 @@ namespace NesLifter.Lifting
                     {
                         RenderState state = Volatile.Read(ref RenderFront);
                         byte[] renderVRam = state.VRam, renderOam = state.Oam, renderPalette = state.Palette;
+                        byte[] renderChr = state.Chr;
                         byte renderCtrl = state.Ctrl, renderMask = state.Mask; int renderMirroring = state.Mirroring;
                         int backdrop = renderPalette[0] & 0x3F;
                         FillScreen(backdrop);
@@ -2474,8 +2604,8 @@ namespace NesLifter.Lifting
                                     // MMC2 latches its CHR banks from the tiles fetched here.
                                     if (MapperStub.HasChrLatch) MapperStub.LatchChr(paddr, tile);
 
-                                    byte low = MapperStub.ReadChrByte(paddr);
-                                    byte high = MapperStub.ReadChrByte(paddr + 8);
+                                    byte low = renderChr[paddr & 0x1FFF];
+                                    byte high = renderChr[(paddr + 8) & 0x1FFF];
                                     int bit = 7 - (tx & 7);
                                     int color = ((low >> bit) & 1) | (((high >> bit) & 1) << 1);
                                     if (color == 0) continue;
@@ -2548,7 +2678,7 @@ namespace NesLifter.Lifting
                                         if ((uint)screenX >= 256) continue;
                                         if (clipLeftSpr && screenX < 8) continue;
                                         int srcX = flipH ? (7 - px) : px;
-                                        int color = GetPatternPixel(patBase, t, srcX, row);
+                                        int color = GetPatternPixel(renderChr, patBase, t, srcX, row);
                                         if (color == 0) continue;
                                         if ((attr & 0x20) != 0 && BackgroundOpaque[screenY * 256 + screenX] != 0) continue;
                                         int rgb = NesPalette[renderPalette[(0x11 + pal * 4 + (color - 1)) & 0x1F] & 0x3F];
@@ -2573,11 +2703,11 @@ namespace NesLifter.Lifting
                         for (int i = 0; i < Screen.Length; i += 4) { Screen[i] = b; Screen[i + 1] = g; Screen[i + 2] = r; Screen[i + 3] = 0xFF; }
                     }
 
-                    static int GetPatternPixel(int patternBase, int tile, int px, int py)
+                    static int GetPatternPixel(byte[] chr, int patternBase, int tile, int px, int py)
                     {
-                        int addr = patternBase + tile * 16 + py;
-                        byte low = MapperStub.ReadChrByte(addr);
-                        byte high = MapperStub.ReadChrByte(addr + 8);
+                        int addr = (patternBase + tile * 16 + py) & 0x1FFF;
+                        byte low = chr[addr];
+                        byte high = chr[(addr + 8) & 0x1FFF];
                         int bit = 7 - px;
                         return ((low >> bit) & 1) | (((high >> bit) & 1) << 1);
                     }
@@ -3383,7 +3513,7 @@ namespace NesLifter.Lifting
 
                     public PpuForm()
                     {
-                        Text = "NES Lifted: " + Runtime.GameName;
+                        Text = "NES Lifted: " + Runtime.Title;
                         FormBorderStyle = FormBorderStyle.FixedSingle;
                         MaximizeBox = false;
                         StartPosition = FormStartPosition.CenterScreen;
@@ -4201,6 +4331,39 @@ namespace NesLifter.Lifting
             }
 
             sb.AppendLine("    };");
+        }
+
+        /// <summary>
+        /// Escapes a free-form string for embedding in a C# string literal. Titles
+        /// are ROM filenames, so they can contain quotes, backslashes and non-ASCII
+        /// characters that would otherwise produce broken generated code.
+        /// </summary>
+        private static string EscapeStringLiteral(string text)
+        {
+            if (string.IsNullOrEmpty(text))
+                return string.Empty;
+
+            StringBuilder sb = new StringBuilder(text.Length + 8);
+
+            foreach (char c in text)
+            {
+                switch (c)
+                {
+                    case '\\': sb.Append("\\\\"); break;
+                    case '"': sb.Append("\\\""); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default:
+                        if (c < 0x20 || c > 0x7E)
+                            sb.Append("\\u").Append(((int)c).ToString("X4"));
+                        else
+                            sb.Append(c);
+                        break;
+                }
+            }
+
+            return sb.ToString();
         }
 
         private static string SanitizeIdentifier(string name)

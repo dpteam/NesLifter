@@ -224,6 +224,22 @@ public sealed class MapperRuntimeEmitter
                     return mem[off];
                 }
 
+                /// <summary>
+                /// Copies the 8 KB of CHR currently mapped at $0000-$1FFF into
+                /// <paramref name="dest"/>.
+                ///
+                /// The renderer calls this at VBlank so it draws a whole frame from
+                /// one consistent set of pattern tables. Reading CHR live during
+                /// rendering races the CPU thread, which switches CHR banks
+                /// constantly, and the visible symptom is tiles that are correct on
+                /// some scanlines and garbage on others.
+                /// </summary>
+                public static void SnapshotChr(byte[] dest)
+                {
+                    for (int addr = 0; addr < 0x2000; addr++)
+                        dest[addr] = ReadChrByte(addr);
+                }
+
                 public static void WriteChrByte(int addr, byte value)
                 {
                     int page = (addr >> 10) & 7;
