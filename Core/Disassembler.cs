@@ -101,6 +101,29 @@ namespace NesLifter.Core
 
         private AnalysisResult _result = new AnalysisResult();
 
+        /// <summary>
+        /// One flag per PRG byte: set once that byte belongs to a decoded
+        /// instruction. Prevents a later target from being decoded inside an
+        /// instruction that recursive descent already established.
+        /// </summary>
+        private bool[] _covered = System.Array.Empty<bool>();
+
+        private bool IsCovered(int offset)
+        {
+            return offset >= 0 && offset < _covered.Length && _covered[offset];
+        }
+
+        private void MarkCovered(int offset, int length)
+        {
+            for (int i = 0; i < length; i++)
+            {
+                int at = offset + i;
+
+                if (at >= 0 && at < _covered.Length)
+                    _covered[at] = true;
+            }
+        }
+
         public List<ushort> ForcedAddresses = new List<ushort>();
 
         public Disassembler(NesRom rom)
@@ -126,6 +149,7 @@ namespace NesLifter.Core
         public AnalysisResult Analyze()
         {
             _result = new AnalysisResult();
+            _covered = new bool[_rom.PrgRom.Length];
 
             // ---- Pass 0: the power-on layout, seeded from the vectors ----
             List<ushort> seeds = new List<ushort>();
@@ -380,8 +404,28 @@ namespace NesLifter.Core
                 if (_result.Instructions.ContainsKey(offset))
                     continue;
 
+                // A branch or jump can land in the middle of an instruction that
+                // was already decoded — typically because the target came from a
+                // jump table, or because a bank view put the same bytes at a
+                // different address. Decoding there produces a second, contradictory
+                // instruction over the same bytes.
+                //
+                // That is not cosmetic. Super Mario Bros. 3 has `JSR $FD90` at
+                // $C45D; a target three bytes earlier produced an extra block at
+                // $C45E decoding `90 FD` as `BCC $C45D`, and the two views fought
+                // each other until the CPU ended up in level data, hit a `BRK`,
+                // and leaked a byte of stack per pass through the handler.
+                //
+                // Recursive descent from real entry points is the reliable
+                // alignment, so the first decode wins and later overlapping
+                // targets are dropped.
+                if (IsCovered(offset))
+                    continue;
+
                 Instruction inst = Decode(image, addr, offset);
                 _result.Instructions.Add(offset, inst);
+
+                MarkCovered(offset, inst.Length);
 
                 if (inst.Control == OpControl.Invalid && !_result.UnknownOpcodes.Contains(inst.Opcode))
                     _result.UnknownOpcodes.Add(inst.Opcode);

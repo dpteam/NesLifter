@@ -157,6 +157,7 @@ namespace NesLifter.Lifting
                     public static bool TraceMapper;
                     public static bool TraceMem;
                     public static bool TraceFrame;
+                    public static bool TraceDispatch;
 
                     public static string Dir = ".";
 
@@ -166,10 +167,11 @@ namespace NesLifter.Lifting
                     static System.IO.StreamWriter _mapW;
                     static System.IO.StreamWriter _memW;
                     static System.IO.StreamWriter _frmW;
+                    static System.IO.StreamWriter _dspW;
 
                     static readonly object _lock = new object();
 
-                    public static bool Any { get { return TraceCpu || TracePpu || TraceApu || TraceMapper || TraceMem || TraceFrame; } }
+                    public static bool Any { get { return TraceCpu || TracePpu || TraceApu || TraceMapper || TraceMem || TraceFrame || TraceDispatch; } }
 
                     public static void Open()
                     {
@@ -185,11 +187,12 @@ namespace NesLifter.Lifting
                             if (TraceMapper) _mapW = Open("mapper.log");
                             if (TraceMem) _memW = Open("mem.log");
                             if (TraceFrame) _frmW = Open("frame.log");
+                            if (TraceDispatch) _dspW = Open("dispatch.log");
                         }
                         catch (Exception ex)
                         {
                             Runtime.Log("diag-open-fail", ex.Message, true);
-                            TraceCpu = TracePpu = TraceApu = TraceMapper = TraceMem = TraceFrame = false;
+                            TraceCpu = TracePpu = TraceApu = TraceMapper = TraceMem = TraceFrame = TraceDispatch = false;
                         }
                     }
 
@@ -215,6 +218,7 @@ namespace NesLifter.Lifting
                             Dispose(ref _mapW);
                             Dispose(ref _memW);
                             Dispose(ref _frmW);
+                            Dispose(ref _dspW);
                         }
                     }
 
@@ -236,6 +240,7 @@ namespace NesLifter.Lifting
                             if (_mapW != null) _mapW.Flush();
                             if (_memW != null) _memW.Flush();
                             if (_frmW != null) _frmW.Flush();
+                            if (_dspW != null) _dspW.Flush();
                         }
                         catch { }
                     }
@@ -302,6 +307,56 @@ namespace NesLifter.Lifting
                             case 0x6A: return "ROR A";
                             case 0xEA: return "NOP";
                             default: return "op=$" + op.ToString("X2");
+                        }
+                    }
+
+                    // ---- Dispatch ----
+
+                    /// <summary>
+                    /// Logs every time control leaves lifted code, and why.
+                    ///
+                    /// This is the trace that answers "who jumped into RAM?". A
+                    /// dispatch to an address below $8000 can only mean the return
+                    /// address on the 6502 stack was wrong, so the line records both
+                    /// the target and the PC that requested it, plus the stack
+                    /// pointer — enough to tell an unbalanced JSR/RTS from a corrupted
+                    /// indirect jump.
+                    /// </summary>
+                    public static void Dispatch(ushort target, string reason)
+                    {
+                        if (_dspW == null) return;
+
+                        lock (_lock)
+                        {
+                            _dspW.Write(Ppu.FrameCount); _dspW.Write(' ');
+                            _dspW.Write(Runtime.CpuCycles); _dspW.Write(' ');
+                            _dspW.Write("-> $"); _dspW.Write(target.ToString("X4"));
+                            _dspW.Write(" from $"); _dspW.Write(Runtime.LastPC.ToString("X4"));
+                            _dspW.Write(" SP=$"); _dspW.Write(Runtime.SP.ToString("X2"));
+                            _dspW.Write(" depth="); _dspW.Write(Runtime.IntDepth);
+                            _dspW.Write(" lifted="); _dspW.Write(Runtime.IsStaticLabel(target) ? "yes" : "no");
+                            _dspW.Write(" why="); _dspW.Write(reason);
+                            _dspW.WriteLine();
+                        }
+                    }
+
+                    /// <summary>
+                    /// Logs each NMI the CPU actually takes, with the cycle counters
+                    /// that decided it. Used to tell "NMI fired again legitimately"
+                    /// from "the frame clock is wrong".
+                    /// </summary>
+                    public static void NmiTaken(ushort pc, long cycles, long nextVblank, int depth)
+                    {
+                        if (_dspW == null) return;
+
+                        lock (_lock)
+                        {
+                            _dspW.Write("NMI frame="); _dspW.Write(Ppu.FrameCount);
+                            _dspW.Write(" at="); _dspW.Write(cycles);
+                            _dspW.Write(" nextVblank="); _dspW.Write(nextVblank);
+                            _dspW.Write(" pc=$"); _dspW.Write(pc.ToString("X4"));
+                            _dspW.Write(" depth="); _dspW.Write(depth);
+                            _dspW.WriteLine();
                         }
                     }
 
@@ -846,13 +901,14 @@ namespace NesLifter.Lifting
                         {
                             switch (raw.Trim().ToLowerInvariant())
                             {
-                                case "all": Diag.TraceCpu = Diag.TracePpu = Diag.TraceApu = Diag.TraceMapper = Diag.TraceMem = Diag.TraceFrame = true; break;
+                                case "all": Diag.TraceCpu = Diag.TracePpu = Diag.TraceApu = Diag.TraceMapper = Diag.TraceMem = Diag.TraceFrame = Diag.TraceDispatch = true; break;
                                 case "cpu": Diag.TraceCpu = true; break;
                                 case "ppu": Diag.TracePpu = true; break;
                                 case "apu": Diag.TraceApu = true; break;
                                 case "mapper": Diag.TraceMapper = true; break;
                                 case "mem": Diag.TraceMem = true; break;
                                 case "frame": Diag.TraceFrame = true; break;
+                                case "dispatch": Diag.TraceDispatch = true; break;
                             }
                         }
                     }
@@ -879,7 +935,34 @@ namespace NesLifter.Lifting
                     public static volatile bool NmiPending;
                     public static volatile bool IrqPending;
                     public static ushort IrqVector = 0x{{_rom.ReadVector(0xFFFE).ToString("X4")}};
-                    public static volatile bool InNmi;
+
+                    /// <summary>
+                    /// Interrupt nesting depth, incremented on entry to NMI or IRQ and
+                    /// decremented by RTI.
+                    ///
+                    /// This replaces a single "am I in NMI" flag, which was wrong in two
+                    /// ways: any RTI cleared it — including the RTI of an IRQ handler, or
+                    /// a game using RTI as a byte-saving trick — and it needed a
+                    /// 1.5-million-cycle timer as a safety valve. A counter matches the
+                    /// hardware: NMI can nest, and RTI unwinds exactly one level.
+                    /// </summary>
+                    public static int IntDepth;
+
+                    /// <summary>
+                    /// Ceiling on interrupt nesting. A handler that runs longer than a
+                    /// frame would otherwise recurse until the 6502 stack wrapped and
+                    /// silently corrupted RAM, which is much harder to diagnose than a
+                    /// dropped interrupt with a log line.
+                    /// </summary>
+                    public const int MaxIntDepth = 8;
+
+                    /// <summary>Unwinds one interrupt level. Called from RTI.</summary>
+                    public static void LeaveInterrupt()
+                    {
+                        if (IntDepth > 0)
+                            IntDepth--;
+                    }
+
                     public static ushort NmiVector = 0x{{_rom.ReadVector(0xFFFA).ToString("X4")}};
 
                     // Throttle
@@ -890,7 +973,6 @@ namespace NesLifter.Lifting
                     public static long NextVblankCycle = 27394;
                     public static long VblankClearCycle;
                     public static long NextThrottleCycle = 2048;
-                    public static long NmiEnterCycles;
 
                     // Frame sync
                     public static object FrameLock = new object();
@@ -1016,6 +1098,7 @@ namespace NesLifter.Lifting
                         A = 0; X = 0; Y = 0; SP = 0xFD; P = 0x24;
                         LastError = null; LastTrap = null; InsCount = 0; LastPC = 0;
                         TrapCount = 0; DispatchTarget = 0; CpuState = "Reset";
+                        IntDepth = 0; NmiPending = false; IrqPending = false;
                         Array.Clear(TraceRing, 0, TraceRing.Length); TraceWrite = 0;
                         CpuCycles = 0; NextVblankCycle = 27394; VblankClearCycle = 0; NextThrottleCycle = 2048;
                         ClockStart = FrameClockStart = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -1072,7 +1155,7 @@ namespace NesLifter.Lifting
                     Line(sb, "case 0x" + offset.ToString("X6") + ": goto " + Label(offset) + ";");
 
                 sb.Append(Raw("""
-                                        default: Runtime.ReportDynamicTarget(Runtime.DispatchTarget); if (!Runtime.Interpret()) { Runtime.Trap("Dynamic dispatch -> $" + Runtime.DispatchTarget.ToString("X4")); return; } goto Dispatch;
+                                        default: if (Diag.TraceDispatch) Diag.Dispatch(Runtime.DispatchTarget, "not lifted"); Runtime.ReportDynamicTarget(Runtime.DispatchTarget); if (!Runtime.Interpret()) { Runtime.Trap("Dynamic dispatch -> $" + Runtime.DispatchTarget.ToString("X4")); return; } goto Dispatch;
                                     }
                                 }
                     """));
@@ -1283,17 +1366,30 @@ namespace NesLifter.Lifting
                                 if (Headless) Runtime.HeadlessPublishFrame();
                             }
 
-                            if (InNmi && (CpuCycles - NmiEnterCycles) > 1500000L) InNmi = false;
-
-                            if (!NmiPending || InNmi || (Ppu.Ctrl & 0x80) == 0)
+                            if (!NmiPending || (Ppu.Ctrl & 0x80) == 0)
                             {
                                 if ((Ppu.Ctrl & 0x80) == 0) NmiPending = false;
                                 return false;
                             }
 
+                            // Hardware nests: if the NMI line is asserted again while
+                            // the handler is still running, the CPU takes it again.
+                            // That is correct behaviour and a healthy handler never
+                            // gets here twice, but an interrupt handler that runs
+                            // slower than a frame would recurse until the stack
+                            // wrapped — so nesting is capped and reported.
+                            if (IntDepth >= MaxIntDepth)
+                            {
+                                NmiPending = false;
+                                Log("nmi-nest", "NMI handler still running after " + MaxIntDepth
+                                    + " levels at frame " + Ppu.FrameCount + "; dropping this one", true);
+                                return false;
+                            }
+
                             NmiPending = false;
-                            InNmi = true;
-                            NmiEnterCycles = CpuCycles;
+                            IntDepth++;
+
+                            if (Diag.TraceDispatch) Diag.NmiTaken(pc, CpuCycles, NextVblankCycle, IntDepth);
 
                             Push16(pc);
                             Push((byte)((P & 0xEF) | 0x20));
@@ -1306,7 +1402,16 @@ namespace NesLifter.Lifting
                         {
                             if (!IrqPending) return false;
                             if ((P & 0x04) != 0) return false;
+
+                            if (IntDepth >= MaxIntDepth)
+                            {
+                                IrqPending = false;
+                                return false;
+                            }
+
                             IrqPending = false;
+                            IntDepth++;
+
                             Push16(pc);
                             Push((byte)((P & 0xEF) | 0x20));
                             P = (byte)(P | 0x04);
@@ -1696,6 +1801,13 @@ namespace NesLifter.Lifting
 
                                 byte op = Memory.Read(pc);
                                 LastPC = pc; TraceInstruction(pc); InsCount++; AdvanceCycles(OpCycles[op]);
+
+                                // The interpreter must be visible in cpu.log too.
+                                // Without this, a trace looks like the CPU jumps from
+                                // one lifted block to an unrelated one, and the real
+                                // path — through interpreted code — is invisible.
+                                if (Diag.TraceCpu) Diag.CpuStep(pc, op);
+
                                 byte mnem = OpMnem[op];
                                 byte mode = OpMode[op];
                                 byte len = OpLen[op];
@@ -1707,7 +1819,7 @@ namespace NesLifter.Lifting
                                     case 44: { ushort tgt; if (mode == 9) { ushort ptr = Memory.Read16((ushort)(pc + 1)); ushort loAddr = ptr; ushort hiAddr = (ushort)((ptr & 0xFF00) | ((ptr + 1) & 0x00FF)); tgt = (ushort)(Memory.Read(loAddr) | (Memory.Read(hiAddr) << 8)); } else { tgt = Memory.Read16((ushort)(pc + 1)); } if (IsStaticLabel(tgt)) { DispatchTarget = tgt; return true; } pc = tgt; continue; }
                                     case 45: { JsrPush((ushort)(pc + 3)); ushort tgt = Memory.Read16((ushort)(pc + 1)); if (IsStaticLabel(tgt)) { DispatchTarget = tgt; return true; } pc = tgt; continue; }
                                     case 46: { ushort tgt = RtsPull(); if (IsStaticLabel(tgt)) { DispatchTarget = tgt; return true; } pc = tgt; continue; }
-                                    case 47: { P = (byte)((Pull() & 0xEF) | 0x20); ushort tgt = Pull16(); InNmi = false; if (IsStaticLabel(tgt)) { DispatchTarget = tgt; return true; } pc = tgt; continue; }
+                                    case 47: { P = (byte)((Pull() & 0xEF) | 0x20); ushort tgt = Pull16(); LeaveInterrupt(); if (IsStaticLabel(tgt)) { DispatchTarget = tgt; return true; } pc = tgt; continue; }
                                     case 48: { Push16((ushort)(pc + 2)); Push((byte)(P | 0x30)); P = (byte)(P | 0x04); ushort tgt = Memory.Read16(0xFFFE); if (IsStaticLabel(tgt)) { DispatchTarget = tgt; return true; } pc = tgt; continue; }
                                     case 49: { bool c; switch (op) { case 0x10: c = (P & 0x80) == 0; break; case 0x30: c = (P & 0x80) != 0; break; case 0x50: c = (P & 0x40) == 0; break; case 0x70: c = (P & 0x40) != 0; break; case 0x90: c = (P & 0x01) == 0; break; case 0xB0: c = (P & 0x01) != 0; break; case 0xD0: c = (P & 0x02) == 0; break; case 0xF0: c = (P & 0x02) != 0; break; default: c = false; break; } ushort nxt = c ? (ushort)(pc + 2 + (sbyte)imm) : (ushort)(pc + 2); if (IsStaticLabel(nxt)) { DispatchTarget = nxt; return true; } pc = nxt; continue; }
                                 }
@@ -3450,7 +3562,7 @@ namespace NesLifter.Lifting
         {
             Line(sb, "Runtime.P = (byte)((Runtime.Pull() & 0xEF) | 0x20);");
             Line(sb, "Runtime.DispatchTarget = Runtime.Pull16();");
-            Line(sb, "Runtime.InNmi = false;");
+            Line(sb, "Runtime.LeaveInterrupt();");
             Line(sb, "goto Dispatch;");
         }
 
