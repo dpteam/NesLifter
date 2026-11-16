@@ -25,6 +25,7 @@ internal static class Program
         int budget = 600;
         bool audio = false;
         bool keepLog = false;
+        string? press = null;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -58,12 +59,16 @@ internal static class Program
                 case "--keep-log":
                     keepLog = true;
                     break;
+
+                case "--press" or "-p":
+                    if (i + 1 < args.Length) press = args[++i];
+                    break;
             }
         }
 
         if (exe == null || !File.Exists(exe))
         {
-            Console.Error.WriteLine("Usage: Probe --exe <Game.exe> [--frames 60,120] [--out dir] [--diag all] [--audio]");
+            Console.Error.WriteLine("Usage: Probe --exe <Game.exe> [--frames 60,120] [--out dir] [--diag all] [--audio] [--press 200:08]");
             return 1;
         }
 
@@ -86,6 +91,12 @@ internal static class Program
             cli.Add(diag);
             cli.Add("--diag-dir");
             cli.Add(workDir);
+        }
+
+        if (press != null)
+        {
+            cli.Add("--press");
+            cli.Add(press);
         }
 
         string? wavPath = null;

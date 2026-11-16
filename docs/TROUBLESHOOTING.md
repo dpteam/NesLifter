@@ -99,6 +99,31 @@ dotnet game.dll --headless 600 --diag cpu,ppu,apu --diag-dir .\probe
 | `--apu-trace <file>` | raw signed 16-bit LE mono at 44.1 kHz |
 | `--diag <list>` | any of `cpu,ppu,apu,mapper,mem,frame`, or `all` |
 | `--diag-dir <dir>` | where the `.log` traces go |
+| `--press <script>` | scripted controller input, see below |
+
+### Tell "stuck on the title screen" from "broken"
+
+A game that never receives input renders one static frame forever, which looks
+exactly like a game that failed to start. Script a button press to distinguish
+them:
+
+```powershell
+# Hold Start from frame 200 to 215, then Right from 500 to 700.
+Game.exe --headless 1400 --shots 400,800 --press 200:08,215:00,500:80,700:00
+```
+
+The mask is the shift-register bit order the pad produces:
+
+| Bit | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Button | A | B | Select | Start | Up | Down | Left | Right |
+
+So `08` is Start, `80` is Right, `88` is Start+Right. The last entry at or
+before the current frame stays held until the next entry replaces it.
+
+If the screen changes after Start, the engine is fine and the earlier run was
+simply waiting. If it does not, look at `cpu.log` for the PC it is spinning on:
+a loop that never reads `$4016` is not waiting for input at all.
 
 `tools/Probe` drives all of this and summarises the result:
 

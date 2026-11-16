@@ -131,6 +131,16 @@ Headless diagnostics, a real APU, and the in-game overlay.
   a real handler finishes in tens of instructions, while uninitialised RAM
   loops forever.
 
+### Added (diagnostics)
+
+- **`--press <script>`** scripts controller input for headless runs:
+  `--press 200:08,215:00` holds Start from frame 200 and releases it at 215. The
+  mask is the pad's shift-register order (A B Select Start Up Down Left Right).
+  Without this a game parked on its title screen is indistinguishable from a
+  broken one, which is exactly the ambiguity that made the first round of probes
+  hard to read. Verified on Super Mario Bros: Start enters the level and Right
+  walks Mario to the first block.
+
 ### Status
 
 All ten reference cartridges render and run:

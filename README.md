@@ -211,7 +211,14 @@ Game.exe --headless 600 --shots 120,240,600 --shot-dir .\probe --apu-trace .\pro
 
 # Per-subsystem traces: cpu, ppu, apu, mapper, mem, frame (or "all")
 Game.exe --headless 600 --diag cpu,ppu,frame --diag-dir .\probe
+
+# Scripted input: hold Start from frame 200 to 215, then Right from 500.
+# Bit order is A B Select Start Up Down Left Right, so 08 = Start, 80 = Right.
+Game.exe --headless 1400 --shots 400,800 --press 200:08,215:00,500:80,700:00
 ```
+
+Scripted input matters more than it sounds: a game sitting on its title screen
+looks identical to a broken game until something presses Start.
 
 Headless is frame-locked, so `frame 120` is exactly frame 120. `tools/Probe`
 wraps all of this and summarises the result:

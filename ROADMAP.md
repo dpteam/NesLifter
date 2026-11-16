@@ -170,6 +170,13 @@ runtime by the interpreter. This is the single largest accuracy gap.
 - [ ] Bank-switch tracking: record the mapper writes that lead to each bank so
       cross-bank `JMP`/`JSR` edges can be resolved *statically* instead of
       relying on the runtime resolve-then-dispatch step
+- [ ] **MMC3 CHR banking in Kirby's Adventure's tutorial scene.** The game runs
+      4000 frames correctly — title screen, level 1 with Kirby and enemies — but
+      the tutorial overlay draws wrong background tiles while its text box is
+      correct. CHR register writes ($80-$85) and mirroring both match FCEUX's
+      `FixMMC3CHR`/`GENMWRAP`, so the remaining suspect is mid-frame CHR
+      switching (A12-timed pattern fetches), which the renderer does not model
+      because it snapshots CHR at VBlank.
 - [ ] Code/data separation: mark reachable bytes, treat everything else as data,
       and stop recursive descent at `BRK`/`RTS` when the next byte is not a
       known entry point
@@ -288,8 +295,7 @@ generated game exposes `Joy1` only.
 
 ---
 
-## Stage 6 — Emulation-grade fidelity (hard)
-- [ ] Cycle-exact 6502 (per-cycle bus accesses, RMW double writes, dummy reads)
+## Stage 6 — Emulation-grade fidelity (hard)- [ ] Cycle-exact 6502 (per-cycle bus accesses, RMW double writes, dummy reads)
 - [ ] CPU interrupt timing: NMI hijacking, IRQ at instruction boundaries only
 - [ ] PPU open bus and decay
 - [ ] Four-screen VRAM and mapper-controlled nametable RAM

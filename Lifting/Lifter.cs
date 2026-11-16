@@ -503,6 +503,11 @@ namespace NesLifter.Lifting
                             {
                                 Diag.Dir = args[++i];
                             }
+                            else if (args[i] == "--press" && i + 1 < args.Length)
+                            {
+                                // Comma-separated "frame:hexmask" pairs, e.g. 120:08 holds Start.
+                                Runtime.ParseScriptedInput(args[++i]);
+                            }
                         }
 
                         if (shotDir != null) Runtime.ShotDir = shotDir;
@@ -577,6 +582,10 @@ namespace NesLifter.Lifting
                                 Audio.TraceFrame();
                                 tracedFrames++;
                             }
+
+                            // Scripted input goes in before the frame is released, so
+                            // the CPU work that follows sees it.
+                            Runtime.ApplyScriptedInput(Ppu.FrameCount);
 
                             bool stopped = Runtime.CpuState == "Trap" || Runtime.CpuState == "Exited";
 
@@ -658,6 +667,66 @@ namespace NesLifter.Lifting
                     // Headless screenshot capture: (frame, path) pairs.
                     public static readonly System.Collections.Generic.List<int> ShotFrames = new System.Collections.Generic.List<int>();
                     public static string ShotDir = ".";
+
+                    // ---- scripted input ----
+                    //
+                    // A game that sits on its title screen forever looks identical
+                    // to a game that is broken: both render one static frame. The
+                    // only way to tell them apart headlessly is to press Start and
+                    // see whether anything changes, so the driver can script a few
+                    // button presses.
+                    //
+                    // Bit order matches the shift register the pad produces:
+                    // 0=A 1=B 2=Select 3=Start 4=Up 5=Down 6=Left 7=Right.
+
+                    /// <summary>Frame number -> button mask to hold from that frame on.</summary>
+                    public static readonly System.Collections.Generic.SortedDictionary<int, byte> ScriptedInput =
+                        new System.Collections.Generic.SortedDictionary<int, byte>();
+
+                    /// <summary>Parses "--press 120:08,240:00" into the script.</summary>
+                    public static void ParseScriptedInput(string spec)
+                    {
+                        if (string.IsNullOrEmpty(spec)) return;
+
+                        foreach (string part in spec.Split(','))
+                        {
+                            string[] halves = part.Split(':');
+
+                            if (halves.Length != 2)
+                                continue;
+
+                            if (!int.TryParse(halves[0].Trim(), out int frame))
+                                continue;
+
+                            if (!byte.TryParse(halves[1].Trim(), System.Globalization.NumberStyles.HexNumber, null, out byte mask))
+                                continue;
+
+                            ScriptedInput[frame] = mask;
+                        }
+                    }
+
+                    /// <summary>
+                    /// Applies any scripted input that is due. Called once per frame
+                    /// on the driver thread, before the frame is released, so the
+                    /// mask is in place for the CPU work that follows.
+                    /// </summary>
+                    public static void ApplyScriptedInput(int frame)
+                    {
+                        byte mask = 0;
+                        bool found = false;
+
+                        foreach (System.Collections.Generic.KeyValuePair<int, byte> entry in ScriptedInput)
+                        {
+                            if (entry.Key > frame)
+                                break;
+
+                            mask = entry.Value;
+                            found = true;
+                        }
+
+                        if (found)
+                            Joy1Buttons = mask;
+                    }
 
                     // ---- headless frame gate ----
                     //
