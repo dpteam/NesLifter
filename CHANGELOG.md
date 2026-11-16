@@ -124,6 +124,12 @@ Headless diagnostics, a real APU, and the in-game overlay.
   gets the free seed now.
 - A fall-through that follows a mapper write (`STA $8000`) now goes through the
   dispatcher, because the bank may have changed.
+- **The interpreter no longer refuses to execute RAM.** Kirby's Adventure
+  installs its IRQ handler at `$0029` and jumps there from the MMC3 IRQ, which is
+  legal on hardware. The guard existed to catch running garbage, so it is now a
+  4-million-instruction budget with a trap that names the address still running:
+  a real handler finishes in tens of instructions, while uninitialised RAM
+  loops forever.
 
 ### Status
 
@@ -136,7 +142,7 @@ All ten reference cartridges render and run:
 | Castlevania | UxROM (2) | correct, audio active |
 | Excitebike | NROM (0) | correct, audio active |
 | Gradius | CNROM (3) | correct, plays the game |
-| Kirby's Adventure | MMC3 (4) | correct, audio active |
+| Kirby's Adventure | MMC3 (4) | correct — plays level 1; one later scene has wrong tiles |
 | Zelda | MMC1 (1) | correct, audio active |
 | Metroid | MMC1 (1) | correct, audio active |
 | Super Mario Bros. | NROM (0) | correct |

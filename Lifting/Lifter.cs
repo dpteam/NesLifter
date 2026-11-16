@@ -1598,15 +1598,27 @@ namespace NesLifter.Lifting
                         public static bool Interpret()
                         {
                             ushort pc = DispatchTarget;
+
+                            // A game is allowed to execute code it has assembled
+                            // into RAM — Kirby's Adventure installs its IRQ handler
+                            // at $0029 and jumps there from the MMC3 IRQ. So RAM
+                            // execution cannot be an error by itself.
+                            //
+                            // What must be caught is running *garbage*: RAM that was
+                            // never initialised, or an address computed from a value
+                            // we got wrong. A budget catches that without rejecting
+                            // the legitimate case. It is generous — a real handler
+                            // runs for tens of instructions, not millions — and the
+                            // trap names the address that was still running, which is
+                            // enough to find the bug.
+                            const int Budget = 4_000_000;
+                            int executed = 0;
+
                             while (true)
                             {
-                                // Executing RAM or I/O is never legitimate: it means an
-                                // address was computed wrongly. Fail with a precise
-                                // message instead of walking zero-filled memory until it
-                                // hits the vector table.
-                                if (pc < 0x4020)
+                                if (++executed > Budget)
                                 {
-                                    SetTrap("Execution entered non-code space at $" + pc.ToString("X4") + " (RAM/IO). This is a lifter bug: report the ROM and this address.");
+                                    SetTrap("Interpreter ran " + Budget + " instructions without reaching lifted code (stuck at $" + pc.ToString("X4") + "). This is a lifter bug: report the ROM and this address.");
                                     return false;
                                 }
 
