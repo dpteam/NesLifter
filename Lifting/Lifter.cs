@@ -44,7 +44,7 @@ namespace NesLifter.Lifting
             // Two different names, for two different jobs. The namespace has to be
             // a valid C# identifier, so punctuation and spaces are folded away.
             // The title shown in the game window is free-form text, so it keeps the
-            // ROM's own name — "Legend of Zelda, The (U) (PRG0) [!]" rather than
+            // ROM's own name вЂ” "Legend of Zelda, The (U) (PRG0) [!]" rather than
             // "Legend_of_Zelda__The__U___PRG0_____".
             _nsName = SanitizeIdentifier(gameName);
             _displayName = EscapeStringLiteral(gameName ?? _nsName);
@@ -173,6 +173,7 @@ namespace NesLifter.Lifting
                     public static bool TraceMem;
                     public static bool TraceFrame;
                     public static bool TraceDispatch;
+                    public static bool TraceScroll;
 
                     public static string Dir = ".";
 
@@ -186,7 +187,7 @@ namespace NesLifter.Lifting
 
                     static readonly object _lock = new object();
 
-                    public static bool Any { get { return TraceCpu || TracePpu || TraceApu || TraceMapper || TraceMem || TraceFrame || TraceDispatch; } }
+                    public static bool Any { get { return TraceCpu || TracePpu || TraceApu || TraceMapper || TraceMem || TraceFrame || TraceDispatch || TraceScroll; } }
 
                     public static void Open()
                     {
@@ -202,12 +203,12 @@ namespace NesLifter.Lifting
                             if (TraceMapper) _mapW = Open("mapper.log");
                             if (TraceMem) _memW = Open("mem.log");
                             if (TraceFrame) _frmW = Open("frame.log");
-                            if (TraceDispatch) _dspW = Open("dispatch.log");
+                            if (TraceDispatch || TraceScroll) _dspW = Open("dispatch.log");
                         }
                         catch (Exception ex)
                         {
                             Runtime.Log("diag-open-fail", ex.Message, true);
-                            TraceCpu = TracePpu = TraceApu = TraceMapper = TraceMem = TraceFrame = TraceDispatch = false;
+                            TraceCpu = TracePpu = TraceApu = TraceMapper = TraceMem = TraceFrame = TraceDispatch = TraceScroll = false;
                         }
                     }
 
@@ -334,7 +335,7 @@ namespace NesLifter.Lifting
                     /// dispatch to an address below $8000 can only mean the return
                     /// address on the 6502 stack was wrong, so the line records both
                     /// the target and the PC that requested it, plus the stack
-                    /// pointer — enough to tell an unbalanced JSR/RTS from a corrupted
+                    /// pointer вЂ” enough to tell an unbalanced JSR/RTS from a corrupted
                     /// indirect jump.
                     /// </summary>
                     public static void Dispatch(ushort target, string reason)
@@ -372,6 +373,38 @@ namespace NesLifter.Lifting
                             _dspW.Write(" pc=$"); _dspW.Write(pc.ToString("X4"));
                             _dspW.Write(" depth="); _dspW.Write(depth);
                             _dspW.WriteLine();
+                        }
+                    }
+
+                    // ---- Scroll ----
+
+                    /// <summary>
+                    /// Per-line scroll values for one frame.
+                    ///
+                    /// A static HUD renders correctly while a scrolling background turns
+                    /// into repeating garbage is the signature of a bad per-scanline
+                    /// scroll capture, so this is the trace that separates "the game set
+                    /// the wrong scroll" from "the renderer used the wrong scroll".
+                    /// </summary>
+                    public static void ScrollLines()
+                    {
+                        if (_dspW == null) return;
+
+                        lock (_lock)
+                        {
+                            _dspW.Write("SCROLL frame="); _dspW.Write(Ppu.FrameCount);
+                            _dspW.Write(" base="); _dspW.Write(Ppu.ScrollX0); _dspW.Write(','); _dspW.Write(Ppu.ScrollY0);
+                            _dspW.Write(" nt="); _dspW.Write(Ppu.BaseNt0);
+                            _dspW.WriteLine();
+
+                            for (int y = 0; y < 240; y++)
+                            {
+                                _dspW.Write("  line "); _dspW.Write(y);
+                                _dspW.Write(" sx="); _dspW.Write(Ppu.LineScrollXSnapshot(y));
+                                _dspW.Write(" sy="); _dspW.Write(Ppu.LineScrollYSnapshot(y));
+                                _dspW.Write(" nt="); _dspW.Write(Ppu.LineBaseNtSnapshot(y));
+                                _dspW.WriteLine();
+                            }
                         }
                     }
 
@@ -583,6 +616,10 @@ namespace NesLifter.Lifting
                                 // Write a machine snapshot for every --shots frame.
                                 Runtime.DumpStates = true;
                             }
+                            else if (args[i] == "--dump-vram")
+                            {
+                                Runtime.DumpVideoMemory = true;
+                            }
                             else if (args[i] == "--force-interpreter")
                             {
                                 // Route every dispatch through the interpreter. Combined
@@ -657,6 +694,7 @@ namespace NesLifter.Lifting
                             {
                                 Runtime.CaptureShot(shotIndex);
                                 if (Runtime.DumpStates) Runtime.DumpState(shotIndex);
+                                if (Runtime.DumpVideoMemory) Ppu.DumpSnapshot(Runtime.ShotDir, Runtime.ShotFrames[shotIndex].ToString("D6"));
                                 shotIndex++;
                             }
 
@@ -682,6 +720,7 @@ namespace NesLifter.Lifting
                         {
                             Runtime.CaptureShot(shotIndex);
                             if (Runtime.DumpStates) Runtime.DumpState(shotIndex);
+                                if (Runtime.DumpVideoMemory) Ppu.DumpSnapshot(Runtime.ShotDir, Runtime.ShotFrames[shotIndex].ToString("D6"));
                             shotIndex++;
                         }
 
@@ -765,6 +804,9 @@ namespace NesLifter.Lifting
                     /// picture is not interesting.
                     /// </summary>
                     public static bool DumpStates;
+
+                    /// <summary>Also dump raw VRAM/CHR/palette for each shot frame.</summary>
+                    public static bool DumpVideoMemory;
 
                     // ---- scripted input ----
                     //
@@ -904,8 +946,8 @@ namespace NesLifter.Lifting
                     /// the live PRG/CHR bank mapping, PPU control state, and all of
                     /// RAM.
                     ///
-                    /// The point is to compare two runs — two builds, or this lifter
-                    /// against a reference emulator — and find the first frame where
+                    /// The point is to compare two runs вЂ” two builds, or this lifter
+                    /// against a reference emulator вЂ” and find the first frame where
                     /// they disagree, instead of staring at a trace of one of them.
                     /// </summary>
                     public static void DumpState(int index)
@@ -1023,7 +1065,7 @@ namespace NesLifter.Lifting
                         {
                             switch (raw.Trim().ToLowerInvariant())
                             {
-                                case "all": Diag.TraceCpu = Diag.TracePpu = Diag.TraceApu = Diag.TraceMapper = Diag.TraceMem = Diag.TraceFrame = Diag.TraceDispatch = true; break;
+                                case "all": Diag.TraceCpu = Diag.TracePpu = Diag.TraceApu = Diag.TraceMapper = Diag.TraceMem = Diag.TraceFrame = Diag.TraceDispatch = Diag.TraceScroll = true; break;
                                 case "cpu": Diag.TraceCpu = true; break;
                                 case "ppu": Diag.TracePpu = true; break;
                                 case "apu": Diag.TraceApu = true; break;
@@ -1031,6 +1073,7 @@ namespace NesLifter.Lifting
                                 case "mem": Diag.TraceMem = true; break;
                                 case "frame": Diag.TraceFrame = true; break;
                                 case "dispatch": Diag.TraceDispatch = true; break;
+                                case "scroll": Diag.TraceScroll = true; break;
                             }
                         }
                     }
@@ -1063,8 +1106,8 @@ namespace NesLifter.Lifting
                     /// decremented by RTI.
                     ///
                     /// This replaces a single "am I in NMI" flag, which was wrong in two
-                    /// ways: any RTI cleared it — including the RTI of an IRQ handler, or
-                    /// a game using RTI as a byte-saving trick — and it needed a
+                    /// ways: any RTI cleared it вЂ” including the RTI of an IRQ handler, or
+                    /// a game using RTI as a byte-saving trick вЂ” and it needed a
                     /// 1.5-million-cycle timer as a safety valve. A counter matches the
                     /// hardware: NMI can nest, and RTI unwinds exactly one level.
                     /// </summary>
@@ -1593,7 +1636,7 @@ namespace NesLifter.Lifting
                             // That is correct behaviour and a healthy handler never
                             // gets here twice, but an interrupt handler that runs
                             // slower than a frame would recurse until the stack
-                            // wrapped — so nesting is capped and reported.
+                            // wrapped вЂ” so nesting is capped and reported.
                             if (IntDepth >= MaxIntDepth)
                             {
                                 NmiPending = false;
@@ -1990,15 +2033,15 @@ namespace NesLifter.Lifting
                             ushort pc = DispatchTarget;
 
                             // A game is allowed to execute code it has assembled
-                            // into RAM — Kirby's Adventure installs its IRQ handler
+                            // into RAM вЂ” Kirby's Adventure installs its IRQ handler
                             // at $0029 and jumps there from the MMC3 IRQ. So RAM
                             // execution cannot be an error by itself.
                             //
                             // What must be caught is running *garbage*: RAM that was
                             // never initialised, or an address computed from a value
                             // we got wrong. A budget catches that without rejecting
-                            // the legitimate case. It is generous — a real handler
-                            // runs for tens of instructions, not millions — and the
+                            // the legitimate case. It is generous вЂ” a real handler
+                            // runs for tens of instructions, not millions вЂ” and the
                             // trap names the address that was still running, which is
                             // enough to find the bug.
                             const int Budget = 4_000_000;
@@ -2026,7 +2069,7 @@ namespace NesLifter.Lifting
                                 // The interpreter must be visible in cpu.log too.
                                 // Without this, a trace looks like the CPU jumps from
                                 // one lifted block to an unrelated one, and the real
-                                // path — through interpreted code — is invisible.
+                                // path вЂ” through interpreted code вЂ” is invisible.
                                 if (Diag.TraceCpu) Diag.CpuStep(pc, op);
 
                                 byte mnem = OpMnem[op];
@@ -2049,7 +2092,7 @@ namespace NesLifter.Lifting
                                 //
                                 // The operand is read lazily: a store must never
                                 // touch its destination. Reading first is not
-                                // harmless — `STA $2007` would advance the PPU's
+                                // harmless вЂ” `STA $2007` would advance the PPU's
                                 // `v` register before writing, so a palette or
                                 // VRAM upload running through the interpreter
                                 // lands every other byte at the wrong address.
@@ -2250,8 +2293,8 @@ namespace NesLifter.Lifting
                         /// Snapshot of the 8 KB of CHR visible at VBlank.
                         ///
                         /// CHR has to be captured like VRAM, not read live. The CPU
-                        /// thread switches CHR banks continuously — that is what CHR
-                        /// banking is for — and the render thread reads the pattern
+                        /// thread switches CHR banks continuously вЂ” that is what CHR
+                        /// banking is for вЂ” and the render thread reads the pattern
                         /// tables while it does. Reading live means one frame is drawn
                         /// from a mixture of old and new banks, which shows up as
                         /// garbled tiles on whichever scanline happened to be fetched
@@ -2442,8 +2485,72 @@ namespace NesLifter.Lifting
                         }
                     }
 
-                    static int MirrorTableLive(int t)
+                    /// <summary>
+                    /// Dumps the raw VRAM and CHR snapshot for a frame.
+                    ///
+                    /// Hex, 32 bytes per line with an address prefix, so it can be
+                    /// eyeballed and diffed. Nametable rows that look like sequential
+                    /// junk are the signature of an upload that went to the wrong
+                    /// address, which is otherwise invisible in a screenshot.
+                    /// </summary>
+                    public static void DumpSnapshot(string dir, string tag)
                     {
+                        try
+                        {
+                            System.IO.Directory.CreateDirectory(dir);
+                            RenderState s = Volatile.Read(ref RenderFront);
+
+                            // VRam is indexed by absolute PPU address, so nametables live at 0x2000 and the dump must cover 0x4000.
+                            WriteHexDump(System.IO.Path.Combine(dir, "vram_" + tag + ".txt"), s.VRam, 0x4000);
+                            WriteHexDump(System.IO.Path.Combine(dir, "chr_" + tag + ".txt"), s.Chr, 0x2000);
+                            WriteHexDump(System.IO.Path.Combine(dir, "pal_" + tag + ".txt"), s.Palette, 32);
+                        }
+                        catch (Exception ex)
+                        {
+                            Runtime.Log("dump-vram-fail", ex.Message, true);
+                        }
+                    }
+
+                    static void WriteHexDump(string path, byte[] data, int length)
+                    {
+                        using (System.IO.StreamWriter w = new System.IO.StreamWriter(path, false, System.Text.Encoding.UTF8))
+                        {
+                            for (int i = 0; i < length; i += 32)
+                            {
+                                w.Write(i.ToString("X4"));
+                                w.Write(' ');
+
+                                for (int j = 0; j < 32 && i + j < length; j++)
+                                {
+                                    w.Write(data[i + j].ToString("X2"));
+                                    w.Write(' ');
+                                }
+
+                                w.WriteLine();
+                            }
+                        }
+                    }
+
+                    /// <summary>Per-line scroll of the frame currently being drawn, for tracing.</summary>
+                    public static int LineScrollXSnapshot(int y)
+                    {
+                        RenderState s = Volatile.Read(ref RenderFront);
+                        return y >= 0 && y < 240 ? s.LineScrollX[y] : 0;
+                    }
+
+                    public static int LineScrollYSnapshot(int y)
+                    {
+                        RenderState s = Volatile.Read(ref RenderFront);
+                        return y >= 0 && y < 240 ? s.LineScrollY[y] : 0;
+                    }
+
+                    public static int LineBaseNtSnapshot(int y)
+                    {
+                        RenderState s = Volatile.Read(ref RenderFront);
+                        return y >= 0 && y < 240 ? s.LineBaseNt[y] : 0;
+                    }
+
+                    static int MirrorTableLive(int t)                    {
                         int m = Runtime.Mirroring;
                         if (m == 1) { if (t == 2) t = 0; else if (t == 3) t = 1; }
                         else if (m == 0) { if (t == 1) t = 0; else if (t >= 2) t = 1; }
@@ -2496,6 +2603,10 @@ namespace NesLifter.Lifting
                     public static void BeginFrame()
                     {
                         if (Diag.TraceFrame) Diag.PpuFrame();
+
+                        // Before the swap, RenderFront still holds the frame that just
+                        // finished вЂ” which is the one whose scroll is worth tracing.
+                        if (Diag.TraceScroll) Diag.ScrollLines();
 
                         // Capture the *completed* visible frame before starting its next VBlank/NMI.
                         // Scroll/split must be captured with VRAM; mixing them caused the jumping horizon.
@@ -2730,7 +2841,7 @@ namespace NesLifter.Lifting
                 /// Structure mirrors hardware: a frame sequencer clocks envelope,
                 /// sweep and length at 240 Hz and 120 Hz, while the mixer runs at
                 /// the output sample rate and reads the resulting channel state.
-                /// That split matters вЂ” games rely on length counters expiring at
+                /// That split matters РІР‚вЂќ games rely on length counters expiring at
                 /// the hardware rate, and on $4015 reporting which channels are
                 /// still alive.
                 /// </summary>
@@ -3500,7 +3611,7 @@ namespace NesLifter.Lifting
                 /// The frame is drawn at integer scale with nearest-neighbour
                 /// sampling, then the overlay is drawn on top at *window*
                 /// resolution so its text is legible. Drawing the overlay at 256x240
-                /// and scaling up вЂ” which the old debug OSD did вЂ” makes it unreadable.
+                /// and scaling up РІР‚вЂќ which the old debug OSD did РІР‚вЂќ makes it unreadable.
                 /// </summary>
                 class PpuForm : Form
                 {
@@ -3895,7 +4006,7 @@ namespace NesLifter.Lifting
         /// same bank view that produced the current offset, so it addresses the
         /// same PRG bytes no matter which bank is loaded when the code runs.
         /// That is why it can stay a direct <c>goto</c> even inside a switchable
-        /// window — and it must, because every instruction ends in one.
+        /// window вЂ” and it must, because every instruction ends in one.
         ///
         /// The exception is a write to the mapper itself. `STA $8000` on a banked
         /// board changes which PRG bytes the next address refers to, so the
