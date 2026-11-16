@@ -269,8 +269,28 @@ namespace NesLifter.Core
             int bankStart = bank * windowBytes;
             int bankEnd = bankStart + windowBytes;
 
-            List<ushort> seeds = new List<ushort> { 0x8000 };
-            HashSet<ushort> seedSet = new HashSet<ushort> { 0x8000 };
+            // Seeding every bank at $8000 is only correct for the bank that is
+            // actually mapped there at power-on. For every other bank, $8000 is
+            // whatever data the game happens to keep in that bank, and decoding
+            // it as code invents instructions that do not exist.
+            //
+            // That matters more than it sounds: the invented instructions have
+            // fall-throughs and branches of their own, so they chain into more
+            // invented instructions, and one of them eventually lands on a byte
+            // that decodes as KIL. Kirby's Adventure tripped exactly this way —
+            // a phantom block in bank 5 reached a $12 and trapped the CPU two
+            // frames in.
+            //
+            // So only the power-on bank gets the free seed. Every other bank is
+            // entered through real edges (known offsets, known functions) below.
+            List<ushort> seeds = new List<ushort>();
+            HashSet<ushort> seedSet = new HashSet<ushort>();
+
+            if (bank == 0)
+            {
+                seeds.Add(0x8000);
+                seedSet.Add(0x8000);
+            }
 
             // Seed at every known code offset that falls inside this bank. A bank
             // is entered at arbitrary points (jump tables, vector tables, calls

@@ -323,14 +323,22 @@ public sealed class MapperRuntimeEmitter
 
             case MapperFamily.Mmc1:
                 Raw("""
-                            _shift = 0; _count = 0; _ctrl = 0x0C; _chr0 = 0; _chr1 = 0; _prgReg = 0;
+                            _shift = 0; _count = 0;
+                            // FCEUX's MMC1CMReset: DRegs[0] = 0x1F, not 0x0C.
+                            // 0x1F means horizontal mirroring, PRG mode 3 and 4 KB CHR
+                            // mode; 0x0C would mean one-screen-low mirroring, which
+                            // makes the first frames after reset come from the wrong
+                            // nametable.
+                            _ctrl = 0x1F; _chr0 = 0; _chr1 = 0; _prgReg = 0;
                             Sync();
                     """);
                 break;
 
             case MapperFamily.Mmc3:
                 Raw("""
-                            _cmd = 0; for (int i = 0; i < 8; i++) _r[i] = 0;
+                            _cmd = 0;
+                            _r[0] = 0; _r[1] = 2; _r[2] = 4; _r[3] = 5;
+                            _r[4] = 6; _r[5] = 7; _r[6] = 0; _r[7] = 1;
                             _irqLatch = 0; _irqCounter = 0; _irqReload = false; _irqEnabled = false; _irqPending = false;
                             Sync();
                     """);
@@ -832,7 +840,15 @@ public sealed class MapperRuntimeEmitter
             case MapperFamily.Mmc3:
                 Raw("""
                             static int _cmd;
-                            static int[] _r = new int[8];
+
+                            // Reset values, not zeros. Hardware leaves the eight bank
+                            // registers holding 0,2,4,5,6,7,0,1 — the "sane" CHR layout a
+                            // game can rely on before it programs anything. Zeroing them
+                            // makes every CHR bank point at bank 0, so a game that starts
+                            // rendering before its first $8001 write draws the same tile
+                            // pattern everywhere. That was the grey screen with garbled
+                            // sprites on Battletoads, Castlevania, Metroid and Kirby.
+                            static int[] _r = new int[8] { 0, 2, 4, 5, 6, 7, 0, 1 };
                             static int _irqLatch, _irqCounter;
                             static bool _irqReload, _irqEnabled, _irqPending;
 
@@ -861,16 +877,33 @@ public sealed class MapperRuntimeEmitter
                                 }
                             }
 
+                            /// <summary>
+                            /// One scanline tick of the MMC3 IRQ counter.
+                            ///
+                            /// Mirrors FCEUX's <c>ClockMMC3Counter</c>: the value *before*
+                            /// the tick decides whether the counter reloads, and the
+                            /// trigger is tested after both branches. Testing only in the
+                            /// decrement branch misses the case where a reload happens to
+                            /// load zero, which is how games get a spurious extra IRQ.
+                            /// </summary>
                             public static void ClockScanline()
                             {
-                                if (_irqCounter == 0 || _irqReload)
+                                int count = _irqCounter;
+
+                                if (count == 0 || _irqReload)
                                 {
-                                    _irqCounter = _irqLatch; _irqReload = false;
+                                    _irqCounter = _irqLatch;
+                                    _irqReload = false;
                                 }
                                 else
                                 {
                                     _irqCounter--;
-                                    if (_irqCounter == 0 && _irqEnabled) { _irqPending = true; Runtime.IrqPending = true; }
+                                }
+
+                                if (_irqCounter == 0 && _irqEnabled)
+                                {
+                                    _irqPending = true;
+                                    Runtime.IrqPending = true;
                                 }
                             }
 

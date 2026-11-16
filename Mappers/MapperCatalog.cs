@@ -92,6 +92,10 @@ public sealed class MapperDescriptor
     /// every bank view at such addresses, and the generator refuses to hardcode
     /// them. Keeping it in one place is what stops the two from disagreeing —
     /// which is exactly the bug that made Zelda execute another bank's bytes.
+    ///
+    /// Getting a value wrong here is silent and expensive: the game runs and
+    /// quietly executes another bank's bytes. Verify each one against the
+    /// board's `Sync` in FCEUX (`refs/fceux/src/boards`) before changing it.
     /// </summary>
     public int FixedPrgFloor => Family switch
     {
@@ -101,18 +105,25 @@ public sealed class MapperDescriptor
         MapperFamily.Cprom => 0x8000,
         MapperFamily.Nina => 0x8000,
 
-        // Fixed 16 KB tail at $C000.
+        // Fixed 16 KB tail at $C000 (FCEUX: setprg16(0xC000, ~0)).
         MapperFamily.UxRom => 0xC000,
         MapperFamily.Camerica => 0xC000,
         MapperFamily.Quattro => 0xC000,
         MapperFamily.Mmc2 => 0xC000,
         MapperFamily.Fme7 => 0xC000,
 
-        // MMC3 can switch $8000-$9FFF, $A000-$BFFF and $C000-$DFFF, but
-        // $E000-$FFFF is always the last bank. Claiming $C000 is deliberate:
-        // both windows are fixed in practice, and it keeps the hot reset code
-        // direct.
-        MapperFamily.Mmc3 => 0xC000,
+        // MMC3 switches $8000-$9FFF (R6), $A000-$BFFF (R7) and $C000-$DFFF
+        // (the fixed second-last bank, or R6 depending on bit 6 of the bank
+        // select). Only $E000-$FFFF is always the last bank:
+        //
+        //   if (V & 0x40) { pwrap(0xC000, R6); pwrap(0x8000, ~1); }
+        //   else          { pwrap(0x8000, R6); pwrap(0xC000, ~1); }
+        //   pwrap(0xE000, ~0);
+        //
+        // Claiming $C000 here — as an earlier version did — makes the generator
+        // hardcode jumps into a window the game swaps, so a JSR lands in the
+        // wrong bank. Kirby's Adventure hits it within two frames.
+        MapperFamily.Mmc3 => 0xE000,
 
         // Everything else can remap the whole window at least once: MMC1 in
         // 32 KB mode, the VRC boards, and the AxROM-style single-window boards.

@@ -33,8 +33,19 @@ namespace NesLifter.Core.Boards
         {
             base.Power();
 
-            for (int i = 0; i < _regs.Length; i++)
-                _regs[i] = 0;
+            // Hardware leaves the eight bank registers holding 0,2,4,5,6,7,0,1 —
+            // the "sane" CHR layout a game may rely on before programming anything.
+            // Zeroing them makes every CHR bank point at bank 0, so a game that
+            // starts rendering before its first $8001 write draws the same tile
+            // pattern everywhere.
+            _regs[0] = 0;
+            _regs[1] = 2;
+            _regs[2] = 4;
+            _regs[3] = 5;
+            _regs[4] = 6;
+            _regs[5] = 7;
+            _regs[6] = 0;
+            _regs[7] = 1;
 
             _bankSelect = 0;
             _prgRamProtect = 0;
@@ -106,7 +117,13 @@ namespace NesLifter.Core.Boards
             if (cycle != 0)
                 return;
 
-            if (_irqCounter == 0 || _irqReload)
+            // Mirrors FCEUX's ClockMMC3Counter: the value before the tick decides
+            // whether the counter reloads, and the trigger is tested after both
+            // branches. Testing only in the decrement branch misses the case where
+            // a reload loads zero.
+            int count = _irqCounter;
+
+            if (count == 0 || _irqReload)
             {
                 _irqCounter = _irqLatch;
                 _irqReload = false;
@@ -114,9 +131,10 @@ namespace NesLifter.Core.Boards
             else
             {
                 _irqCounter--;
-                if (_irqCounter == 0 && _irqEnabled)
-                    _irqPending = true;
             }
+
+            if (_irqCounter == 0 && _irqEnabled)
+                _irqPending = true;
         }
 
         private void SyncMirroring(byte value)

@@ -153,6 +153,10 @@ runtime by the interpreter. This is the single largest accuracy gap.
       dispatched rather than hardcoded to one bank's offset.
       Remaining: per-bank coverage accounting and pruning of banks that are
       proven to be data only.
+- [x] **Seed only the power-on bank at `$8000`.** In every other bank `$8000` is
+      data, and decoding it invents instructions whose own fall-throughs chain
+      into more invented instructions until one decodes as `KIL`. Kirby's
+      Adventure trapped two frames in on exactly this.
 - [ ] **Seed each bank at cross-bank entry points.** A `JSR $B4AC` from the
       fixed bank is ambiguous — it could mean bank 5's or bank 7's `$B4AC`.
       Two attempts failed: seeding every bank at every ambiguous address decodes
@@ -160,12 +164,9 @@ runtime by the interpreter. This is the single largest accuracy gap.
       minutes), and filtering `$FF` padding did not make it converge. A real
       solution needs bank-switch tracking (below) so the analyser knows *which*
       bank is selected at each call site.
-- [ ] **Trace `$2007` reads as a first-class event.** Zelda's palette upload is
-      preceded by a `$2007` read per entry, so `v` advances twice and only the
-      odd palette slots get written (`$3F00` is never touched). The read does not
-      appear in `cpu.log`, so it comes from a path other than lifted game code —
-      most likely the interpreter. Fixing it is the last step to correct Zelda's
-      palette and tiles.
+- [x] **Trace `$2007` reads as a first-class event.** The interleaved reads turned
+      out to be the interpreter reading a store's destination before writing it.
+      Fixed; the `R $2007` trace stays because it is what found the bug.
 - [ ] Bank-switch tracking: record the mapper writes that lead to each bank so
       cross-bank `JMP`/`JSR` edges can be resolved *statically* instead of
       relying on the runtime resolve-then-dispatch step

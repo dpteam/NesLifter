@@ -321,12 +321,14 @@ namespace NesLifter.Lifting
                             _ppuW.Write("  sl="); _ppuW.Write(Ppu.CurrentScanline());
                             _ppuW.Write(" v="); _ppuW.Write(Ppu.VRamAddr.ToString("X4"));
                             _ppuW.Write(" ctrl=$"); _ppuW.Write(Ppu.Ctrl.ToString("X2"));
+                            _ppuW.Write(" pc=$"); _ppuW.Write(Runtime.LastPC.ToString("X4"));
                             _ppuW.WriteLine();
                         }
                     }
 
                     /// <summary>One line per PPU register write.</summary>
-                    public static void PpuWrite(ushort reg, byte value)                    {
+                    public static void PpuWrite(ushort reg, byte value)
+                    {
                         if (_ppuW == null) return;
 
                         lock (_lock)
@@ -339,6 +341,7 @@ namespace NesLifter.Lifting
                             _ppuW.Write(" v="); _ppuW.Write(Ppu.VRamAddr.ToString("X4"));
                             _ppuW.Write(" t="); _ppuW.Write(Ppu.TempAddr.ToString("X4"));
                             _ppuW.Write(" ctrl=$"); _ppuW.Write(Ppu.Ctrl.ToString("X2"));
+                            _ppuW.Write(" pc=$"); _ppuW.Write(Runtime.LastPC.ToString("X4"));
                             _ppuW.WriteLine();
                         }
                     }
@@ -1629,75 +1632,104 @@ namespace NesLifter.Lifting
                                 }
 
                                 // Normal instructions
-                                byte val = ReadOp(mode, pc, imm);
+                                //
+                                // The operand is read lazily: a store must never
+                                // touch its destination. Reading first is not
+                                // harmless — `STA $2007` would advance the PPU's
+                                // `v` register before writing, so a palette or
+                                // VRAM upload running through the interpreter
+                                // lands every other byte at the wrong address.
+                                // The same applies to `STA $2002` (clears VBlank
+                                // and resets the write toggle) and to any
+                                // read-modify-write instruction, which must read
+                                // its operand exactly once.
+                                byte val = 0;
+
                                 switch (mnem)
                                 {
-                                    case 1: A = val; SetNZ(A); break;
-                                    case 2: X = val; SetNZ(X); break;
-                                    case 3: Y = val; SetNZ(Y); break;
                                     case 4: Memory.Write(AddrOp(mode, pc, imm), A); break;
                                     case 5: Memory.Write(AddrOp(mode, pc, imm), X); break;
                                     case 6: Memory.Write(AddrOp(mode, pc, imm), Y); break;
-                                    case 7: X = A; SetNZ(X); break;
-                                    case 8: Y = A; SetNZ(Y); break;
-                                    case 9: A = X; SetNZ(A); break;
-                                    case 10: A = Y; SetNZ(A); break;
-                                    case 11: SP = X; break;
-                                    case 12: X = SP; SetNZ(X); break;
-                                    case 13: X = (byte)(X + 1); SetNZ(X); break;
-                                    case 14: Y = (byte)(Y + 1); SetNZ(Y); break;
-                                    case 15: X = (byte)(X - 1); SetNZ(X); break;
-                                    case 16: Y = (byte)(Y - 1); SetNZ(Y); break;
-                                    case 17: Adc(val); break;
-                                    case 18: Sbc(val); break;
-                                    case 19: Compare(A, val); break;
-                                    case 20: Compare(X, val); break;
-                                    case 21: Compare(Y, val); break;
-                                    case 22: A = (byte)(A & val); SetNZ(A); break;
-                                    case 23: A = (byte)(A | val); SetNZ(A); break;
-                                    case 24: A = (byte)(A ^ val); SetNZ(A); break;
-                                    case 25: Bit(val); break;
-                                    case 26: if (mode == 1) A = Asl(A); else { ushort a = AddrOp(mode, pc, imm); Memory.Write(a, Asl(Memory.Read(a))); } break;
-                                    case 27: if (mode == 1) A = Lsr(A); else { ushort a = AddrOp(mode, pc, imm); Memory.Write(a, Lsr(Memory.Read(a))); } break;
-                                    case 28: if (mode == 1) A = Rol(A); else { ushort a = AddrOp(mode, pc, imm); Memory.Write(a, Rol(Memory.Read(a))); } break;
-                                    case 29: if (mode == 1) A = Ror(A); else { ushort a = AddrOp(mode, pc, imm); Memory.Write(a, Ror(Memory.Read(a))); } break;
-                                    case 30: { ushort a = AddrOp(mode, pc, imm); byte t = (byte)(Memory.Read(a) + 1); SetNZ(t); Memory.Write(a, t); } break;
-                                    case 31: { ushort a = AddrOp(mode, pc, imm); byte t = (byte)(Memory.Read(a) - 1); SetNZ(t); Memory.Write(a, t); } break;
-                                    case 32: P = (byte)(P & 0xFE); break;
-                                    case 33: P = (byte)(P | 0x01); break;
-                                    case 34: P = (byte)(P & 0xFB); break;
-                                    case 35: P = (byte)(P | 0x04); break;
-                                    case 36: P = (byte)(P & 0xBF); break;
-                                    case 37: P = (byte)(P & 0xF7); break;
-                                    case 38: P = (byte)(P | 0x08); break;
-                                    case 39: Push(A); break;
-                                    case 40: A = Pull(); SetNZ(A); break;
-                                    case 41: Push((byte)(P | 0x30)); break;
-                                    case 42: P = (byte)((Pull() & 0xEF) | 0x20); break;
-                                    case 43: break;
-                                    case 50: A = X = val; SetNZ(A); break;
                                     case 51: Memory.Write(AddrOp(mode, pc, imm), (byte)(A & X)); break;
-                                    case 52: { ushort a = AddrOp(mode, pc, imm); byte t = (byte)(Memory.Read(a) - 1); Memory.Write(a, t); Compare(A, t); } break;
-                                    case 53: { ushort a = AddrOp(mode, pc, imm); byte t = (byte)(Memory.Read(a) + 1); Memory.Write(a, t); Sbc(t); } break;
-                                    case 54: { ushort a = AddrOp(mode, pc, imm); byte t = Asl(Memory.Read(a)); Memory.Write(a, t); A = (byte)(A | t); SetNZ(A); } break;
-                                    case 55: { ushort a = AddrOp(mode, pc, imm); byte t = Rol(Memory.Read(a)); Memory.Write(a, t); A = (byte)(A & t); SetNZ(A); } break;
-                                    case 56: { ushort a = AddrOp(mode, pc, imm); byte t = Lsr(Memory.Read(a)); Memory.Write(a, t); A = (byte)(A ^ t); SetNZ(A); } break;
-                                    case 57: { ushort a = AddrOp(mode, pc, imm); byte t = Ror(Memory.Read(a)); Memory.Write(a, t); Adc(t); } break;
-                                    case 58: A = (byte)(A & val); SetCarry((A & 0x80) != 0); SetNZ(A); break;
-                                    case 59: A = Lsr((byte)(A & val)); break;
-                                    case 60: A = Ror((byte)(A & val)); break;
-                                    case 61: A = (byte)((A | 0xEE) & X & val); SetNZ(A); break;
-                                    case 62: A = (byte)((A | 0xEE) & val); X = A; SetNZ(A); break;
-                                    case 63: { int t = (A & X) - val; X = (byte)t; SetCarry(t >= 0); SetNZ(X); } break;
                                     case 64: Memory.Write(AddrOp(mode, pc, imm), Y); break;
-                                    case 65: SP = (byte)(SP & val); A = SP; X = SP; SetNZ(SP); break;
                                     case 66: Memory.Write(AddrOp(mode, pc, imm), (byte)(A & X)); break;
-                                    case 67: DispatchTarget = pc; return false;
-                                    default: DispatchTarget = pc; return false;
+
+                                    default:
+                                        val = ReadOp(mode, pc, imm);
+                                        switch (mnem)
+                                        {
+                                            case 1: A = val; SetNZ(A); break;
+                                            case 2: X = val; SetNZ(X); break;
+                                            case 3: Y = val; SetNZ(Y); break;
+                                            case 7: X = A; SetNZ(X); break;
+                                            case 8: Y = A; SetNZ(Y); break;
+                                            case 9: A = X; SetNZ(A); break;
+                                            case 10: A = Y; SetNZ(A); break;
+                                            case 11: SP = X; break;
+                                            case 12: X = SP; SetNZ(X); break;
+                                            case 13: X = (byte)(X + 1); SetNZ(X); break;
+                                            case 14: Y = (byte)(Y + 1); SetNZ(Y); break;
+                                            case 15: X = (byte)(X - 1); SetNZ(X); break;
+                                            case 16: Y = (byte)(Y - 1); SetNZ(Y); break;
+                                            case 17: Adc(val); break;
+                                            case 18: Sbc(val); break;
+                                            case 19: Compare(A, val); break;
+                                            case 20: Compare(X, val); break;
+                                            case 21: Compare(Y, val); break;
+                                            case 22: A = (byte)(A & val); SetNZ(A); break;
+                                            case 23: A = (byte)(A | val); SetNZ(A); break;
+                                            case 24: A = (byte)(A ^ val); SetNZ(A); break;
+                                            case 25: Bit(val); break;
+                                            case 26: if (mode == 1) A = Asl(A); else { ushort a = AddrOp(mode, pc, imm); Memory.Write(a, Asl(val)); } break;
+                                            case 27: if (mode == 1) A = Lsr(A); else { ushort a = AddrOp(mode, pc, imm); Memory.Write(a, Lsr(val)); } break;
+                                            case 28: if (mode == 1) A = Rol(A); else { ushort a = AddrOp(mode, pc, imm); Memory.Write(a, Rol(val)); } break;
+                                            case 29: if (mode == 1) A = Ror(A); else { ushort a = AddrOp(mode, pc, imm); Memory.Write(a, Ror(val)); } break;
+                                            case 30: { ushort a = AddrOp(mode, pc, imm); byte t = (byte)(val + 1); SetNZ(t); Memory.Write(a, t); } break;
+                                            case 31: { ushort a = AddrOp(mode, pc, imm); byte t = (byte)(val - 1); SetNZ(t); Memory.Write(a, t); } break;
+                                            case 32: P = (byte)(P & 0xFE); break;
+                                            case 33: P = (byte)(P | 0x01); break;
+                                            case 34: P = (byte)(P & 0xFB); break;
+                                            case 35: P = (byte)(P | 0x04); break;
+                                            case 36: P = (byte)(P & 0xBF); break;
+                                            case 37: P = (byte)(P & 0xF7); break;
+                                            case 38: P = (byte)(P | 0x08); break;
+                                            case 39: Push(A); break;
+                                            case 40: A = Pull(); SetNZ(A); break;
+                                            case 41: Push((byte)(P | 0x30)); break;
+                                            case 42: P = (byte)((Pull() & 0xEF) | 0x20); break;
+                                            case 43: break;
+                                            case 50: A = X = val; SetNZ(A); break;
+                                            case 52: { ushort a = AddrOp(mode, pc, imm); byte t = (byte)(val - 1); Memory.Write(a, t); Compare(A, t); } break;
+                                            case 53: { ushort a = AddrOp(mode, pc, imm); byte t = (byte)(val + 1); Memory.Write(a, t); Sbc(t); } break;
+                                            case 54: { ushort a = AddrOp(mode, pc, imm); byte t = Asl(val); Memory.Write(a, t); A = (byte)(A | t); SetNZ(A); } break;
+                                            case 55: { ushort a = AddrOp(mode, pc, imm); byte t = Rol(val); Memory.Write(a, t); A = (byte)(A & t); SetNZ(A); } break;
+                                            case 56: { ushort a = AddrOp(mode, pc, imm); byte t = Lsr(val); Memory.Write(a, t); A = (byte)(A ^ t); SetNZ(A); } break;
+                                            case 57: { ushort a = AddrOp(mode, pc, imm); byte t = Ror(val); Memory.Write(a, t); Adc(t); } break;
+                                            case 58: A = (byte)(A & val); SetCarry((A & 0x80) != 0); SetNZ(A); break;
+                                            case 59: A = Lsr((byte)(A & val)); break;
+                                            case 60: A = Ror((byte)(A & val)); break;
+                                            case 61: A = (byte)((A | 0xEE) & X & val); SetNZ(A); break;
+                                            case 62: A = (byte)((A | 0xEE) & val); X = A; SetNZ(A); break;
+                                            case 63: { int t = (A & X) - val; X = (byte)t; SetCarry(t >= 0); SetNZ(X); } break;
+                                            case 65: SP = (byte)(SP & val); A = SP; X = SP; SetNZ(SP); break;
+                                            case 67: DispatchTarget = pc; return false;
+                                            default: UnknownOpcodeInInterpreter(op, pc); return false;
+                                        }
+                                        break;
                                 }
 
                                 pc = (ushort)(pc + len);
                             }
+                        }
+
+                        /// <summary>
+                        /// Reports a mnemonic the interpreter does not implement
+                        /// through the same trap as an unknown lifted opcode, so it
+                        /// is never silently a NOP.
+                        /// </summary>
+                        static void UnknownOpcodeInInterpreter(byte op, ushort pc)
+                        {
+                            SetTrap("Interpreter: unimplemented opcode $" + op.ToString("X2") + " at $" + pc.ToString("X4"));
                         }
 
                 """));
@@ -3281,7 +3313,9 @@ namespace NesLifter.Lifting
             if (inst.Info != null && inst.Info.Mn == "KIL")
                 return;
 
-            EmitFallthrough(sb, inst.FallthroughOffset, inst.Fallthrough);
+            // `inst` is passed so a write to the mapper switches the fall-through
+            // to the dispatcher: the bank may have changed under our feet.
+            EmitFallthrough(sb, inst.FallthroughOffset, inst.Fallthrough, inst);
         }
 
         private void EmitBranch(StringBuilder sb, Instruction inst)
@@ -3415,16 +3449,24 @@ namespace NesLifter.Lifting
         /// <summary>
         /// Emits the fall-through into the next block.
         ///
-        /// Unlike a jump target, a fall-through offset is always consistent with
-        /// the block that precedes it: the analyser computed it from the same
-        /// bank view that produced the current offset, so it addresses the same
-        /// PRG bytes no matter which bank is loaded when the code runs. It can
-        /// therefore stay a direct <c>goto</c> even inside a switchable window —
-        /// which matters, because every instruction ends in one.
+        /// Unlike a jump target, a fall-through offset is normally consistent
+        /// with the block that precedes it: the analyser computed it from the
+        /// same bank view that produced the current offset, so it addresses the
+        /// same PRG bytes no matter which bank is loaded when the code runs.
+        /// That is why it can stay a direct <c>goto</c> even inside a switchable
+        /// window — and it must, because every instruction ends in one.
+        ///
+        /// The exception is a write to the mapper itself. `STA $8000` on a banked
+        /// board changes which PRG bytes the next address refers to, so the
+        /// fall-through must be resolved against the *new* mapping. Emitting a
+        /// direct goto there continues in the bank the analyser happened to be
+        /// walking, which is a different bank's code.
         /// </summary>
-        private void EmitFallthrough(StringBuilder sb, int offset, ushort address)
+        private void EmitFallthrough(StringBuilder sb, int offset, ushort address, Instruction? after = null)
         {
-            if (offset >= 0 && _labels.Contains(offset))
+            bool remaps = after != null && MayRemapPrg(after);
+
+            if (!remaps && offset >= 0 && _labels.Contains(offset))
             {
                 Line(sb, $"goto {Label(offset)};");
                 return;
@@ -3432,6 +3474,70 @@ namespace NesLifter.Lifting
 
             Line(sb, $"Runtime.DispatchTarget = 0x{address:X4};");
             Line(sb, "goto Dispatch;");
+        }
+
+        /// <summary>
+        /// True when executing <paramref name="inst"/> can change the PRG bank
+        /// mapping, so the following address must be resolved at runtime.
+        ///
+        /// Only absolute stores are considered: mapper registers live in
+        /// <c>$8000-$FFFF</c> and games write them with `STA abs`, while
+        /// indexed and indirect stores from those regions are data movement.
+        /// Being conservative here costs one indirect branch; being wrong costs
+        /// correctness.
+        /// </summary>
+        private bool MayRemapPrg(Instruction inst)
+        {
+            if (inst.Info == null)
+                return false;
+
+            // A board without PRG banking cannot be remapped at all.
+            if (_mapperDescriptor.FixedPrgFloor >= 0x10000 && !HasSwitchableWindow())
+                return false;
+
+            if (inst.Info.Mode != AddrMode.Abs || inst.Operand < 0x8000)
+                return false;
+
+            string mn = inst.Info.Mn;
+
+            switch (mn)
+            {
+                case "STA":
+                case "STX":
+                case "STY":
+                case "SAX":
+                    return true;
+
+                // Read-modify-write instructions also write their destination.
+                case "ASL":
+                case "LSR":
+                case "ROL":
+                case "ROR":
+                case "INC":
+                case "DEC":
+                case "SLO":
+                case "RLA":
+                case "SRE":
+                case "RRA":
+                case "DCP":
+                case "ISB":
+                    return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>True when the mapper can move PRG banks at all.</summary>
+        private bool HasSwitchableWindow()
+        {
+            return _mapperDescriptor.Family switch
+            {
+                MapperFamily.Nrom => false,
+                MapperFamily.Cnrom => false,
+                MapperFamily.Cprom => false,
+                MapperFamily.Nina => false,
+                _ => true,
+            };
         }
 
         private void EmitOperation(StringBuilder sb, Instruction inst)

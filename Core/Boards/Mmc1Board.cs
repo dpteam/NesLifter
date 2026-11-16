@@ -89,7 +89,11 @@
 
         private void ClearRegisters()
         {
-            _registers[0] = 0x0C;
+            // FCEUX's MMC1CMReset sets DRegs[0] = 0x1F, not 0x0C: horizontal
+            // mirroring, PRG mode 3, 4 KB CHR mode. 0x0C would select one-screen-low
+            // mirroring, so the first frames after reset would come from the wrong
+            // nametable.
+            _registers[0] = 0x1F;
             _registers[1] = 0;
             _registers[2] = 0;
             _registers[3] = 0;

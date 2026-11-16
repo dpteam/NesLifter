@@ -90,37 +90,65 @@ Headless diagnostics, a real APU, and the in-game overlay.
 - `$2007` reads are traced as `R $2007` alongside writes, which is what made it
   possible to see read/write interleaving during a VRAM upload.
 - `dist/` is git-ignored.
+- `refs/` is git-ignored. Upstream emulator sources (FCEUX) are cloned there for
+  accuracy reference and never built or shipped.
 
-### Known broken
+### Fixed (mapper accuracy, cross-checked against FCEUX)
 
-Measured headlessly with `tools/Probe` on 10 reference cartridges, 9 render and
-1 does not:
+- **The interpreter read the operand of every instruction, including stores.**
+  `STA $2007` read `$2007` first, advancing the PPU's `v` register before the
+  write, so a VRAM or palette upload running through the interpreter landed every
+  other byte at the wrong address. `STA $2002` similarly cleared VBlank and reset
+  the write toggle before storing. Read-modify-write instructions read their
+  operand twice. Stores now never touch their destination, and RMW reads once.
+  This was the cause of the "grey screen with garbled sprites" on every title
+  whose init runs through the interpreter — Tetris, Metroid, Castlevania.
+- **MMC3 bank registers powered on as zeros.** Hardware leaves them holding
+  `0,2,4,5,6,7,0,1` — the sane CHR layout a game may rely on before programming
+  anything. With zeros every CHR bank pointed at bank 0, so a game that starts
+  rendering before its first `$8001` write drew the same tile everywhere.
+- **MMC3 `$C000-$DFFF` is switchable, not fixed.** `FixedPrgFloor` said `$C000`,
+  so the generator hardcoded jumps into a window the game swaps with R6 via bit 6
+  of the bank select. Now `$E000`, matching FCEUX's `pwrap(0xE000, ~0)`.
+- **MMC3 IRQ counter** now tests the trigger after both the reload and the
+  decrement branch, like FCEUX's `ClockMMC3Counter`, instead of only after the
+  decrement.
+- **MMC1 powered on with `$0C`, which selects one-screen-low mirroring.** FCEUX's
+  `MMC1CMReset` uses `$1F` (horizontal, PRG mode 3, 4 KB CHR).
+- **The analyser seeded `$8000` in every bank view.** `$8000` is only an entry
+  point in the bank that is actually mapped there at power-on; in every other
+  bank it is whatever data the game keeps in that bank. Decoding that data
+  invented instructions with fall-throughs and branches of their own, which
+  chained into more invented instructions until one landed on a `KIL` byte.
+  Kirby's Adventure trapped two frames in on exactly this. Only the power-on bank
+  gets the free seed now.
+- A fall-through that follows a mapper write (`STA $8000`) now goes through the
+  dispatcher, because the bank may have changed.
 
-| Title | State | Diagnosis |
+### Status
+
+All ten reference cartridges render and run:
+
+| Title | Mapper | State |
 | --- | --- | --- |
-| Kirby's Adventure (MMC3) | traps at frame 2, `KIL/HLT at $802E` | The ROM's vector table is implausible at every candidate PRG size (`NMI=$0041 RESET=$00F0 IRQ=$0029` for 512 KB, `$002D/$0000/$00FF` for 128 KB), so no reset handler can be found. Before the dispatch fix it ran 600 blank frames; the trap is an improvement — a precise failure instead of silently executing padding. |
+| Adventure Island | CNROM (3) | correct, audio active |
+| Battletoads | AxROM (7) | correct — slow star-field intro |
+| Castlevania | UxROM (2) | correct, audio active |
+| Excitebike | NROM (0) | correct, audio active |
+| Gradius | CNROM (3) | correct, plays the game |
+| Kirby's Adventure | MMC3 (4) | correct, audio active |
+| Zelda | MMC1 (1) | correct, audio active |
+| Metroid | MMC1 (1) | correct, audio active |
+| Super Mario Bros. | NROM (0) | correct |
+| Tetris | MMC1 (1) | correct |
 
-Zelda (MMC1) renders and plays music but its tiles and palette are wrong. The
-cause is visible in `ppu.log`: every palette write is preceded by a `$2007`
-*read* at the same address, so `v` advances twice per entry and only the odd
-palette slots are ever written (`$3F00` is never touched). The read is not
-present in `cpu.log`, so it originates somewhere other than game code — most
-likely the interpreter path during the upload routine. That is the next thing to
-chase, and it is recorded in `ROADMAP.md`.
+Frames that come out blank at a given frame number are screen transitions in the
+game (Gradius' attract mode, Zelda's demo hand-off), not rendering failures —
+sampling a few frames per run distinguishes the two.
 
-The other nine render correctly:
-
-| Title | Colours / ink at frame 600 | Audio |
-| --- | --- | --- |
-| Adventure Island | 10 / 18.5% | 0.8% silent, rms 4919 |
-| Battletoads | 6 / 6.5% | silent at this point in the run |
-| Castlevania | 11 / 24.7% | silent at this point in the run |
-| Excitebike | 6 / 17.3% | 16.3% silent, rms 3601 |
-| Gradius | 9 / 5.8% | 70% silent, rms 611 |
-| Metroid | 13 / 44.8% | 2.3% silent, rms 3398 |
-| Super Mario Bros. | 11 / 45.4% | title screen is silent by design |
-| Tetris | 4 / 13.6% | silent at this point in the run |
-| Zelda | 5 / 8.8% | 6.4% silent, rms 3482 |
+Note that Tetris is **MMC1**, not NROM, so the earlier "NROM is fine, mappers are
+broken" reading was not quite right: the worst failures were in the *interpreter*
+(see below), which every title uses until its code is fully lifted.
 
 ---
 
