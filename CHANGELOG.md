@@ -225,6 +225,56 @@ bank-switch tracking item in `ROADMAP.md`.
 SMB3 currently runs indefinitely without trapping but renders nothing, because
 its PPU never leaves `ctrl`/`mask` `$00`.
 
+### Diagnosing SMB3: state diffing instead of staring
+
+`--dump-state` writes a full machine snapshot per `--shots` frame — CPU
+registers, the live PRG window offsets, PPU control state, and all of RAM — as
+text so it diffs with ordinary tools. `tools/StateDiff` compares two such
+directories and reports the first frame where they disagree, down to individual
+RAM addresses.
+
+The companion flag is `--force-interpreter`, which routes every dispatch through
+the interpreter. Running a title both ways and diffing is a self-check that needs
+no external emulator: if the two runs diverge, the lifted code is wrong; if they
+agree and both fail, the bug is in the runtime.
+
+That immediately localised SMB3:
+
+```
+frame 2, 4, 6, 8: identical
+frame 10: 27 difference(s)
+  ppuctrl: 00 vs 28      ppumask: 00 vs 1E
+  sp: F9 vs FB           RAM $0101: 00 vs 20
+```
+
+The interpreter run enables the PPU; the lifted run does not, and it carries two
+extra bytes of stack. Diffing the two `cpu.log` traces at register level (PC is
+unreliable, see below) puts the first real divergence at instruction 92034:
+
+```
+lifted: C48E  E0  (CPX #$18)
+interp: 848E  A9  (LDA #$18)
+```
+
+Both returned from the same bank-switch trampoline with the same stack and the
+same registers, then executed **different bytes at the same CPU address**. The
+generated code contains a block for `$C48E` and none for `$848E`, so the analyser
+and the runtime disagree about which bank occupies the window after the
+trampoline writes it. That is the remaining SMB3 bug, and it is a mapping
+question, not a decoding one.
+
+Two incidental findings from the same work:
+
+- `Runtime.ForceInterpreter` was declared but never read — the overlay toggle did
+  nothing. Wiring it up naively also exposed a livelock: the interpreter hands
+  control back to lifted code when the PC is a known label, so under the forced
+  flag the dispatcher called straight back in at the same PC forever. Fixed.
+- `LastPC` — and therefore the PC column in `cpu.log` and every trap message —
+  can be off by a bank stride ($4000 in SMB3) when the same PRG bytes appear in
+  two windows, because the label is keyed by PRG offset and the displayed address
+  comes from whichever view decoded it first. It is cosmetic, but it made the
+  first diff read as a false divergence until the comparison ignored PC.
+
 ---
 
 ## [0.9.0] — 2026-11-16

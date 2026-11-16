@@ -368,10 +368,25 @@ frame-level model cannot reproduce. These are the accuracy targets:
 
 ## Stage 7 — Tooling and ecosystem (hard)
 
+- [x] **State dumping and diffing.** `--dump-state` writes a text snapshot per
+      captured frame (registers, live PRG window offsets, PPU state, all of RAM);
+      `tools/StateDiff` reports the first frame where two runs disagree, down to
+      individual RAM addresses.
+- [x] **`--force-interpreter`** routes every dispatch through the interpreter, so
+      a title can be run lifted and interpreted and the two dumps compared. A
+      divergence means the lift is wrong; agreement means the runtime is.
 - [ ] Diff harness: run the generated game and a reference emulator in lockstep,
-      compare RAM + framebuffer per frame, report the first divergence
+      compare RAM + framebuffer per frame, report the first divergence. The
+      self-comparison above covers lift-vs-runtime; this adds the third leg,
+      lift-vs-hardware.
 - [ ] Test-ROM suite integration (nestest, blargg, ppu_vbl_nmi, sprite_hit)
 - [ ] Symbol/`.nl` sidecar so traces map to readable names
+- [ ] **Breakpoints and single-step.** No debugger surface exists yet: a trap can
+      only be diagnosed after the fact from traces. Wanted: break on PC, on a RAM
+      address changing, or on a mapper write, and step from there.
+- [ ] Fix `LastPC` when a PRG offset is visible in two windows: it currently
+      reports whichever view decoded it first, so a trace can show an address a
+      bank stride away from the one actually executing.
 - [ ] Source-level debugging: `#line` directives back into the disassembly
 - [ ] WebAssembly output target
 - [ ] Rewrite the lifter as a proper IR (SSA-ish) with peephole optimisation

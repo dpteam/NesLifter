@@ -563,6 +563,18 @@ namespace NesLifter.Lifting
                                 // Comma-separated "frame:hexmask" pairs, e.g. 120:08 holds Start.
                                 Runtime.ParseScriptedInput(args[++i]);
                             }
+                            else if (args[i] == "--dump-state")
+                            {
+                                // Write a machine snapshot for every --shots frame.
+                                Runtime.DumpStates = true;
+                            }
+                            else if (args[i] == "--force-interpreter")
+                            {
+                                // Route every dispatch through the interpreter. Combined
+                                // with --dump-state this compares lifted execution against
+                                // interpreted execution of the same ROM.
+                                Runtime.ForceInterpreter = true;
+                            }
                         }
 
                         if (shotDir != null) Runtime.ShotDir = shotDir;
@@ -629,6 +641,7 @@ namespace NesLifter.Lifting
                                    Ppu.FrameCount >= Runtime.ShotFrames[shotIndex])
                             {
                                 Runtime.CaptureShot(shotIndex);
+                                if (Runtime.DumpStates) Runtime.DumpState(shotIndex);
                                 shotIndex++;
                             }
 
@@ -653,6 +666,7 @@ namespace NesLifter.Lifting
                         while (shotIndex < Runtime.ShotFrames.Count)
                         {
                             Runtime.CaptureShot(shotIndex);
+                            if (Runtime.DumpStates) Runtime.DumpState(shotIndex);
                             shotIndex++;
                         }
 
@@ -722,6 +736,13 @@ namespace NesLifter.Lifting
                     // Headless screenshot capture: (frame, path) pairs.
                     public static readonly System.Collections.Generic.List<int> ShotFrames = new System.Collections.Generic.List<int>();
                     public static string ShotDir = ".";
+
+                    /// <summary>
+                    /// Write a machine snapshot alongside each screenshot. Separate
+                    /// from ShotFrames so a run can dump state at frames where the
+                    /// picture is not interesting.
+                    /// </summary>
+                    public static bool DumpStates;
 
                     // ---- scripted input ----
                     //
@@ -851,6 +872,85 @@ namespace NesLifter.Lifting
                     /// The screenshot is taken from the *live* PPU, not from the
                     /// renderer's snapshot, so what lands on disk is what the PPU
                     /// would show at this instant.
+                    /// </summary>
+                    /// <summary>
+                    /// Writes a full machine snapshot for one frame.
+                    ///
+                    /// Text, not binary, so it diffs with ordinary tools and a
+                    /// divergence can be read rather than decoded. Every field that
+                    /// decides what the machine does next is included: CPU registers,
+                    /// the live PRG/CHR bank mapping, PPU control state, and all of
+                    /// RAM.
+                    ///
+                    /// The point is to compare two runs — two builds, or this lifter
+                    /// against a reference emulator — and find the first frame where
+                    /// they disagree, instead of staring at a trace of one of them.
+                    /// </summary>
+                    public static void DumpState(int index)
+                    {
+                        try
+                        {
+                            System.IO.Directory.CreateDirectory(ShotDir);
+
+                            string path = System.IO.Path.Combine(
+                                ShotDir,
+                                "state_" + ShotFrames[index].ToString("D6") + ".txt");
+
+                            using (System.IO.StreamWriter w = new System.IO.StreamWriter(
+                                path, false, System.Text.Encoding.UTF8))
+                            {
+                                w.WriteLine("frame " + Ppu.FrameCount);
+                                w.WriteLine("cycles " + CpuCycles);
+                                w.WriteLine("pc " + LastPC.ToString("X4"));
+                                w.WriteLine("a " + A.ToString("X2"));
+                                w.WriteLine("x " + X.ToString("X2"));
+                                w.WriteLine("y " + Y.ToString("X2"));
+                                w.WriteLine("sp " + SP.ToString("X2"));
+                                w.WriteLine("p " + P.ToString("X2"));
+                                w.WriteLine("intdepth " + IntDepth);
+                                w.WriteLine("mirroring " + Mirroring);
+
+                                // Mapper mapping: the offsets behind each CPU window.
+                                // This is what "which bank is selected" means, and it
+                                // is invisible in a register dump.
+                                w.WriteLine("prg8000 " + MapperStub.ToOffset(0x8000).ToString("X6"));
+                                w.WriteLine("prgA000 " + MapperStub.ToOffset(0xA000).ToString("X6"));
+                                w.WriteLine("prgC000 " + MapperStub.ToOffset(0xC000).ToString("X6"));
+                                w.WriteLine("prgE000 " + MapperStub.ToOffset(0xE000).ToString("X6"));
+
+                                w.WriteLine("ppuctrl " + Ppu.Ctrl.ToString("X2"));
+                                w.WriteLine("ppumask " + Ppu.Mask.ToString("X2"));
+                                w.WriteLine("ppustatus " + Ppu.Status.ToString("X2"));
+                                w.WriteLine("vramaddr " + Ppu.VRamAddr.ToString("X4"));
+                                w.WriteLine("scroll " + Ppu.ScrollX0 + "," + Ppu.ScrollY0);
+
+                                // RAM last, one line of 32 bytes each, so a diff shows
+                                // the exact address that changed.
+                                w.WriteLine("ram " + Ram.Length.ToString("X4"));
+                                for (int i = 0; i < Ram.Length; i += 32)
+                                {
+                                    w.Write("ram ");
+                                    w.Write(i.ToString("X4"));
+                                    w.Write(' ');
+
+                                    for (int j = 0; j < 32 && i + j < Ram.Length; j++)
+                                    {
+                                        w.Write(Ram[i + j].ToString("X2"));
+                                        w.Write(' ');
+                                    }
+
+                                    w.WriteLine();
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Log("dump-state-fail", ex.Message, true);
+                        }
+                    }
+
+                    /// <summary>
+                    /// Writes a PNG of the current frame to the shot directory.
                     /// </summary>
                     public static void CaptureShot(int index)
                     {
@@ -1146,6 +1246,19 @@ namespace NesLifter.Lifting
                 sb.Append(Raw("""
                             Dispatch:
                                 {
+                                    // --force-interpreter routes everything through the
+                                    // interpreter. Running a title both ways and diffing
+                                    // the state dumps is a self-check that needs no
+                                    // external emulator: if the two runs diverge, the
+                                    // lifted code is wrong; if they agree and both fail,
+                                    // the bug is in the runtime (PPU, APU, mapper).
+                                    if (Runtime.ForceInterpreter)
+                                    {
+                                        if (Diag.TraceDispatch) Diag.Dispatch(Runtime.DispatchTarget, "forced interpreter");
+                                        if (!Runtime.Interpret()) { Runtime.Trap("Forced interpreter stopped at $" + Runtime.DispatchTarget.ToString("X4")); return; }
+                                        goto Dispatch;
+                                    }
+
                                     int off = MapperStub.ToOffset(Runtime.DispatchTarget);
                                     switch (off)
                                     {
@@ -1797,7 +1910,12 @@ namespace NesLifter.Lifting
                                 }
 
                                 if (CheckNmi(pc)) { DispatchTarget = NmiVector; return true; }
-                                if (IsStaticLabel(pc)) { DispatchTarget = pc; return true; }
+
+                                // Handing control back to a lifted block is what makes
+                                // the interpreter fast, but under --force-interpreter it
+                                // is an infinite loop: the dispatcher would call straight
+                                // back in at the same PC without executing anything.
+                                if (!ForceInterpreter && IsStaticLabel(pc)) { DispatchTarget = pc; return true; }
 
                                 byte op = Memory.Read(pc);
                                 LastPC = pc; TraceInstruction(pc); InsCount++; AdvanceCycles(OpCycles[op]);
