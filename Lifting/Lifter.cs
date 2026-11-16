@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
@@ -112,11 +112,333 @@ namespace NesLifter.Lifting
             AppendApu(sb);
             AppendMapper(sb);
             AppendAudio(sb);
+            AppendDiag(sb);
+            AppendOverlay(sb);
             AppendForm(sb);
 
             sb.AppendLine("}");
 
             return sb.ToString();
+        }
+
+        // ================================================================
+        // Diagnostics
+        // ================================================================
+
+        /// <summary>
+        /// Emits a structured trace facility for each console component.
+        ///
+        /// A lifted game that renders the wrong thing gives no clue *which*
+        /// component is wrong. These traces are written per subsystem so a
+        /// regression can be localised: a PPU trace that looks correct while the
+        /// screen is wrong points at the renderer, an APU trace that is silent
+        /// points at the channel logic, and a CPU trace that jumps into RAM
+        /// points at the analyser.
+        ///
+        /// Everything is behind a bool check, so the cost when disabled is one
+        /// predictable branch.
+        /// </summary>
+        private void AppendDiag(StringBuilder sb)
+        {
+            sb.Append(Raw("""
+                /// <summary>
+                /// Per-subsystem tracing, off unless enabled from the command line.
+                ///
+                /// Files are written as text so they can be diffed between builds:
+                /// one line per event, fixed column layout, hex values with a
+                /// consistent width. The intent is that "it looks wrong" becomes
+                /// "line 4123 of ppu.log is wrong".
+                /// </summary>
+                static class Diag
+                {
+                    public static bool TraceCpu;
+                    public static bool TracePpu;
+                    public static bool TraceApu;
+                    public static bool TraceMapper;
+                    public static bool TraceMem;
+                    public static bool TraceFrame;
+
+                    public static string Dir = ".";
+
+                    static System.IO.StreamWriter _cpuW;
+                    static System.IO.StreamWriter _ppuW;
+                    static System.IO.StreamWriter _apuW;
+                    static System.IO.StreamWriter _mapW;
+                    static System.IO.StreamWriter _memW;
+                    static System.IO.StreamWriter _frmW;
+
+                    static readonly object _lock = new object();
+
+                    public static bool Any { get { return TraceCpu || TracePpu || TraceApu || TraceMapper || TraceMem || TraceFrame; } }
+
+                    public static void Open()
+                    {
+                        if (!Any) return;
+
+                        try
+                        {
+                            System.IO.Directory.CreateDirectory(Dir);
+
+                            if (TraceCpu) _cpuW = Open("cpu.log");
+                            if (TracePpu) _ppuW = Open("ppu.log");
+                            if (TraceApu) _apuW = Open("apu.log");
+                            if (TraceMapper) _mapW = Open("mapper.log");
+                            if (TraceMem) _memW = Open("mem.log");
+                            if (TraceFrame) _frmW = Open("frame.log");
+                        }
+                        catch (Exception ex)
+                        {
+                            Runtime.Log("diag-open-fail", ex.Message, true);
+                            TraceCpu = TracePpu = TraceApu = TraceMapper = TraceMem = TraceFrame = false;
+                        }
+                    }
+
+                    static System.IO.StreamWriter Open(string name)
+                    {
+                        System.IO.StreamWriter w = new System.IO.StreamWriter(
+                            System.IO.Path.Combine(Dir, name), false, System.Text.Encoding.UTF8);
+
+                        w.AutoFlush = false;
+                        w.WriteLine("# NesLifter trace: " + name);
+                        w.WriteLine("# game=" + Runtime.GameName + " mapper=" + Runtime.Mapper + " (" + Runtime.MapperName + ")");
+                        return w;
+                    }
+
+                    public static void Close()
+                    {
+                        lock (_lock)
+                        {
+                            FlushAll();
+                            Dispose(ref _cpuW);
+                            Dispose(ref _ppuW);
+                            Dispose(ref _apuW);
+                            Dispose(ref _mapW);
+                            Dispose(ref _memW);
+                            Dispose(ref _frmW);
+                        }
+                    }
+
+                    static void Dispose(ref System.IO.StreamWriter w)
+                    {
+                        try { if (w != null) { w.Flush(); w.Dispose(); } }
+                        catch { }
+                        w = null;
+                    }
+
+                    /// <summary>Flushes every trace. Called once per frame so a crash keeps the tail.</summary>
+                    public static void FlushAll()
+                    {
+                        try
+                        {
+                            if (_cpuW != null) _cpuW.Flush();
+                            if (_ppuW != null) _ppuW.Flush();
+                            if (_apuW != null) _apuW.Flush();
+                            if (_mapW != null) _mapW.Flush();
+                            if (_memW != null) _memW.Flush();
+                            if (_frmW != null) _frmW.Flush();
+                        }
+                        catch { }
+                    }
+
+                    // ---- CPU ----
+
+                    /// <summary>
+                    /// One line per executed instruction.
+                    ///
+                    /// Columns are fixed so two traces can be diffed directly:
+                    /// frame, cycle, PC, opcode, A, X, Y, SP, P.
+                    /// </summary>
+                    public static void CpuStep(ushort pc, byte opcode)
+                    {
+                        if (_cpuW == null) return;
+
+                        lock (_lock)
+                        {
+                            _cpuW.Write(Ppu.FrameCount); _cpuW.Write(' ');
+                            _cpuW.Write(Runtime.CpuCycles); _cpuW.Write(' ');
+                            _cpuW.Write("PC="); _cpuW.Write(pc.ToString("X4"));
+                            _cpuW.Write(" OP="); _cpuW.Write(opcode.ToString("X2"));
+                            _cpuW.Write(" A="); _cpuW.Write(Runtime.A.ToString("X2"));
+                            _cpuW.Write(" X="); _cpuW.Write(Runtime.X.ToString("X2"));
+                            _cpuW.Write(" Y="); _cpuW.Write(Runtime.Y.ToString("X2"));
+                            _cpuW.Write(" SP="); _cpuW.Write(Runtime.SP.ToString("X2"));
+                            _cpuW.Write(" P="); _cpuW.Write(Runtime.P.ToString("X2"));
+                            _cpuW.Write(' ');
+                            _cpuW.WriteLine(Disasm(pc));
+                        }
+                    }
+
+                    /// <summary>
+                    /// Decodes the instruction at <paramref name="pc"/> for the trace.
+                    /// Reads through the live memory map, so it reflects the bank
+                    /// that is actually selected.
+                    /// </summary>
+                    static string Disasm(ushort pc)
+                    {
+                        byte op = Memory.Read(pc);
+                        byte lo = Memory.Read((ushort)(pc + 1));
+                        byte hi = Memory.Read((ushort)(pc + 2));
+
+                        switch (op)
+                        {
+                            case 0x4C: return "JMP $" + ((hi << 8) | lo).ToString("X4");
+                            case 0x20: return "JSR $" + ((hi << 8) | lo).ToString("X4");
+                            case 0x60: return "RTS";
+                            case 0x40: return "RTI";
+                            case 0x00: return "BRK";
+                            case 0x6C: return "JMP ($" + ((hi << 8) | lo).ToString("X4") + ")";
+                            case 0xA9: return "LDA #$" + lo.ToString("X2");
+                            case 0xA2: return "LDX #$" + lo.ToString("X2");
+                            case 0xA0: return "LDY #$" + lo.ToString("X2");
+                            case 0x8D: return "STA $" + ((hi << 8) | lo).ToString("X4");
+                            case 0xAD: return "LDA $" + ((hi << 8) | lo).ToString("X4");
+                            case 0x85: return "STA $" + lo.ToString("X2");
+                            case 0xA5: return "LDA $" + lo.ToString("X2");
+                            case 0xD0: return "BNE $" + (pc + 2 + (sbyte)lo).ToString("X4");
+                            case 0xF0: return "BEQ $" + (pc + 2 + (sbyte)lo).ToString("X4");
+                            case 0x4A: return "LSR A";
+                            case 0x0A: return "ASL A";
+                            case 0x2A: return "ROL A";
+                            case 0x6A: return "ROR A";
+                            case 0xEA: return "NOP";
+                            default: return "op=$" + op.ToString("X2");
+                        }
+                    }
+
+                    // ---- PPU ----
+
+                    /// <summary>One line per PPU register read, so $2007 traffic is visible.</summary>
+                    public static void PpuRead(ushort reg, byte value)
+                    {
+                        if (_ppuW == null) return;
+
+                        lock (_lock)
+                        {
+                            _ppuW.Write(Ppu.FrameCount); _ppuW.Write(' ');
+                            _ppuW.Write(Runtime.CpuCycles); _ppuW.Write(' ');
+                            _ppuW.Write("R $"); _ppuW.Write((0x2000 + (reg & 7)).ToString("X4"));
+                            _ppuW.Write(" = $"); _ppuW.Write(value.ToString("X2"));
+                            _ppuW.Write("  sl="); _ppuW.Write(Ppu.CurrentScanline());
+                            _ppuW.Write(" v="); _ppuW.Write(Ppu.VRamAddr.ToString("X4"));
+                            _ppuW.Write(" ctrl=$"); _ppuW.Write(Ppu.Ctrl.ToString("X2"));
+                            _ppuW.WriteLine();
+                        }
+                    }
+
+                    /// <summary>One line per PPU register write.</summary>
+                    public static void PpuWrite(ushort reg, byte value)                    {
+                        if (_ppuW == null) return;
+
+                        lock (_lock)
+                        {
+                            _ppuW.Write(Ppu.FrameCount); _ppuW.Write(' ');
+                            _ppuW.Write(Runtime.CpuCycles); _ppuW.Write(' ');
+                            _ppuW.Write("W $"); _ppuW.Write((0x2000 + (reg & 7)).ToString("X4"));
+                            _ppuW.Write(" = $"); _ppuW.Write(value.ToString("X2"));
+                            _ppuW.Write("  sl="); _ppuW.Write(Ppu.CurrentScanline());
+                            _ppuW.Write(" v="); _ppuW.Write(Ppu.VRamAddr.ToString("X4"));
+                            _ppuW.Write(" t="); _ppuW.Write(Ppu.TempAddr.ToString("X4"));
+                            _ppuW.Write(" ctrl=$"); _ppuW.Write(Ppu.Ctrl.ToString("X2"));
+                            _ppuW.WriteLine();
+                        }
+                    }
+
+                    /// <summary>
+                    /// Per-frame PPU summary: the values that decide what gets drawn.
+                    /// This is the first place to look when a frame is wrong.
+                    /// </summary>
+                    public static void PpuFrame()
+                    {
+                        if (_frmW == null) return;
+
+                        lock (_lock)
+                        {
+                            _frmW.Write(Ppu.FrameCount); _frmW.Write(' ');
+                            _frmW.Write("ctrl=$"); _frmW.Write(Ppu.Ctrl.ToString("X2"));
+                            _frmW.Write(" mask=$"); _frmW.Write(Ppu.Mask.ToString("X2"));
+                            _frmW.Write(" status=$"); _frmW.Write(Ppu.Status.ToString("X2"));
+                            _frmW.Write(" scroll=");
+                            _frmW.Write(Ppu.ScrollX0); _frmW.Write(','); _frmW.Write(Ppu.ScrollY0);
+                            _frmW.Write(" nt="); _frmW.Write(Ppu.BaseNt0);
+                            _frmW.Write(" split=");
+                            _frmW.Write(Ppu.SplitActive ? Ppu.SplitY.ToString() : "off");
+                            _frmW.Write(" oam0=");
+                            _frmW.Write(Ppu.Oam[0]); _frmW.Write(','); _frmW.Write(Ppu.Oam[1]);
+                            _frmW.Write(','); _frmW.Write(Ppu.Oam[2]); _frmW.Write(','); _frmW.Write(Ppu.Oam[3]);
+                            _frmW.Write(" pal0=$"); _frmW.Write(Ppu.Palette[0].ToString("X2"));
+                            _frmW.WriteLine();
+                        }
+                    }
+
+                    // ---- APU ----
+
+                    /// <summary>One line per APU register write, plus the decoded state.</summary>
+                    public static void ApuWrite(ushort addr, byte value)
+                    {
+                        if (_apuW == null) return;
+
+                        lock (_lock)
+                        {
+                            _apuW.Write(Ppu.FrameCount); _apuW.Write(' ');
+                            _apuW.Write(Runtime.CpuCycles); _apuW.Write(' ');
+                            _apuW.Write("W $"); _apuW.Write(addr.ToString("X4"));
+                            _apuW.Write(" = $"); _apuW.Write(value.ToString("X2"));
+                            _apuW.Write("  sq1="); _apuW.Write(Apu.Sq1On() ? "1" : "0");
+                            _apuW.Write(" sq2="); _apuW.Write(Apu.Sq2On() ? "1" : "0");
+                            _apuW.Write(" tri="); _apuW.Write(Apu.TriOn() ? "1" : "0");
+                            _apuW.Write(" noi="); _apuW.Write(Apu.NoiOn() ? "1" : "0");
+                            _apuW.Write(" per=");
+                            _apuW.Write(Apu.Period1); _apuW.Write(','); _apuW.Write(Apu.Period2);
+                            _apuW.Write(','); _apuW.Write(Apu.PeriodT);
+                            _apuW.Write(" len=");
+                            _apuW.Write(Apu.Len1); _apuW.Write(','); _apuW.Write(Apu.Len2);
+                            _apuW.Write(','); _apuW.Write(Apu.LenT); _apuW.Write(','); _apuW.Write(Apu.LenN);
+                            _apuW.WriteLine();
+                        }
+                    }
+
+                    // ---- Mapper ----
+
+                    public static void MapperWrite(ushort addr, byte value)
+                    {
+                        if (_mapW == null) return;
+
+                        lock (_lock)
+                        {
+                            _mapW.Write(Ppu.FrameCount); _mapW.Write(' ');
+                            _mapW.Write("W $"); _mapW.Write(addr.ToString("X4"));
+                            _mapW.Write(" = $"); _mapW.Write(value.ToString("X2"));
+                            _mapW.Write("  prg0=");
+                            _mapW.Write(MapperStub.ToOffset(0x8000).ToString("X6"));
+                            _mapW.Write(" prgE=");
+                            _mapW.Write(MapperStub.ToOffset(0xE000).ToString("X6"));
+                            _mapW.WriteLine();
+                        }
+                    }
+
+                    // ---- Memory ----
+
+                    /// <summary>
+                    /// Traces an unusual access: a read or write that lands outside
+                    /// the regions a well-behaved game uses.
+                    /// </summary>
+                    public static void MemAccess(char kind, ushort addr, byte value)
+                    {
+                        if (_memW == null) return;
+
+                        lock (_lock)
+                        {
+                            _memW.Write(Ppu.FrameCount); _memW.Write(' ');
+                            _memW.Write(kind); _memW.Write(" $");
+                            _memW.Write(addr.ToString("X4"));
+                            _memW.Write(" = $"); _memW.Write(value.ToString("X2"));
+                            _memW.Write(" PC=$"); _memW.Write(Runtime.LastPC.ToString("X4"));
+                            _memW.WriteLine();
+                        }
+                    }
+                }
+
+                """));
         }
 
         // ================================================================
@@ -133,6 +455,8 @@ namespace NesLifter.Lifting
                     {
                         int headlessFrames = 0;
                         bool headless = false;
+                        string shotDir = null;
+
                         for (int i = 0; i < args.Length; i++)
                         {
                             if (args[i] == "--headless")
@@ -154,7 +478,31 @@ namespace NesLifter.Lifting
                             {
                                 Runtime.ExitAfterIcon = true;
                             }
+                            else if (args[i] == "--shots" && i + 1 < args.Length)
+                            {
+                                // Comma-separated frame numbers to capture.
+                                Runtime.ParseShotFrames(args[++i]);
+                            }
+                            else if (args[i] == "--shot-dir" && i + 1 < args.Length)
+                            {
+                                shotDir = args[++i];
+                            }
+                            else if (args[i] == "--apu-trace" && i + 1 < args.Length)
+                            {
+                                Runtime.ApuTracePath = args[++i];
+                            }
+                            else if (args[i] == "--diag" && i + 1 < args.Length)
+                            {
+                                // Comma-separated subsystems: cpu,ppu,apu,mapper,mem,frame
+                                Runtime.ParseDiag(args[++i]);
+                            }
+                            else if (args[i] == "--diag-dir" && i + 1 < args.Length)
+                            {
+                                Diag.Dir = args[++i];
+                            }
                         }
+
+                        if (shotDir != null) Runtime.ShotDir = shotDir;
 
                         if (headless) return RunHeadless(headlessFrames > 0 ? headlessFrames : 600);
 
@@ -181,9 +529,12 @@ namespace NesLifter.Lifting
                     }
 
                     /// <summary>
-                    /// Runs the lifted game without a window. Used by CI and by
-                    /// NesLifter --selftest to prove the generated assembly executes.
+                    /// Runs the lifted game without a window. Used by CI, by
+                    /// NesLifter --selftest, and by the screenshot tool.
+                    ///
                     /// Exit code 0 = reached the frame budget without trapping.
+                    /// With --shots, a PNG per requested frame is written to the
+                    /// shot directory so rendering can be inspected offline.
                     /// </summary>
                     static int RunHeadless(int frames)
                     {
@@ -191,16 +542,55 @@ namespace NesLifter.Lifting
                         Runtime.ThrottleEnabled = false;
                         Runtime.Init();
 
+                        // Create the output directory up front: the audio trace opens
+                        // its file on frame 1, long before the first screenshot would
+                        // have created the folder, and a missing path silently drops
+                        // the opening seconds of every trace.
+                        try { System.IO.Directory.CreateDirectory(Runtime.ShotDir); } catch { }
+
                         Thread cpuThread = new Thread(new ThreadStart(Runtime.CpuThread));
                         cpuThread.IsBackground = true;
                         cpuThread.Start();
 
-                        long deadline = Environment.TickCount64 + 60000;
-                        while (Ppu.FrameCount < frames && Environment.TickCount64 < deadline)
+                        int shotIndex = 0;
+                        int tracedFrames = 0;
+
+                        // The CPU thread publishes exactly one completed frame and then
+                        // parks, so "frame N" here means frame N: no frame is skipped
+                        // between the request and the capture.
+                        while (Ppu.FrameCount < frames)
                         {
-                            if (Runtime.CpuState == "Trap" || Runtime.CpuState == "Exited") break;
-                            Thread.Sleep(2);
+                            if (!Runtime.HeadlessWaitFrame(20000)) break;
+
+                            while (shotIndex < Runtime.ShotFrames.Count &&
+                                   Ppu.FrameCount >= Runtime.ShotFrames[shotIndex])
+                            {
+                                Runtime.CaptureShot(shotIndex);
+                                shotIndex++;
+                            }
+
+                            if (Runtime.ApuTracePath != null && tracedFrames < frames)
+                            {
+                                Audio.TraceFrame();
+                                tracedFrames++;
+                            }
+
+                            bool stopped = Runtime.CpuState == "Trap" || Runtime.CpuState == "Exited";
+
+                            Runtime.HeadlessRelease();
+
+                            if (stopped) break;
                         }
+
+                        // Flush any shots that were requested after the last frame we saw.
+                        while (shotIndex < Runtime.ShotFrames.Count)
+                        {
+                            Runtime.CaptureShot(shotIndex);
+                            shotIndex++;
+                        }
+
+                        Runtime.HeadlessFinish();
+                        Diag.Close();
 
                         Console.WriteLine("headless: frames=" + Ppu.FrameCount + " instructions=" + Runtime.InsCount + " state=" + Runtime.CpuState);
                         if (Runtime.LastError != null)
@@ -261,6 +651,140 @@ namespace NesLifter.Lifting
                     public static int IconSamples;
                     public static int IconBestScore;
                     public static byte[] IconBest;
+
+                    // Headless screenshot capture: (frame, path) pairs.
+                    public static readonly System.Collections.Generic.List<int> ShotFrames = new System.Collections.Generic.List<int>();
+                    public static string ShotDir = ".";
+
+                    // ---- headless frame gate ----
+                    //
+                    // Unthrottled, the CPU thread runs thousands of frames per
+                    // second. A driver asking for "frame 120" would never see it,
+                    // and an audio trace would cover minutes of sound instead of
+                    // the two seconds requested. So in headless mode the CPU
+                    // thread parks after every frame until the driver has taken
+                    // its screenshot and sample.
+
+                    public static volatile bool HeadlessDone;
+
+                    static readonly System.Threading.SemaphoreSlim HeadlessReady =
+                        new System.Threading.SemaphoreSlim(0);
+                    static readonly System.Threading.SemaphoreSlim HeadlessAck =
+                        new System.Threading.SemaphoreSlim(0);
+
+                    /// <summary>
+                    /// Called on the CPU thread once a frame is complete. Publishes
+                    /// the frame and blocks until the driver releases it.
+                    /// </summary>
+                    public static void HeadlessPublishFrame()
+                    {
+                        if (HeadlessDone) return;
+
+                        HeadlessReady.Release();
+                        HeadlessAck.Wait();
+                    }
+
+                    /// <summary>Waits for a published frame. False when the CPU thread died.</summary>
+                    public static bool HeadlessWaitFrame(int timeoutMs)
+                    {
+                        return HeadlessReady.Wait(timeoutMs);
+                    }
+
+                    /// <summary>Lets the CPU thread run on to the next frame.</summary>
+                    public static void HeadlessRelease()
+                    {
+                        try { HeadlessAck.Release(); } catch { }
+                    }
+
+                    /// <summary>Stops gating so the CPU thread stops parking.</summary>
+                    public static void HeadlessFinish()
+                    {
+                        HeadlessDone = true;
+                        HeadlessRelease();
+                    }
+
+                    /// <summary>
+                    /// Parses "--shots 60,120,300" into the capture list.
+                    /// </summary>
+                    public static void ParseShotFrames(string spec)
+                    {
+                        if (string.IsNullOrEmpty(spec)) return;
+
+                        foreach (string part in spec.Split(','))
+                        {
+                            int frame;
+                            if (int.TryParse(part.Trim(), out frame) && frame >= 0)
+                                ShotFrames.Add(frame);
+                        }
+                    }
+
+                    /// <summary>
+                    /// Renders the current PPU state and writes it as a PNG.
+                    ///
+                    /// The screenshot is taken from the *live* PPU, not from the
+                    /// renderer's snapshot, so what lands on disk is what the PPU
+                    /// would show at this instant.
+                    /// </summary>
+                    public static void CaptureShot(int index)
+                    {
+                        try
+                        {
+                            Ppu.RenderScreen();
+
+                            System.IO.Directory.CreateDirectory(ShotDir);
+
+                            string path = System.IO.Path.Combine(
+                                ShotDir,
+                                "frame_" + ShotFrames[index].ToString("D6") + ".png");
+
+                            using (Bitmap bmp = new Bitmap(256, 240, PixelFormat.Format32bppArgb))
+                            {
+                                for (int y = 0; y < 240; y++)
+                                {
+                                    for (int x = 0; x < 256; x++)
+                                    {
+                                        int i = (y * 256 + x) * 4;
+                                        bmp.SetPixel(x, y, Color.FromArgb(255, Ppu.Screen[i + 2], Ppu.Screen[i + 1], Ppu.Screen[i]));
+                                    }
+                                }
+
+                                bmp.Save(path, ImageFormat.Png);
+                            }
+
+                            Console.WriteLine("shot: " + path);
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.Error.WriteLine("shot failed: " + ex.Message);
+                        }
+                    }
+
+                    /// <summary>When set, the APU writes a raw 8-bit mono trace here.</summary>
+                    public static string ApuTracePath;
+
+                    /// <summary>
+                    /// Parses "--diag cpu,ppu" into the per-subsystem flags.
+                    /// "all" enables everything.
+                    /// </summary>
+                    public static void ParseDiag(string spec)
+                    {
+                        if (string.IsNullOrEmpty(spec)) return;
+
+                        foreach (string raw in spec.Split(','))
+                        {
+                            switch (raw.Trim().ToLowerInvariant())
+                            {
+                                case "all": Diag.TraceCpu = Diag.TracePpu = Diag.TraceApu = Diag.TraceMapper = Diag.TraceMem = Diag.TraceFrame = true; break;
+                                case "cpu": Diag.TraceCpu = true; break;
+                                case "ppu": Diag.TracePpu = true; break;
+                                case "apu": Diag.TraceApu = true; break;
+                                case "mapper": Diag.TraceMapper = true; break;
+                                case "mem": Diag.TraceMem = true; break;
+                                case "frame": Diag.TraceFrame = true; break;
+                            }
+                        }
+                    }
+
                     public static long InsCount;
                     public static ushort LastPC;
                     public static ushort DispatchTarget;
@@ -298,7 +822,79 @@ namespace NesLifter.Lifting
 
                     // Frame sync
                     public static object FrameLock = new object();
-                    public static volatile bool OsdFull;
+
+                    // ---- overlay-facing state ----
+                    // These exist so the overlay can read and change engine state
+                    // without reaching into the renderer or the audio thread.
+
+                    /// <summary>Window scale requested by the overlay; 0 means "unchanged".</summary>
+                    public static int RequestedScale;
+
+                    /// <summary>Silences the mixer without closing the audio device.</summary>
+                    public static volatile bool MuteAll;
+
+                    /// <summary>Routes every dispatch through the interpreter. Debug only.</summary>
+                    public static volatile bool ForceInterpreter;
+
+                    /// <summary>Writes the last instructions to the trace ring faster. Debug only.</summary>
+                    public static volatile bool TraceEnabled;
+
+                    /// <summary>Smoothed frames per second, updated once per frame.</summary>
+                    public static double MeasuredFps;
+
+                    static long _fpsWindowStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                    static int _fpsWindowFrames;
+
+                    /// <summary>Called once per frame to maintain MeasuredFps.</summary>
+                    public static void SampleFps()
+                    {
+                        _fpsWindowFrames++;
+
+                        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+                        long elapsed = now - _fpsWindowStart;
+
+                        if (elapsed < System.Diagnostics.Stopwatch.Frequency / 2) return;
+
+                        MeasuredFps = _fpsWindowFrames * (double)System.Diagnostics.Stopwatch.Frequency / elapsed;
+                        _fpsWindowFrames = 0;
+                        _fpsWindowStart = now;
+                    }
+
+                    /// <summary>Asks the window to change its integer scale.</summary>
+                    public static void RequestScale(int scale)
+                    {
+                        RequestedScale = scale;
+                    }
+
+                    /// <summary>Last few log lines, newest last, for the overlay's Log tab.</summary>
+                    public static System.Collections.Generic.List<string> RecentLog(int count)
+                    {
+                        System.Collections.Generic.List<string> result = new System.Collections.Generic.List<string>();
+
+                        lock (LogRingLock)
+                        {
+                            int start = Math.Max(0, LogRing.Count - count);
+
+                            for (int i = start; i < LogRing.Count; i++)
+                                result.Add(LogRing[i]);
+                        }
+
+                        return result;
+                    }
+
+                    static readonly object LogRingLock = new object();
+                    static readonly System.Collections.Generic.List<string> LogRing = new System.Collections.Generic.List<string>(256);
+
+                    static void PushLogRing(string line)
+                    {
+                        lock (LogRingLock)
+                        {
+                            LogRing.Add(line);
+
+                            if (LogRing.Count > 256)
+                                LogRing.RemoveAt(0);
+                        }
+                    }
 
                     // Input
                     public static volatile byte Joy1Buttons;
@@ -314,7 +910,9 @@ namespace NesLifter.Lifting
                         A = 0; X = 0; Y = 0; SP = 0xFD; P = 0x24;
                         DispatchTarget = 0; CpuState = "Init";
                         Memory.Reset(); Ppu.Reset(); Apu.Reset(); MapperStub.Power();
+                        Diag.Open();
                         Log("session", "=== game started; mapper=" + Mapper + "; log=" + LogPath + " ===", true);
+                        if (Diag.Any) Log("diag", "tracing to " + Diag.Dir, true);
                     }
 
                     public static void CpuThread()
@@ -334,6 +932,10 @@ namespace NesLifter.Lifting
                         {
                             CpuState = "Exception";
                             OnCpuException(ex);
+                        }
+                        finally
+                        {
+                            Diag.Close();
                         }
                     }
 
@@ -418,18 +1020,25 @@ namespace NesLifter.Lifting
 
                 Line(sb, "Runtime.LastPC = 0x" + hex + "; Runtime.TraceInstruction(0x" + hex + ");");
 
+                // CPU trace hook: one line per instruction, only when enabled.
+                if (inst != null)
+                    Line(sb, "if (Diag.TraceCpu) Diag.CpuStep(0x" + hex + ", 0x" + inst.Opcode.ToString("X2") + ");");
+                else
+                    Line(sb, "if (Diag.TraceCpu) Diag.CpuStep(0x" + hex + ", 0x00);");
+
                 if (inst != null && inst.Info != null)
                     Line(sb, "Runtime.InsCount++; Runtime.AdvanceCycles(" + inst.Info.Cycles + ");");
                 else
                     Line(sb, "Runtime.InsCount++; Runtime.AdvanceCycles(1);");
 
+                // The NMI/IRQ vectors live at the top of the address space, which
+                // is fixed on most boards but remapped wholesale on AxROM-style
+                // mappers. Resolving through the dispatcher costs one indirect
+                // branch per frame and is correct on both.
                 if (_nmiOffset >= 0)
-                    Line(sb, "if (Runtime.CheckNmi(0x" + hex + ")) goto " + Label(_nmiOffset) + ";");
+                    Line(sb, "if (Runtime.CheckNmi(0x" + hex + ")) { Runtime.DispatchTarget = Runtime.NmiVector; goto Dispatch; }");
 
-                if (_irqOffset >= 0)
-                    Line(sb, "if (Runtime.CheckIrq(0x" + hex + ")) goto " + Label(_irqOffset) + ";");
-                else
-                    Line(sb, "if (Runtime.CheckIrq(0x" + hex + ")) { Runtime.DispatchTarget = Runtime.IrqVector; goto Dispatch; }");
+                Line(sb, "if (Runtime.CheckIrq(0x" + hex + ")) { Runtime.DispatchTarget = Runtime.IrqVector; goto Dispatch; }");
 
                 if (inst != null)
                 {
@@ -468,6 +1077,7 @@ namespace NesLifter.Lifting
                                     if (SuppressedLogs.TryGetValue(category, out suppressed)) SuppressedLogs[category] = 0;
                                     LastLogAt[category] = now;
                                     string suffix = suppressed == 0 ? string.Empty : " (coalesced " + suppressed + " repeats)";
+                                    PushLogRing(DateTime.Now.ToString("HH:mm:ss") + " [" + category + "] " + message + suffix);
                                     System.IO.File.AppendAllText(LogPath, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + " [" + category + "] " + message + suffix + Environment.NewLine);
                                 }
                             }
@@ -593,7 +1203,12 @@ namespace NesLifter.Lifting
                                 NmiPending = true;
                                 Ppu.Status = (byte)(Ppu.Status | 0x80);
                                 Ppu.BeginFrame();
+                                Runtime.SampleFps();
+                                if (Diag.Any) Diag.FlushAll();
                                 Log("nmi", "vblank/frame=" + Ppu.FrameCount + " cycles=" + CpuCycles + " pc=$" + pc.ToString("X4"), false);
+
+                                // Park here so a headless driver can capture this exact frame.
+                                if (Headless) Runtime.HeadlessPublishFrame();
                             }
 
                             if (InNmi && (CpuCycles - NmiEnterCycles) > 1500000L) InNmi = false;
@@ -1141,6 +1756,10 @@ namespace NesLifter.Lifting
                             if (addr == 0x4014) { Ppu.DmaOam(value); return; }
                             Apu.WriteReg(addr, value); return;
                         }
+
+                        if (Diag.TraceMapper) Diag.MapperWrite(addr, value);
+                        if (Diag.TraceMem && addr < 0x6000) Diag.MemAccess('W', addr, value);
+
                         MapperStub.Write(addr, value);
                     }
 
@@ -1233,6 +1852,13 @@ namespace NesLifter.Lifting
 
                     public static byte ReadReg(ushort reg)
                     {
+                        byte readValue = ReadRegCore(reg);
+                        if (Diag.TracePpu) Diag.PpuRead(reg, readValue);
+                        return readValue;
+                    }
+
+                    static byte ReadRegCore(ushort reg)
+                    {
                         switch (reg & 7)
                         {
                             case 2:
@@ -1267,6 +1893,8 @@ namespace NesLifter.Lifting
 
                     public static void WriteReg(ushort reg, byte value)
                     {
+                        if (Diag.TracePpu) Diag.PpuWrite(reg, value);
+
                         switch (reg & 7)
                         {
                             case 0: Ctrl = value; TempAddr = (TempAddr & 0xF3FF) | ((value & 3) << 10); break;
@@ -1407,6 +2035,8 @@ namespace NesLifter.Lifting
 
                     public static void BeginFrame()
                     {
+                        if (Diag.TraceFrame) Diag.PpuFrame();
+
                         // Capture the *completed* visible frame before starting its next VBlank/NMI.
                         // Scroll/split must be captured with VRAM; mixing them caused the jumping horizon.
                         RenderState back = RenderBack;
@@ -1522,6 +2152,12 @@ namespace NesLifter.Lifting
                             bool clipLeftSpr = (renderMask & 0x04) == 0;
                             int[] lineCount = new int[240];
 
+                            // Hardware draws at most eight sprites per scanline. Games
+                            // that flicker sprites deliberately rely on that limit, so it
+                            // is on by default; the overlay can lift it to inspect what a
+                            // game is actually putting in OAM.
+                            int sprLimit = Overlay.SpriteLimit ? 8 : 64;
+
                             for (int i = 0; i < 64; i++)
                             {
                                 int sy2 = renderOam[i * 4] + 1;
@@ -1546,7 +2182,7 @@ namespace NesLifter.Lifting
                                 {
                                     int probe = sy2 + py;
                                     if ((uint)probe >= 240) continue;
-                                    if (lineCount[probe] >= 8) continue;
+                                    if (lineCount[probe] >= sprLimit) continue;
                                     visible = true;
                                     break;
                                 }
@@ -1556,7 +2192,7 @@ namespace NesLifter.Lifting
                                 {
                                     int screenY = sy2 + py;
                                     if ((uint)screenY >= 240) continue;
-                                    if (lineCount[screenY] >= 8) continue;
+                                    if (lineCount[screenY] >= sprLimit) continue;
                                     lineCount[screenY]++;
                                     int srcY = flipV ? (height - 1 - py) : py;
                                     int t = tileIndex;
@@ -1614,27 +2250,68 @@ namespace NesLifter.Lifting
         private void AppendApu(StringBuilder sb)
         {
             sb.Append(Raw("""
+                /// <summary>
+                /// The 2A03 audio unit: two pulse channels, triangle, noise and a
+                /// DMC stub.
+                ///
+                /// Structure mirrors hardware: a frame sequencer clocks envelope,
+                /// sweep and length at 240 Hz and 120 Hz, while the mixer runs at
+                /// the output sample rate and reads the resulting channel state.
+                /// That split matters вЂ” games rely on length counters expiring at
+                /// the hardware rate, and on $4015 reporting which channels are
+                /// still alive.
+                /// </summary>
                 static class Apu
                 {
-                    public static volatile int Env1, Env2, EnvN;
-                    public static volatile int EnvDiv1, EnvDiv2, EnvDivN;
-                    public static volatile bool EnvStart1, EnvStart2, EnvStartN;
                     public static byte[] Regs = new byte[0x18];
-                    public static volatile int Period1, Period2, PeriodT;
+
+                    // ---- envelope ----
+                    public static volatile int Env1, Env2, EnvN;
+                    static int _envDiv1, _envDiv2, _envDivN;
+                    static bool _envStart1, _envStart2, _envStartN;
+
+                    // ---- length counters ----
                     public static volatile int Len1, Len2, LenT, LenN;
+
+                    // ---- periods ----
+                    public static volatile int Period1, Period2, PeriodT;
+
+                    // ---- sweep (pulse 1/2) ----
+                    static int _sweepDiv1, _sweepDiv2;
+                    static bool _sweepReload1, _sweepReload2;
+                    static int _sweepPeriod1, _sweepPeriod2;
+
+                    // ---- triangle linear counter ----
                     public static volatile int LinT;
                     public static volatile bool LinReload;
-                    static int _lenDiv;
+
+                    // ---- frame sequencer ----
                     static int _frameCycleAcc;
-                    public static readonly int[] LengthTable = new int[32] {10,254,20,2,40,4,80,6,160,8,60,10,14,12,26,14,12,16,24,18,48,20,96,22,192,24,72,26,16,28,32,30};
+                    static int _halfFrame;
+                    static int _frameMode;          // 0 = 4-step, 1 = 5-step
+                    static bool _frameIrqInhibit;
+
+                    public static readonly int[] LengthTable = new int[32]
+                    {
+                        10,254,20,2,40,4,80,6,160,8,60,10,14,12,26,14,
+                        12,16,24,18,48,20,96,22,192,24,72,26,16,28,32,30
+                    };
 
                     public static void Reset()
                     {
                         Env1 = Env2 = EnvN = 0;
-                        EnvDiv1 = EnvDiv2 = EnvDivN = 0;
-                        EnvStart1 = EnvStart2 = EnvStartN = false;
+                        _envDiv1 = _envDiv2 = _envDivN = 0;
+                        _envStart1 = _envStart2 = _envStartN = false;
                         Array.Clear(Regs, 0, Regs.Length);
-                        Period1 = Period2 = PeriodT = 0; Len1 = Len2 = LenT = LenN = 0; LinT = 0; LinReload = false; _lenDiv = 0; _frameCycleAcc = 0;
+                        Period1 = Period2 = PeriodT = 0;
+                        Len1 = Len2 = LenT = LenN = 0;
+                        LinT = 0; LinReload = false;
+                        _sweepDiv1 = _sweepDiv2 = 0;
+                        _sweepReload1 = _sweepReload2 = false;
+                        _sweepPeriod1 = _sweepPeriod2 = 0;
+                        _frameCycleAcc = 0; _halfFrame = 0;
+                        _frameMode = 0; _frameIrqInhibit = false;
+
                         if (!Runtime.Headless) Audio.TryStart();
                     }
 
@@ -1642,22 +2319,100 @@ namespace NesLifter.Lifting
                     {
                         if (addr == 0x4016) return Runtime.JoyRead1();
                         if (addr == 0x4017) return Runtime.JoyRead2();
-                        if (addr == 0x4015) return 0;
+
+                        if (addr == 0x4015)
+                        {
+                            // $4015 reports which channels still have length left.
+                            // Games poll this to know when a sound finished; returning
+                            // zero makes them think every channel is dead, so they
+                            // retrigger constantly and the audio stutters.
+                            int status = 0;
+                            if (Len1 > 0) status |= 0x01;
+                            if (Len2 > 0) status |= 0x02;
+                            if (LenT > 0) status |= 0x04;
+                            if (LenN > 0) status |= 0x08;
+                            if (Runtime.IrqPending) status |= 0x40;
+                            return (byte)status;
+                        }
+
                         if (addr >= 0x4000 && addr <= 0x4017) return Regs[addr - 0x4000];
                         return 0;
                     }
 
                     public static void WriteReg(ushort addr, byte value)
                     {
+                        if (Diag.TraceApu) Diag.ApuWrite(addr, value);
+
                         if (addr == 0x4016) { Runtime.JoyStrobe(value); Regs[addr - 0x4000] = value; return; }
                         if (addr >= 0x4000 && addr <= 0x4017) Regs[addr - 0x4000] = value;
 
                         switch (addr)
                         {
-                            case 0x4003: Period1 = ((value & 7) << 8) | Regs[0x02]; Len1 = LengthTable[(value >> 3) & 0x1F]; EnvStart1 = true; break;
-                            case 0x4007: Period2 = ((value & 7) << 8) | Regs[0x06]; Len2 = LengthTable[(value >> 3) & 0x1F]; EnvStart2 = true; break;
-                            case 0x400B: PeriodT = ((value & 7) << 8) | Regs[0x0A]; LenT = LengthTable[(value >> 3) & 0x1F]; LinReload = true; break;
-                            case 0x400F: LenN = LengthTable[(value >> 3) & 0x1F]; EnvStartN = true; break;
+                            case 0x4000:
+                                _envStart1 = true;
+                                break;
+
+                            case 0x4001:
+                                _sweepReload1 = true;
+                                break;
+
+                            case 0x4002:
+                                Period1 = (Period1 & 0x700) | value;
+                                break;
+
+                            case 0x4003:
+                                Period1 = (Period1 & 0x0FF) | ((value & 7) << 8);
+                                if (Sq1Enabled()) Len1 = LengthTable[(value >> 3) & 0x1F];
+                                _envStart1 = true;
+                                break;
+
+                            case 0x4004:
+                                _envStart2 = true;
+                                break;
+
+                            case 0x4005:
+                                _sweepReload2 = true;
+                                break;
+
+                            case 0x4006:
+                                Period2 = (Period2 & 0x700) | value;
+                                break;
+
+                            case 0x4007:
+                                Period2 = (Period2 & 0x0FF) | ((value & 7) << 8);
+                                if (Sq2Enabled()) Len2 = LengthTable[(value >> 3) & 0x1F];
+                                _envStart2 = true;
+                                break;
+
+                            case 0x4008:
+                                // Linear counter reload value, and the control flag
+                                // that decides whether it keeps decrementing.
+                                LinReload = true;
+                                break;
+
+                            case 0x400A:
+                                PeriodT = (PeriodT & 0x700) | value;
+                                break;
+
+                            case 0x400B:
+                                PeriodT = (PeriodT & 0x0FF) | ((value & 7) << 8);
+                                if (TriEnabled()) LenT = LengthTable[(value >> 3) & 0x1F];
+                                LinReload = true;
+                                break;
+
+                            case 0x400C:
+                                _envStartN = true;
+                                break;
+
+                            case 0x400E:
+                                // Noise period comes straight from Regs[0x0E].
+                                break;
+
+                            case 0x400F:
+                                if (NoiEnabled()) LenN = LengthTable[(value >> 3) & 0x1F];
+                                _envStartN = true;
+                                break;
+
                             case 0x4015:
                                 if ((value & 1) == 0) Len1 = 0;
                                 if ((value & 2) == 0) Len2 = 0;
@@ -1665,42 +2420,204 @@ namespace NesLifter.Lifting
                                 if ((value & 8) == 0) LenN = 0;
                                 Audio.OnStatusChange(value);
                                 break;
+
+                            case 0x4017:
+                                // Frame counter mode. 5-step mode is quieter and
+                                // suppresses the frame IRQ; games use it for music
+                                // timing, so it has to be honoured.
+                                _frameMode = (value & 0x80) != 0 ? 1 : 0;
+                                _frameIrqInhibit = (value & 0x40) != 0;
+
+                                if (_frameIrqInhibit)
+                                    Runtime.IrqPending = false;
+
+                                _frameCycleAcc = 0;
+                                _halfFrame = 0;
+
+                                if (_frameMode == 1)
+                                    ClockHalfFrame();
+
+                                break;
                         }
                     }
+
+                    // =========================================================
+                    // Frame sequencer
+                    // =========================================================
 
                     public static void ClockCpu(int cycles)
                     {
-                        // NTSC APU quarter-frame clock: 1,789,773 / 240 в‰€ 7,457 CPU cycles.
+                        // NTSC: 1,789,773 Hz / 240 quarter-frames = 7,457 cycles.
                         _frameCycleAcc += cycles;
-                        while (_frameCycleAcc >= 7457) { _frameCycleAcc -= 7457; Clock240(); }
-                    }
 
-                    public static void Clock240()
-                    {
-                        if (EnvStart1) { EnvStart1 = false; Env1 = 15; EnvDiv1 = 0; }
-                        else { if (++EnvDiv1 >= ((Regs[0x00] & 0x0F) + 1)) { EnvDiv1 = 0; if (Env1 > 0) Env1--; else if ((Regs[0x00] & 0x20) != 0) Env1 = 15; } }
-                        if (EnvStart2) { EnvStart2 = false; Env2 = 15; EnvDiv2 = 0; }
-                        else { if (++EnvDiv2 >= ((Regs[0x04] & 0x0F) + 1)) { EnvDiv2 = 0; if (Env2 > 0) Env2--; else if ((Regs[0x04] & 0x20) != 0) Env2 = 15; } }
-                        if (EnvStartN) { EnvStartN = false; EnvN = 15; EnvDivN = 0; }
-                        else { if (++EnvDivN >= ((Regs[0x0C] & 0x0F) + 1)) { EnvDivN = 0; if (EnvN > 0) EnvN--; else if ((Regs[0x0C] & 0x20) != 0) EnvN = 15; } }
-                        if (LinReload) LinT = Regs[0x08] & 0x7F;
-                        else if (LinT > 0) LinT--;
-                        if ((Regs[0x08] & 0x80) == 0) LinReload = false;
-                        _lenDiv++;
-                        if (_lenDiv >= 2)
+                        while (_frameCycleAcc >= 7457)
                         {
-                            _lenDiv = 0;
-                            if (Len1 > 0 && (Regs[0x00] & 0x20) == 0) Len1--;
-                            if (Len2 > 0 && (Regs[0x04] & 0x20) == 0) Len2--;
-                            if (LenT > 0 && (Regs[0x08] & 0x80) == 0) LenT--;
-                            if (LenN > 0 && (Regs[0x0C] & 0x20) == 0) LenN--;
+                            _frameCycleAcc -= 7457;
+                            ClockQuarterFrame();
                         }
                     }
 
-                    public static bool Sq1On() { return (Regs[0x15] & 1) != 0 && Len1 > 0; }
-                    public static bool Sq2On() { return (Regs[0x15] & 2) != 0 && Len2 > 0; }
-                    public static bool TriOn() { return (Regs[0x15] & 4) != 0 && LenT > 0 && LinT > 0; }
-                    public static bool NoiOn() { return (Regs[0x15] & 8) != 0 && LenN > 0; }
+                    static void ClockQuarterFrame()
+                    {
+                        ClockEnvelope(ref Env1, ref _envDiv1, ref _envStart1, Regs[0x00]);
+                        ClockEnvelope(ref Env2, ref _envDiv2, ref _envStart2, Regs[0x04]);
+                        ClockEnvelope(ref EnvN, ref _envDivN, ref _envStartN, Regs[0x0C]);
+
+                        // Triangle linear counter.
+                        if (LinReload)
+                            LinT = Regs[0x08] & 0x7F;
+                        else if (LinT > 0)
+                            LinT--;
+
+                        // Bit 7 of $4008 holds the counter: when clear, the reload
+                        // flag is cleared too, so the counter runs down once.
+                        if ((Regs[0x08] & 0x80) == 0)
+                            LinReload = false;
+
+                        // Length and sweep run at half the envelope rate.
+                        _halfFrame++;
+
+                        if (_halfFrame >= 2)
+                        {
+                            _halfFrame = 0;
+                            ClockHalfFrame();
+                        }
+                    }
+
+                    static void ClockHalfFrame()
+                    {
+                        // Length counters, halted by bit 5 of the channel register.
+                        if (Len1 > 0 && (Regs[0x00] & 0x20) == 0) Len1--;
+                        if (Len2 > 0 && (Regs[0x04] & 0x20) == 0) Len2--;
+                        if (LenT > 0 && (Regs[0x08] & 0x80) == 0) LenT--;
+                        if (LenN > 0 && (Regs[0x0C] & 0x20) == 0) LenN--;
+
+                        ClockSweep(ref Period1, ref _sweepDiv1, ref _sweepReload1, ref _sweepPeriod1, Regs[0x01], negateOnesComplement: true);
+                        ClockSweep(ref Period2, ref _sweepDiv2, ref _sweepReload2, ref _sweepPeriod2, Regs[0x05], negateOnesComplement: false);
+                    }
+
+                    static void ClockEnvelope(ref int env, ref int div, ref bool start, byte reg)
+                    {
+                        if (start)
+                        {
+                            start = false;
+                            env = 15;
+                            div = 0;
+                            return;
+                        }
+
+                        int period = (reg & 0x0F) + 1;
+
+                        if (++div >= period)
+                        {
+                            div = 0;
+
+                            if (env > 0)
+                            {
+                                env--;
+                            }
+                            else if ((reg & 0x20) != 0)
+                            {
+                                // Loop flag: restart from 15.
+                                env = 15;
+                            }
+                        }
+                    }
+
+                    /// <summary>
+                    /// One half-frame of a pulse sweep unit.
+                    ///
+                    /// Without this, every pitch sweep in every game is wrong:
+                    /// Mario's jump, the coin, the power-up and most sound effects
+                    /// are sweeps rather than fixed tones.
+                    /// </summary>
+                    static void ClockSweep(
+                        ref int period,
+                        ref int divider,
+                        ref bool reload,
+                        ref int sweepPeriod,
+                        byte reg,
+                        bool negateOnesComplement)
+                    {
+                        int shift = reg & 7;
+                        int step = (reg >> 4) & 7;
+                        bool enabled = (reg & 0x80) != 0;
+
+                        if (divider == 0 && enabled && shift > 0)
+                        {
+                            int delta = period >> shift;
+                            int target = (reg & 0x08) != 0
+                                ? period - delta - (negateOnesComplement ? 1 : 0)
+                                : period + delta;
+
+                            if (target >= 0 && target <= 0x7FF)
+                                period = target;
+
+                            sweepPeriod = target;
+                        }
+
+                        if (divider == 0 || reload)
+                        {
+                            divider = step;
+                            reload = false;
+                        }
+                        else
+                        {
+                            divider--;
+                        }
+                    }
+
+                    // =========================================================
+                    // Channel state for the mixer
+                    // =========================================================
+
+                    public static bool Sq1Enabled() { return (Regs[0x15] & 0x01) != 0; }
+                    public static bool Sq2Enabled() { return (Regs[0x15] & 0x02) != 0; }
+                    public static bool TriEnabled() { return (Regs[0x15] & 0x04) != 0; }
+                    public static bool NoiEnabled() { return (Regs[0x15] & 0x08) != 0; }
+
+                    /// <summary>
+                    /// A pulse channel is silenced by a very low period or by a sweep
+                    /// target that overflows, exactly like hardware.
+                    /// </summary>
+                    public static bool Sq1On()
+                    {
+                        if (!Sq1Enabled() || Len1 <= 0) return false;
+                        if (Period1 < 8 || Period1 > 0x7FF) return false;
+                        if (SweepMutes(Regs[0x01], Period1, true)) return false;
+                        return true;
+                    }
+
+                    public static bool Sq2On()
+                    {
+                        if (!Sq2Enabled() || Len2 <= 0) return false;
+                        if (Period2 < 8 || Period2 > 0x7FF) return false;
+                        if (SweepMutes(Regs[0x05], Period2, false)) return false;
+                        return true;
+                    }
+
+                    static bool SweepMutes(byte reg, int period, bool onesComplement)
+                    {
+                        int shift = reg & 7;
+
+                        if (shift == 0 || period < 8) return false;
+
+                        int delta = period >> shift;
+                        int target = (reg & 0x08) != 0
+                            ? period - delta - (onesComplement ? 1 : 0)
+                            : period + delta;
+
+                        return target > 0x7FF || target < 0;
+                    }
+
+                    public static bool TriOn() { return TriEnabled() && LenT > 0 && LinT > 0; }
+                    public static bool NoiOn() { return NoiEnabled() && LenN > 0; }
+
+                    /// <summary>Current envelope output for a pulse channel (0..15).</summary>
+                    public static int PulseVolume(byte reg, int envelope)
+                    {
+                        return (reg & 0x10) != 0 ? (reg & 0x0F) : envelope;
+                    }
                 }
 
                 """));
@@ -1709,13 +2626,45 @@ namespace NesLifter.Lifting
         private void AppendAudio(StringBuilder sb)
         {
             sb.Append(Raw("""
+                /// <summary>
+                /// winmm streaming output and the APU mixer.
+                ///
+                /// Output is 16-bit mono at 44.1 kHz. 8-bit was audibly noisy on
+                /// quiet passages and made the NES's already-harsh output worse;
+                /// 16-bit costs nothing here because the buffer is still tiny.
+                ///
+                /// Mixing follows the hardware's nonlinear behaviour: each channel
+                /// produces a value, they are summed, and the sum is scaled so the
+                /// loudest possible combination lands just below full scale. The
+                /// previous version summed without headroom and clipped on almost
+                /// every frame of music, which is the distortion most games had.
+                /// </summary>
                 static class Audio
                 {
                     [StructLayout(LayoutKind.Sequential)]
-                    struct WAVEFORMATEX { public ushort wFormatTag; public ushort nChannels; public uint nSamplesPerSec; public uint nAvgBytesPerSec; public ushort nBlockAlign; public ushort wBitsPerSample; public ushort cbSize; }
+                    struct WAVEFORMATEX
+                    {
+                        public ushort wFormatTag;
+                        public ushort nChannels;
+                        public uint nSamplesPerSec;
+                        public uint nAvgBytesPerSec;
+                        public ushort nBlockAlign;
+                        public ushort wBitsPerSample;
+                        public ushort cbSize;
+                    }
 
                     [StructLayout(LayoutKind.Sequential)]
-                    struct WAVEHDR { public IntPtr lpData; public uint dwBufferLength; public uint dwBytesRecorded; public IntPtr dwUser; public uint dwFlags; public uint dwLoops; public IntPtr lpNext; public IntPtr reserved; }
+                    struct WAVEHDR
+                    {
+                        public IntPtr lpData;
+                        public uint dwBufferLength;
+                        public uint dwBytesRecorded;
+                        public IntPtr dwUser;
+                        public uint dwFlags;
+                        public uint dwLoops;
+                        public IntPtr lpNext;
+                        public IntPtr reserved;
+                    }
 
                     [DllImport("winmm.dll")] static extern int waveOutOpen(out IntPtr h, int dev, ref WAVEFORMATEX fmt, IntPtr cb, IntPtr inst, int flags);
                     [DllImport("winmm.dll")] static extern int waveOutPrepareHeader(IntPtr h, ref WAVEHDR hdr, int size);
@@ -1724,61 +2673,102 @@ namespace NesLifter.Lifting
                     [DllImport("winmm.dll")] static extern int waveOutReset(IntPtr h);
                     [DllImport("winmm.dll")] static extern int waveOutClose(IntPtr h);
 
-                    const int SR = 22050;
-                    const int BLOCK = 512;
-                    const int NBUF = 4;
+                    /// <summary>Output sample rate. 44.1 kHz keeps the noise channel's hiss intact.</summary>
+                    public const int SR = 44100;
+
+                    /// <summary>Samples per buffer. 1024 at 44.1 kHz is ~23 ms.</summary>
+                    const int BlockSamples = 1024;
+
+                    const int BlockBytes = BlockSamples * 2;
+                    const int NBuf = 4;
+
                     static IntPtr _hwo;
                     static bool _open;
                     static Thread _thread;
                     static volatile bool _run;
-                    static byte[][] _buf = new byte[NBUF][];
-                    static WAVEHDR[] _hdr = new WAVEHDR[NBUF];
-                    static GCHandle[] _pin = new GCHandle[NBUF];
-                    static bool[] _queued = new bool[NBUF];
+
+                    static readonly byte[][] _buf = new byte[NBuf][];
+                    static readonly WAVEHDR[] _hdr = new WAVEHDR[NBuf];
+                    static readonly GCHandle[] _pin = new GCHandle[NBuf];
+                    static readonly bool[] _queued = new bool[NBuf];
+
+                    // Oscillator state.
                     static float _ph1, _ph2, _phT;
+                    static float _noiseAcc;
+                    static int _noise = 1;
+
+                    // Filter state.
                     static float _dc, _lp1, _lp2;
-                    static int _noise = 0x7FFF;
-                    static int _noiseCounter;
+
                     public static volatile int DbgAlive;
                     public static volatile int DbgWrErr;
-                    static readonly int[] NoisePeriod = new int[16] {4,8,16,32,64,96,128,160,202,254,380,508,762,1016,2034,4068};
-                    static readonly float[] DutyF = new float[4] {0.125f,0.25f,0.5f,0.75f};
-                    static readonly int[] TriangleWave = new int[32] {
+
+                    /// <summary>
+                    /// Master volume, 0..100. The overlay edits this directly so
+                    /// there is one value rather than a UI copy and an engine copy
+                    /// that can drift apart.
+                    /// </summary>
+                    public static volatile int Volume = 80;
+
+                    static readonly int[] NoisePeriod =
+                    {
+                        4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068
+                    };
+
+                    static readonly float[] DutyF = { 0.125f, 0.25f, 0.5f, 0.75f };
+
+                    static readonly int[] TriangleWave =
+                    {
                         15,14,13,12,11,10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
                          0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15
                     };
 
                     public static void OnStatusChange(byte v) { }
 
+                    public static bool IsOpen { get { return _open; } }
+
                     public static void TryStart()
                     {
                         try
                         {
                             if (_open) return;
+
                             WAVEFORMATEX fmt = new WAVEFORMATEX();
-                            fmt.wFormatTag = 1; fmt.nChannels = 1; fmt.nSamplesPerSec = SR; fmt.wBitsPerSample = 8; fmt.nBlockAlign = 1; fmt.nAvgBytesPerSec = SR; fmt.cbSize = 0;
+                            fmt.wFormatTag = 1;            // PCM
+                            fmt.nChannels = 1;
+                            fmt.nSamplesPerSec = SR;
+                            fmt.wBitsPerSample = 16;
+                            fmt.nBlockAlign = 2;
+                            fmt.nAvgBytesPerSec = SR * 2;
+                            fmt.cbSize = 0;
+
                             int r = waveOutOpen(out _hwo, -1, ref fmt, IntPtr.Zero, IntPtr.Zero, 0);
-                            if (r != 0) return;
+                            if (r != 0) { DbgWrErr = r; return; }
+
                             _open = true;
 
                             int hdrSize = Marshal.SizeOf(typeof(WAVEHDR));
 
-                            for (int i = 0; i < NBUF; i++)
+                            for (int i = 0; i < NBuf; i++)
                             {
-                                _buf[i] = new byte[BLOCK];
+                                _buf[i] = new byte[BlockBytes];
                                 _pin[i] = GCHandle.Alloc(_buf[i], GCHandleType.Pinned);
                                 _hdr[i] = new WAVEHDR();
                                 _hdr[i].lpData = _pin[i].AddrOfPinnedObject();
-                                _hdr[i].dwBufferLength = BLOCK;
+                                _hdr[i].dwBufferLength = BlockBytes;
                                 waveOutPrepareHeader(_hwo, ref _hdr[i], hdrSize);
                             }
 
                             _run = true;
                             _thread = new Thread(new ThreadStart(ThreadProc));
                             _thread.IsBackground = true;
+                            _thread.Name = "apu-out";
                             _thread.Start();
                         }
-                        catch { _open = false; }
+                        catch
+                        {
+                            _open = false;
+                        }
                     }
 
                     public static void TryStop()
@@ -1790,8 +2780,15 @@ namespace NesLifter.Lifting
                             if (_open)
                             {
                                 waveOutReset(_hwo);
+
                                 int hdrSize = Marshal.SizeOf(typeof(WAVEHDR));
-                                for (int i = 0; i < NBUF; i++) { try { waveOutUnprepareHeader(_hwo, ref _hdr[i], hdrSize); } catch { } if (_pin[i].IsAllocated) _pin[i].Free(); }
+
+                                for (int i = 0; i < NBuf; i++)
+                                {
+                                    try { waveOutUnprepareHeader(_hwo, ref _hdr[i], hdrSize); } catch { }
+                                    if (_pin[i].IsAllocated) _pin[i].Free();
+                                }
+
                                 waveOutClose(_hwo);
                                 _open = false;
                             }
@@ -1801,7 +2798,9 @@ namespace NesLifter.Lifting
 
                     static void ThreadProc()
                     {
-                        int hdrSize; try { hdrSize = Marshal.SizeOf(typeof(WAVEHDR)); } catch { hdrSize = 32; }
+                        int hdrSize;
+                        try { hdrSize = Marshal.SizeOf(typeof(WAVEHDR)); } catch { hdrSize = 32; }
+
                         int idx = 0;
 
                         while (_run)
@@ -1813,65 +2812,188 @@ namespace NesLifter.Lifting
                                 if (_queued[idx])
                                 {
                                     int stuck = 0;
+
                                     while (_run && (_hdr[idx].dwFlags & 1) == 0)
                                     {
-                                        Thread.Sleep(1); stuck++;
+                                        Thread.Sleep(1);
+                                        stuck++;
+
                                         if (stuck > 2000) { try { waveOutReset(_hwo); } catch { } break; }
                                     }
+
                                     if (!_run) break;
                                 }
 
                                 Fill(_buf[idx]);
+
                                 int wr = waveOutWrite(_hwo, ref _hdr[idx], hdrSize);
-                                if (wr == 0) { _queued[idx] = true; idx = (idx + 1) & (NBUF - 1); }
-                                else { DbgWrErr = wr; Thread.Sleep(2); }
+
+                                if (wr == 0)
+                                {
+                                    _queued[idx] = true;
+                                    idx = (idx + 1) & (NBuf - 1);
+                                }
+                                else
+                                {
+                                    DbgWrErr = wr;
+                                    Thread.Sleep(2);
+                                }
                             }
                             catch { Thread.Sleep(5); }
                         }
                     }
 
+                    /// <summary>
+                    /// Renders one frame worth of audio into the trace file.
+                    ///
+                    /// Headless mode never opens the audio device, so without this
+                    /// the APU is unobservable: music either works or does not, and
+                    /// there is no way to tell why. The trace is raw signed 16-bit
+                    /// little-endian mono at the mixer rate.
+                    /// </summary>
+                    public static void TraceFrame()
+                    {
+                        if (string.IsNullOrEmpty(Runtime.ApuTracePath)) return;
+
+                        try
+                        {
+                            int samples = SR / 60;
+                            byte[] buffer = new byte[samples * 2];
+                            Fill(buffer);
+
+                            using (System.IO.FileStream fs = new System.IO.FileStream(
+                                Runtime.ApuTracePath, System.IO.FileMode.Append, System.IO.FileAccess.Write))
+                            {
+                                fs.Write(buffer, 0, buffer.Length);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Runtime.Log("apu-trace-fail", ex.Message, true);
+                        }
+                    }
+
+                    /// <summary>
+                    /// Mixes <paramref name="b"/> samples into signed 16-bit PCM.
+                    ///
+                    /// The NES mixer is nonlinear: pulse and TND (triangle, noise,
+                    /// DMC) are combined through two separate formulas and summed.
+                    /// Doing it that way matters because the relative loudness of
+                    /// the channels is what makes a NES soundtrack sound like one.
+                    /// </summary>
                     static void Fill(byte[] b)
                     {
-                        int per1 = Apu.Period1 + 1;
-                        int per2 = Apu.Period2 + 1;
-                        int perT = Apu.PeriodT + 1;
-                        int nperIdx = Apu.Regs[0xE] & 0xF; int nper = NoisePeriod[nperIdx];
-                        int nmode = (Apu.Regs[0xE] & 0x80) != 0 ? 6 : 1;
-                        float f1 = per1 > 8 ? (1789773f / (16f * per1)) : 0f;
-                        float f2 = per2 > 8 ? (1789773f / (16f * per2)) : 0f;
-                        float fT = perT > 1 ? (1789773f / (32f * perT)) : 0f;
-                        int v1 = Apu.Sq1On() ? ((Apu.Regs[0] & 0x10) != 0 ? (Apu.Regs[0] & 0x0F) : Apu.Env1) : 0;
-                        int v2 = Apu.Sq2On() ? ((Apu.Regs[4] & 0x10) != 0 ? (Apu.Regs[4] & 0x0F) : Apu.Env2) : 0;
-                        int vT = Apu.TriOn() ? 12 : 0;
-                        int vN = Apu.NoiOn() ? ((Apu.Regs[0xC] & 0x10) != 0 ? (Apu.Regs[0xC] & 0x0F) : Apu.EnvN) : 0;
-                        float d1f = DutyF[(Apu.Regs[0] >> 6) & 3];
-                        float d2f = DutyF[(Apu.Regs[4] >> 6) & 3];
+                        int per1 = Apu.Period1;
+                        int per2 = Apu.Period2;
+                        int perT = Apu.PeriodT;
 
-                        for (int i = 0; i < b.Length; i++)
+                        // Hardware silences a pulse whose period is below 8.
+                        float f1 = per1 >= 8 ? 1789773f / (16f * (per1 + 1)) : 0f;
+                        float f2 = per2 >= 8 ? 1789773f / (16f * (per2 + 1)) : 0f;
+                        float fT = perT >= 1 ? 1789773f / (32f * (perT + 1)) : 0f;
+
+                        bool on1 = Apu.Sq1On();
+                        bool on2 = Apu.Sq2On();
+                        bool onT = Apu.TriOn();
+                        bool onN = Apu.NoiOn();
+
+                        int v1 = on1 ? Apu.PulseVolume(Apu.Regs[0x00], Apu.Env1) : 0;
+                        int v2 = on2 ? Apu.PulseVolume(Apu.Regs[0x04], Apu.Env2) : 0;
+                        int vN = onN ? Apu.PulseVolume(Apu.Regs[0x0C], Apu.EnvN) : 0;
+
+                        float d1f = DutyF[(Apu.Regs[0x00] >> 6) & 3];
+                        float d2f = DutyF[(Apu.Regs[0x04] >> 6) & 3];
+
+                        // Noise period is expressed in CPU cycles, not samples. The
+                        // old code compared it against a per-sample counter, which
+                        // made the LFSR run ~81x too slowly: noise came out as a low
+                        // rumble instead of a hiss.
+                        int noisePeriod = NoisePeriod[Apu.Regs[0x0E] & 0x0F];
+                        bool noiseShortMode = (Apu.Regs[0x0E] & 0x80) != 0;
+                        float cyclesPerSample = 1789773f / SR;
+
+                        float gain = Runtime.MuteAll ? 0f : (Overlay.Volume / 100f);
+                        int samples = b.Length / 2;
+
+                        for (int n = 0; n < samples; n++)
                         {
+                            // ---- pulse 1 / 2 ----
                             int pulse = 0;
-                            if (v1 != 0 && f1 > 0f) { _ph1 += f1 / SR; if (_ph1 >= 1f) _ph1 -= 1f; if (_ph1 < d1f) pulse += v1; }
-                            if (v2 != 0 && f2 > 0f) { _ph2 += f2 / SR; if (_ph2 >= 1f) _ph2 -= 1f; if (_ph2 < d2f) pulse += v2; }
 
+                            if (v1 != 0 && f1 > 0f)
+                            {
+                                _ph1 += f1 / SR;
+                                if (_ph1 >= 1f) _ph1 -= 1f;
+                                if (_ph1 < d1f) pulse += v1;
+                            }
+
+                            if (v2 != 0 && f2 > 0f)
+                            {
+                                _ph2 += f2 / SR;
+                                if (_ph2 >= 1f) _ph2 -= 1f;
+                                if (_ph2 < d2f) pulse += v2;
+                            }
+
+                            // ---- triangle / noise ----
                             float tin = 0f;
-                            if (vT != 0 && fT > 0f) { _phT += fT / SR; if (_phT >= 1f) _phT -= 1f; int ti = (int)(_phT * 32f); if (ti >= 32) ti = 31; tin += TriangleWave[ti] / 8227f; }
-                            if (vN != 0) { _noiseCounter++; if (_noiseCounter >= nper) { _noiseCounter = 0; int bit = (_noise & 1) ^ ((_noise >> nmode) & 1); _noise = (_noise >> 1) | (bit << 14); } if ((_noise & 1) == 0) tin += vN / 12241f; }
 
-                            float pulseOut = (pulse == 0) ? 0f : (95.52f / (8128f / pulse + 100f));
-                            float tndOut   = (tin == 0f) ? 0f : (159.79f / (1f / tin + 100f));
-                            float outv = pulseOut + tndOut;
+                            if (onT && fT > 0f)
+                            {
+                                _phT += fT / SR;
+                                if (_phT >= 1f) _phT -= 1f;
 
-                            // Gentle DC blocking and two one-pole low-passes: the NES output
-                            // is famously harsh, and this is what makes it listenable.
-                            _dc += (outv - _dc) * 0.002f;
+                                int ti = (int)(_phT * 32f);
+                                if (ti > 31) ti = 31;
+
+                                tin += TriangleWave[ti] / 8227f;
+                            }
+
+                            if (vN != 0)
+                            {
+                                // Advance the LFSR at the hardware rate.
+                                _noiseAcc += cyclesPerSample;
+
+                                while (_noiseAcc >= noisePeriod)
+                                {
+                                    _noiseAcc -= noisePeriod;
+
+                                    int tap = noiseShortMode ? 6 : 1;
+                                    int feedback = (_noise & 1) ^ ((_noise >> tap) & 1);
+
+                                    _noise = (_noise >> 1) | (feedback << 14);
+                                }
+
+                                if ((_noise & 1) == 0)
+                                    tin += vN / 12241f;
+                            }
+
+                            // ---- nonlinear mixing ----
+                            float pulseOut = pulse == 0 ? 0f : 95.52f / (8128f / pulse + 100f);
+                            float tndOut = tin == 0f ? 0f : 159.79f / (1f / tin + 100f);
+
+                            float outv = (pulseOut + tndOut) * gain;
+
+                            // DC blocking, then a gentle low-pass. The NES output is
+                            // harsh by design; two poles at ~9 kHz takes the edge off
+                            // without muffling the music.
+                            _dc += (outv - _dc) * 0.0005f;
                             float s0 = outv - _dc;
-                            _lp1 += 0.85f * (s0 - _lp1);
-                            _lp2 += 0.85f * (_lp1 - _lp2);
 
-                            int sample = 128 + (int)(_lp2 * 240f);
-                            if (sample < 0) sample = 0;
-                            if (sample > 255) sample = 255;
-                            b[i] = (byte)sample;
+                            _lp1 += 0.45f * (s0 - _lp1);
+                            _lp2 += 0.45f * (_lp1 - _lp2);
+
+                            // Scale to 16-bit. 0.62 is the theoretical maximum of the
+                            // two mixer formulas at full volume, so dividing by it
+                            // gives headroom instead of clipping.
+                            float scaled = _lp2 / 0.62f;
+
+                            if (scaled > 1f) scaled = 1f;
+                            if (scaled < -1f) scaled = -1f;
+
+                            short sample = (short)(scaled * 32000f);
+
+                            b[n * 2] = (byte)(sample & 0xFF);
+                            b[n * 2 + 1] = (byte)((sample >> 8) & 0xFF);
                         }
                     }
                 }
@@ -1888,9 +3010,25 @@ namespace NesLifter.Lifting
             sb.Append(_mapper.Emit());
         }
 
-        private void AppendForm(StringBuilder sb)
+        // ================================================================
+        // Overlay
+        // ================================================================
+
+        private void AppendOverlay(StringBuilder sb)
         {
-            sb.Append(Raw("""
+            sb.Append(new OverlayEmitter().Emit());
+        }
+
+        private void AppendForm(StringBuilder sb)
+        {            sb.Append(Raw("""
+                /// <summary>
+                /// The game window.
+                ///
+                /// The frame is drawn at integer scale with nearest-neighbour
+                /// sampling, then the overlay is drawn on top at *window*
+                /// resolution so its text is legible. Drawing the overlay at 256x240
+                /// and scaling up вЂ” which the old debug OSD did вЂ” makes it unreadable.
+                /// </summary>
                 class PpuForm : Form
                 {
                     private System.Windows.Forms.Timer _timer;
@@ -1898,23 +3036,33 @@ namespace NesLifter.Lifting
                     private Bitmap _work;
                     private Thread _renderThread;
                     private volatile bool _closing;
+                    private int _scale = 2;
 
                     public PpuForm()
                     {
                         Text = "NES Lifted: " + Runtime.GameName;
-                        ClientSize = new Size(256 * 2, 240 * 2);
                         FormBorderStyle = FormBorderStyle.FixedSingle;
                         MaximizeBox = false;
                         StartPosition = FormStartPosition.CenterScreen;
                         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+                        BackColor = Color.Black;
+
+                        ApplyScale(_scale);
 
                         _front = new Bitmap(256, 240, PixelFormat.Format32bppArgb);
                         _work = new Bitmap(256, 240, PixelFormat.Format32bppArgb);
 
                         _timer = new System.Windows.Forms.Timer();
-                        _timer.Interval = 33;
+                        _timer.Interval = 16;
                         _timer.Tick += delegate(object sender, EventArgs e)
                         {
+                            // Honour a scale change requested from the overlay.
+                            if (Runtime.RequestedScale > 0 && Runtime.RequestedScale != _scale)
+                            {
+                                ApplyScale(Runtime.RequestedScale);
+                                Runtime.RequestedScale = 0;
+                            }
+
                             Invalidate();
                         };
                         _timer.Start();
@@ -1925,8 +3073,8 @@ namespace NesLifter.Lifting
                         _renderThread.Start();
 
                         this.KeyPreview = true;
-                        this.KeyDown += delegate(object s, KeyEventArgs ke) { SetJoyKey(ke.KeyCode, true); ke.SuppressKeyPress = true; };
-                        this.KeyUp += delegate(object s, KeyEventArgs ke) { SetJoyKey(ke.KeyCode, false); };
+                        this.KeyDown += delegate(object s, KeyEventArgs ke) { OnGameKey(ke.KeyCode, true, ke); };
+                        this.KeyUp += delegate(object s, KeyEventArgs ke) { OnGameKey(ke.KeyCode, false, ke); };
 
                         // Screenshot-to-icon: sample the framebuffer for a while, then keep
                         // the most interesting frame. A single shot at a fixed time lands
@@ -1949,9 +3097,49 @@ namespace NesLifter.Lifting
                         }
                     }
 
+                    /// <summary>Resizes the window to an integer multiple of 256x240.</summary>
+                    void ApplyScale(int scale)
+                    {
+                        if (scale < 1) scale = 1;
+                        if (scale > 8) scale = 8;
+
+                        _scale = scale;
+                        ClientSize = new Size(256 * scale, 240 * scale);
+                    }
+
+                    /// <summary>
+                    /// Routes a key to the overlay first, then to the emulated pad.
+                    ///
+                    /// The overlay decides whether it consumes the key: the monitor tab
+                    /// lets game input through so you can keep playing while watching
+                    /// the numbers, while settings tabs swallow it so arrow keys change
+                    /// values instead of moving the player.
+                    /// </summary>
+                    void OnGameKey(Keys key, bool down, KeyEventArgs e)
+                    {
+                        if (down && Overlay.HandleKey(key))
+                        {
+                            e.SuppressKeyPress = true;
+                            e.Handled = true;
+                            return;
+                        }
+
+                        if (Overlay.LocksInput)
+                        {
+                            // Swallow everything else too: a half-pressed d-pad while
+                            // the overlay is open would drift the game.
+                            e.SuppressKeyPress = true;
+                            e.Handled = true;
+                            return;
+                        }
+
+                        if (down) SetJoyKey(key, true, e);
+                        else SetJoyKey(key, false, e);
+                    }
+
                     void RenderLoop()
                     {
-                        const int MaxFps = 30;
+                        const int MaxFps = 60;
                         long freq = System.Diagnostics.Stopwatch.Frequency;
                         long nextFrame = System.Diagnostics.Stopwatch.GetTimestamp();
 
@@ -1959,18 +3147,18 @@ namespace NesLifter.Lifting
                         {
                             try
                             {
-                                if (!Ppu.FrameReady) { Thread.Sleep(2); continue; }
+                                if (!Ppu.FrameReady) { Thread.Sleep(1); continue; }
                                 Ppu.FrameReady = false;
 
                                 Ppu.RenderScreen();
                                 BlitTo(_work);
-                                DrawOsd(_work);
 
                                 Bitmap ready = _work;
                                 _work = Interlocked.Exchange(ref _front, ready);
 
-                                // Do not queue stale NES frames: CPU may produce 60 Hz,
-                                // presentation is adaptive up to 30 Hz.
+                                // Present at the display rate, not the emulated rate:
+                                // dropping stale frames keeps latency low when the CPU
+                                // runs ahead.
                                 nextFrame += freq / MaxFps;
                                 long now = System.Diagnostics.Stopwatch.GetTimestamp();
                                 if (nextFrame < now) nextFrame = now;
@@ -1996,49 +3184,41 @@ namespace NesLifter.Lifting
                         finally { bmp.UnlockBits(data); }
                     }
 
-                    void DrawOsd(Bitmap bmp)
-                    {
-                        if (bmp == null) return;
-
-                        try
-                        {
-                            using (Graphics g = Graphics.FromImage(bmp))
-                            {
-                                string c = string.Format("F:{0} I:{1} T:{2}", Ppu.FrameCount, Runtime.InsCount, Runtime.TrapCount);
-                                g.FillRectangle(Brushes.Black, 0, 0, 256, 15);
-                                g.DrawString(c, SystemFonts.DefaultFont, Brushes.Yellow, 2, 1);
-
-                                if (!string.IsNullOrEmpty(Runtime.LastError))
-                                {
-                                    string msg = Runtime.LastError; if (msg.Length > 56) msg = msg.Substring(0, 56);
-                                    g.FillRectangle(Brushes.Black, 0, 222, 256, 18);
-                                    g.DrawString(msg, SystemFonts.DefaultFont, Brushes.Red, 2, 224);
-                                }
-                            }
-                        }
-                        catch { }
-                    }
-
                     protected override void OnPaint(PaintEventArgs e)
                     {
                         base.OnPaint(e);
 
+                        e.Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
+                        e.Graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
+                        e.Graphics.Clear(Color.Black);
+
                         Bitmap b = Volatile.Read(ref _front);
 
                         if (b != null)
-                        {
-                            e.Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
-                            e.Graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
                             e.Graphics.DrawImage(b, 0, 0, ClientSize.Width, ClientSize.Height);
+
+                        // Minimal status line, only when enabled and only outside the
+                        // overlay (the overlay's monitor tab covers the same ground).
+                        if (Overlay.ShowFps && !Overlay.Visible)
+                        {
+                            string text = Runtime.MeasuredFps.ToString("0") + " fps";
+                            e.Graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+                            e.Graphics.DrawString(text, SystemFonts.DefaultFont, Brushes.White, 4, 2);
                         }
+
+                        Overlay.Draw(e.Graphics, ClientSize.Width, ClientSize.Height);
                     }
 
-                    static void SetJoyKey(Keys k, bool down)
+                    void SetJoyKey(Keys k, bool down, KeyEventArgs e)
                     {
                         int b = KeyBit(k); if (b < 0) return;
+
                         if (down) Runtime.Joy1Buttons = (byte)(Runtime.Joy1Buttons | (1 << b));
                         else Runtime.Joy1Buttons = (byte)(Runtime.Joy1Buttons & ~(1 << b));
-                        Runtime.Log("key-" + b + "-" + down, (down ? "KeyDown " : "KeyUp ") + k + " -> NES bit " + b + "; P1=$" + Runtime.Joy1Buttons.ToString("X2"), false);
+
+                        // Arrow keys and Enter are also the overlay's navigation keys,
+                        // so they must not reach the control's default handling.
+                        e.SuppressKeyPress = true;
                     }
 
                     static int KeyBit(Keys k)
@@ -2081,7 +3261,7 @@ namespace NesLifter.Lifting
             if (inst.Control == OpControl.Invalid)
             {
                 Line(sb, "Runtime.UnknownOpcode(0x" + inst.Opcode.ToString("X2") + ", 0x" + inst.Address.ToString("X4") + ");");
-                EmitGoto(sb, inst.FallthroughOffset, inst.Fallthrough);
+                EmitFallthrough(sb, inst.FallthroughOffset, inst.Fallthrough);
                 return;
             }
 
@@ -2101,34 +3281,39 @@ namespace NesLifter.Lifting
             if (inst.Info != null && inst.Info.Mn == "KIL")
                 return;
 
-            EmitGoto(sb, inst.FallthroughOffset, inst.Fallthrough);
+            EmitFallthrough(sb, inst.FallthroughOffset, inst.Fallthrough);
         }
 
         private void EmitBranch(StringBuilder sb, Instruction inst)
         {
             string cond = GetBranchCondition(inst.Info?.Mn ?? "???");
 
-            // A branch can leave the current bank view; in that case the target
-            // offset is not part of the lifted set and we must dispatch instead.
-            bool targetLifted = inst.TargetOffset >= 0 && _labels.Contains(inst.TargetOffset);
+            // A branch target inside a banked window is only known at runtime, so
+            // it goes through the dispatcher rather than a direct goto. Trapping
+            // is reserved for targets the analyser never found at all.
+            bool direct = inst.TargetOffset >= 0
+                          && _labels.Contains(inst.TargetOffset)
+                          && !IsBankDependent(inst.Target);
+
+            bool resolvable = direct || inst.HasTarget || IsBankDependent(inst.Target);
 
             Line(sb, $"if ({cond})");
             Line(sb, "{");
 
-            if (targetLifted)
+            if (resolvable)
             {
                 EmitGoto(sb, inst.TargetOffset, inst.Target);
             }
             else
             {
                 Line(sb, $"Runtime.Trap(\"Missing branch target ${inst.Target:X4}\");");
-                EmitGoto(sb, inst.FallthroughOffset, inst.Fallthrough);
+                EmitFallthrough(sb, inst.FallthroughOffset, inst.Fallthrough);
             }
 
             Line(sb, "}");
             Line(sb, "else");
             Line(sb, "{");
-            EmitGoto(sb, inst.FallthroughOffset, inst.Fallthrough);
+            EmitFallthrough(sb, inst.FallthroughOffset, inst.Fallthrough);
             Line(sb, "}");
         }
 
@@ -2175,12 +3360,69 @@ namespace NesLifter.Lifting
         }
 
         /// <summary>
-        /// Emits a jump to a block. <paramref name="offset"/> is the PRG offset
-        /// of the destination; when it is lifted, the jump is a direct
-        /// <c>goto</c>, otherwise control goes through the dispatcher so the
-        /// runtime can resolve the address against the current bank.
+        /// First CPU address that the mapper never remaps. Anything below it can
+        /// appear at different PRG offsets depending on which bank is selected,
+        /// so a jump to it cannot be compiled to a direct <c>goto</c>.
+        ///
+        /// The floor lives on <see cref="MapperDescriptor"/> because the analyser
+        /// needs the same number: being conservative here only costs an indirect
+        /// branch, while being wrong silently executes another bank's bytes.
+        /// </summary>
+        private int FixedPrgFloor()
+        {
+            return _mapperDescriptor.FixedPrgFloor;
+        }
+
+        /// <summary>
+        /// True when <paramref name="address"/> can resolve to more than one PRG
+        /// offset, i.e. when the mapper can move it.
+        ///
+        /// The floor is the lowest address the board never remaps, so everything
+        /// *below* it is ambiguous. Getting this comparison backwards silently
+        /// hardcodes banked jumps, which is how Zelda ended up executing bank 0's
+        /// $FF padding instead of bank 5's code.
+        /// </summary>
+        private bool IsBankDependent(ushort address)
+        {
+            return address < FixedPrgFloor();
+        }
+
+        /// <summary>
+        /// Emits a jump to a block reached through a *CPU address* (JMP, JSR,
+        /// branch). <paramref name="offset"/> is the PRG offset of the
+        /// destination as seen by the bank view the analyser decoded it in; when
+        /// it is lifted and the address is not remappable, the jump is a direct
+        /// <c>goto</c>. Otherwise control goes through the dispatcher so the
+        /// runtime resolves the address against the *live* mapping.
+        ///
+        /// The bank-dependency check matters: the analyser merges every bank by
+        /// offset, so a fixed-bank <c>JSR $B4AC</c> keeps whichever offset the
+        /// power-on pass saw. Hardcoding that runs bank 0's bytes after the game
+        /// has selected bank 5.
         /// </summary>
         private void EmitGoto(StringBuilder sb, int offset, ushort address)
+        {
+            if (offset >= 0 && _labels.Contains(offset) && !IsBankDependent(address))
+            {
+                Line(sb, $"goto {Label(offset)};");
+                return;
+            }
+
+            Line(sb, $"Runtime.DispatchTarget = 0x{address:X4};");
+            Line(sb, "goto Dispatch;");
+        }
+
+        /// <summary>
+        /// Emits the fall-through into the next block.
+        ///
+        /// Unlike a jump target, a fall-through offset is always consistent with
+        /// the block that precedes it: the analyser computed it from the same
+        /// bank view that produced the current offset, so it addresses the same
+        /// PRG bytes no matter which bank is loaded when the code runs. It can
+        /// therefore stay a direct <c>goto</c> even inside a switchable window —
+        /// which matters, because every instruction ends in one.
+        /// </summary>
+        private void EmitFallthrough(StringBuilder sb, int offset, ushort address)
         {
             if (offset >= 0 && _labels.Contains(offset))
             {

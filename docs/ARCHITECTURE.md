@@ -167,8 +167,26 @@ renderer never observes a half-written VRAM. Per-scanline scroll values are
 captured during the frame, which is what makes mid-frame scroll splits (status
 bars, SMB's horizon) line up.
 
-Audio runs on a third thread owned by `winmm`: four ring buffers of 512 samples
-at 22 050 Hz, filled from the current APU register state.
+Audio runs on a third thread owned by `winmm`: four ring buffers of 1024 samples
+of 16-bit mono at 44 100 Hz, filled from the current APU register state. The APU
+itself is clocked from the CPU thread, not from the audio thread, because games
+read `$4015` and depend on length counters expiring at the hardware rate.
+
+### Headless is frame-locked
+
+With a window, the CPU thread free-runs and the renderer drops stale frames. That
+is wrong for diagnosis: a driver asking for "frame 120" would never see it
+because the CPU races past. So `--headless` inserts a rendezvous at VBlank — the
+CPU thread publishes the completed frame and parks on a semaphore until the
+driver has captured its screenshot and audio sample. One frame at a time, fully
+deterministic, which is what makes a screenshot or a trace reproducible.
+
+### Overlay
+
+The overlay draws on top of the *window*, not the framebuffer. Drawing at 256×240
+and scaling up — which the old debug OSD did — makes the text unreadable. It
+reads and writes `Runtime` fields directly (volume, scale, throttle) so there is
+no separate "apply" step and no chance of the UI and the engine disagreeing.
 
 ## 8. Verification
 

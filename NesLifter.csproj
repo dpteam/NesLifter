@@ -13,7 +13,7 @@
     <Product>NesLifter</Product>
     <Description>Static NES (6502) recompiler that emits self-contained .NET games.</Description>
     <ApplicationIcon>assets\icon.ico</ApplicationIcon>
-    <Version>0.6.0</Version>
+    <Version>0.10.0</Version>
     <NeutralLanguage>en</NeutralLanguage>
     <EnableNETAnalyzers>true</EnableNETAnalyzers>
     <AnalysisLevel>latest</AnalysisLevel>
@@ -36,11 +36,18 @@
     <Compile Remove="lifted\**\*.cs" />
     <Compile Remove="tools\**\*.cs" />
     <Compile Remove="tests\**\*.cs" />
-    <None Include="assets\**" CopyToOutputDirectory="PreserveNewest" />
+
+    <!-- Branding assets, copied next to the exe. assets/icon.ico is not just
+         decoration: GamePackager falls back to it when a game has no captured
+         icon, so it has to exist on disk at runtime. The single-file bundler
+         would otherwise swallow it (it matches the .ico it embeds into the
+         apphost), hence ExcludeFromSingleFile. -->
+    <None Include="assets\**" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Update="assets\icon.ico" ExcludeFromSingleFile="true" />
 
     <!-- The GUI's HTML/CSS/JS, including the vendored NES.css and Font Awesome.
          Copied to the output so WebView2 can serve it from disk. -->
-    <None Include="web\**" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="web\**" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>

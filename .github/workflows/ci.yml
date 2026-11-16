@@ -83,23 +83,15 @@ jobs:
         shell: pwsh
         run: |
           # The single-file bundle carries the managed assemblies, but the GUI's
-          # web/ folder and the WebView2 native loader must sit next to the exe
-          # or the interface cannot start. Fail loudly rather than shipping a
-          # broken zip.
+          # web/ folder must sit next to the exe or the interface cannot start.
+          # assets/icon.ico is excluded from the bundle on purpose: GamePackager
+          # uses it as the fallback icon for generated games, so it has to exist
+          # as a real file.
           $missing = @()
           if (-not (Test-Path 'dist/NesLifter.exe')) { $missing += 'NesLifter.exe' }
           if (-not (Test-Path 'dist/web/index.html')) { $missing += 'web/index.html' }
           if (-not (Test-Path 'dist/web/vendor/nes.css/nes.min.css')) { $missing += 'web/vendor/nes.css' }
           if (-not (Test-Path 'dist/assets/icon.ico')) { $missing += 'assets/icon.ico' }
-
-          # The loader lives under runtimes/<rid>/native in a framework-dependent
-          # publish; a self-contained one may flatten it next to the exe.
-          $loader = @(
-            'dist/WebView2Loader.dll',
-            'dist/runtimes/win-x64/native/WebView2Loader.dll'
-          ) | Where-Object { Test-Path $_ }
-
-          if ($loader.Count -eq 0) { $missing += 'WebView2Loader.dll' }
 
           if ($missing.Count -gt 0) {
             Write-Error "Published output is missing: $($missing -join ', ')"
@@ -107,6 +99,62 @@ jobs:
           }
 
           Write-Host 'Published layout looks complete.'
+
+      # WebView2Loader.dll is a native dependency that PublishSingleFile with
+      # IncludeNativeLibrariesForSelfExtract packs *into* the exe and unpacks to a
+      # temp folder on first run. Asserting it exists next to the exe fails on a
+      # correct build, so instead run the published binary: if the bundle were
+      # broken, the process would fail to start at all.
+      - name: Smoke-test published binary
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'smoke-out'
+
+          & dist/NesLifter.exe --selftest --frames 30 --output $out --no-tui 2>&1 |
+            Tee-Object -Variable log
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Published binary exited with $LASTEXITCODE"
+            exit 1
+          }
+
+          if (($log -join "`n") -notmatch 'Summary: ok=') {
+            Write-Error 'Published binary did not run the self-test.'
+            exit 1
+          }
+
+          Write-Host 'Published binary runs.'
+
+      - name: Verify the GUI resources resolve
+        shell: pwsh
+        run: |
+          # The GUI loads web/index.html through a virtual host rooted at
+          # AppContext.BaseDirectory. If the web folder did not ship, the window
+          # opens blank and nothing in the build fails, so check the files the
+          # page actually references are present and non-empty.
+          $required = @(
+            'dist/web/index.html',
+            'dist/web/app.js',
+            'dist/web/theme.css',
+            'dist/web/sfx.js',
+            'dist/web/vendor/nes.css/nes.min.css',
+            'dist/web/vendor/fontawesome/css/all.min.css',
+            'dist/web/vendor/fontawesome/webfonts/fa-solid-900.woff2'
+          )
+
+          $bad = @()
+
+          foreach ($file in $required) {
+            if (-not (Test-Path $file)) { $bad += "$file (missing)"; continue }
+            if ((Get-Item $file).Length -eq 0) { $bad += "$file (empty)" }
+          }
+
+          if ($bad.Count -gt 0) {
+            Write-Error "GUI resources broken: $($bad -join ', ')"
+            exit 1
+          }
+
+          Write-Host 'GUI resources present.'
 
       - name: Upload lifter
         uses: actions/upload-artifact@v4

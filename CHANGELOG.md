@@ -8,6 +8,122 @@ Versioning is [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.10.0] — 2026-11-16
+
+Headless diagnostics, a real APU, and the in-game overlay.
+
+### Added
+
+- **Headless screenshot capture.** `--shots 60,120,300` with `--shot-dir` makes a
+  lifted game write a PNG per requested frame. Headless is now *frame-locked*:
+  the CPU thread finishes a frame, parks, and waits for the driver to capture it,
+  so "frame 120" means exactly frame 120. Previously the CPU ran unthrottled and
+  raced past every requested frame, which is why early probes produced no images.
+- **`--apu-trace <file>`** writes raw signed 16-bit LE mono at 44.1 kHz for the
+  same run, so a rendering bug and an audio bug can be diagnosed together.
+- **Per-subsystem tracing** via `--diag <list>` and `--diag-dir`: `cpu.log`,
+  `ppu.log`, `apu.log`, `mapper.log`, `mem.log`, `frame.log`. One event per line
+  with fixed columns, so two runs diff directly. `frame.log` is the first place
+  to look when a frame is wrong: sane `ctrl`/`mask` there means the bug is in the
+  renderer, not in the game's PPU setup.
+- **`tools/Probe`**: drives a lifted game headlessly and reports distinct colours
+  and ink percentage per frame plus silence/clipping/RMS for the audio trace.
+- **In-game overlay, toggled with F2.** Six tabs (Monitor · Video · Audio · Input
+  · Debug · Log), TAB to switch, arrows to change values. Drawn at *window*
+  resolution so text stays legible at any scale. The Monitor tab is passive — you
+  can keep playing while watching CPU/PPU/APU state — while settings tabs lock
+  game input so an arrow key changes a setting instead of moving the player.
+- Overlay controls: integer scale 1x-6x, FPS counter, 8-sprite limit toggle,
+  frame limiter, master volume, mute, force interpreter, instruction tracing,
+  clear trap count, and a log tail.
+- `--headless` output directory is created up front, so the audio trace no longer
+  loses its opening seconds to a missing folder.
+
+### Changed
+
+- **Audio output is 16-bit at 44.1 kHz** (was 8-bit at 22.05 kHz). The old format
+  was audibly noisy on quiet passages and the mixer clipped on almost every frame
+  of music.
+- **The mixer now follows the hardware's nonlinear behaviour.** Pulse and TND are
+  combined through the two NES formulas and summed with 0.62 headroom, so the
+  relative loudness of the channels sounds like a NES instead of a flat sum that
+  clipped. Added DC blocking and a two-pole ~9 kHz low-pass.
+- **Noise LFSR advances at the CPU-cycle rate.** The old code compared the noise
+  period against a per-sample counter, making the LFSR run ~81x too slow: noise
+  came out as a low rumble instead of a hiss.
+- The overlay's `Volume` proxies `Audio.Volume` rather than keeping a second copy,
+  so the UI and the mixer cannot disagree.
+- Sprite limit is read from the overlay instead of being hard-coded, so the limit
+  can be lifted to inspect what a game actually puts in OAM.
+
+### Fixed
+
+- **The APU was fundamentally incomplete.** Added sweep units (Mario's jump, the
+  coin, the power-up and most sound effects are sweeps, not fixed tones), a
+  proper frame sequencer with 4-step and 5-step modes, `$4015` status reads
+  returning live length counters (games poll it to know when a sound finished —
+  returning zero made them retrigger constantly), the triangle linear counter,
+  and hardware-accurate `SweepMutes` silencing.
+- `$4015` status now reports the frame-IRQ pending bit.
+- **The single-file publish dropped `assets/icon.ico`.** `GamePackager` falls back
+  to it when a game has no captured icon, so the file has to exist on disk; the
+  bundler was swallowing it because it matches the `.ico` it embeds into the
+  apphost. Now marked `ExcludeFromSingleFile`.
+- **CI's publish check was wrong.** It required `WebView2Loader.dll` next to the
+  exe, but `PublishSingleFile` with `IncludeNativeLibrariesForSelfExtract` packs
+  native dependencies *into* the bundle and unpacks them on first run, so a
+  correct build has no such file. Replaced with a smoke test that actually runs
+  the published binary, plus a check that the GUI's referenced web resources are
+  present and non-empty.
+- **Jumps into a switchable PRG window were hardcoded to one bank's offset.**
+  The analyser merges every bank by PRG offset, so a `JSR $B4AC` recorded
+  whichever offset the power-on pass saw; after the game selected another bank
+  the same `goto` executed a different bank's bytes. `MapperDescriptor.FixedPrgFloor`
+  now states the lowest address a board never remaps, and `Lifter.EmitGoto`
+  routes anything below it through the runtime dispatcher. Fall-throughs keep
+  using direct `goto`s (`EmitFallthrough`) because they are always consistent
+  with the block that precedes them. Effect on Zelda: went from a completely
+  blank frame to rendering.
+- NMI and IRQ vectors now dispatch through `Runtime.NmiVector`/`IrqVector`
+  instead of a compile-time label, so boards that remap the whole window
+  (AxROM) still find the handler.
+- `$2007` reads are traced as `R $2007` alongside writes, which is what made it
+  possible to see read/write interleaving during a VRAM upload.
+- `dist/` is git-ignored.
+
+### Known broken
+
+Measured headlessly with `tools/Probe` on 10 reference cartridges, 9 render and
+1 does not:
+
+| Title | State | Diagnosis |
+| --- | --- | --- |
+| Kirby's Adventure (MMC3) | traps at frame 2, `KIL/HLT at $802E` | The ROM's vector table is implausible at every candidate PRG size (`NMI=$0041 RESET=$00F0 IRQ=$0029` for 512 KB, `$002D/$0000/$00FF` for 128 KB), so no reset handler can be found. Before the dispatch fix it ran 600 blank frames; the trap is an improvement — a precise failure instead of silently executing padding. |
+
+Zelda (MMC1) renders and plays music but its tiles and palette are wrong. The
+cause is visible in `ppu.log`: every palette write is preceded by a `$2007`
+*read* at the same address, so `v` advances twice per entry and only the odd
+palette slots are ever written (`$3F00` is never touched). The read is not
+present in `cpu.log`, so it originates somewhere other than game code — most
+likely the interpreter path during the upload routine. That is the next thing to
+chase, and it is recorded in `ROADMAP.md`.
+
+The other nine render correctly:
+
+| Title | Colours / ink at frame 600 | Audio |
+| --- | --- | --- |
+| Adventure Island | 10 / 18.5% | 0.8% silent, rms 4919 |
+| Battletoads | 6 / 6.5% | silent at this point in the run |
+| Castlevania | 11 / 24.7% | silent at this point in the run |
+| Excitebike | 6 / 17.3% | 16.3% silent, rms 3601 |
+| Gradius | 9 / 5.8% | 70% silent, rms 611 |
+| Metroid | 13 / 44.8% | 2.3% silent, rms 3398 |
+| Super Mario Bros. | 11 / 45.4% | title screen is silent by design |
+| Tetris | 4 / 13.6% | silent at this point in the run |
+| Zelda | 5 / 8.8% | 6.4% silent, rms 3482 |
+
+---
+
 ## [0.9.0] — 2026-11-16
 
 Graphical and terminal front ends, plus the icon and packaging pipeline.

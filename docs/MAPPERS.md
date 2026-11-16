@@ -14,6 +14,36 @@ it in all three places (plus a board test).
 
 ---
 
+## Fixed PRG floor
+
+Every descriptor declares `FixedPrgFloor`: the lowest CPU address the board never
+remaps, or `0x10000` when it can remap the whole window.
+
+| Board | Floor | Meaning |
+| --- | --- | --- |
+| NROM, CNROM, CPROM, Nina | `$8000` | no PRG banking at all |
+| UxROM, Camerica, Quattro, MMC2, FME7 | `$C000` | fixed 16 KB tail |
+| MMC3 | `$C000` | `$C000-$FFFF` is fixed in practice |
+| MMC1, VRC, AxROM, GxROM, BNROM, Color Dreams | `0x10000` | can move everything |
+
+Both halves of the pipeline use it, and they must agree:
+
+- **The analyser** merges instructions by PRG offset across every bank view, so a
+  jump target below the floor is ambiguous — `$B4AC` may be bank 5's or bank 7's.
+- **The generator** therefore compiles jumps to those addresses as a dispatcher
+  round trip (`Runtime.DispatchTarget = addr; goto Dispatch;`) instead of a
+  direct `goto` to one bank's offset. The runtime resolves the address against
+  the *live* mapping.
+
+Fall-throughs are exempt: they are computed from the same bank view that produced
+the preceding block, so they address the same PRG bytes whatever bank is loaded.
+They stay direct `goto`s, which matters because every instruction ends in one.
+
+Getting this wrong is silent: the game runs, and quietly executes another bank's
+bytes. Zelda (MMC1) rendered a blank screen for exactly this reason.
+
+---
+
 ## NROM — 0
 
 Fixed. 16 KB PRG is mirrored to both windows; 32 KB is linear. CHR ROM is

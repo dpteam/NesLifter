@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using NesLifter.Core.Boards;
 using NesLifter.Mappers;
@@ -222,6 +222,20 @@ namespace NesLifter.Core
 
                 if (_result.Instructions.Count == instructionsBefore)
                     break;
+
+                // A jump into a switchable window is ambiguous: $B4AC could be
+                // bank 5's $B4AC or bank 7's, and the analyser cannot know which
+                // bank is loaded when the call happens.
+                //
+                // Two approaches were tried here. Seeding every bank at every
+                // ambiguous address decodes overlapping regions in each view and
+                // inflates the output past the size of PRG; filtering out $FF
+                // padding helps but still explodes on real titles (Zelda did not
+                // finish in 20 minutes). So the generator routes such jumps
+                // through the runtime dispatcher instead and the interpreter
+                // executes whatever the live mapping points at. See
+                // MapperDescriptor.FixedPrgFloor.
+                break;
             }
         }
 

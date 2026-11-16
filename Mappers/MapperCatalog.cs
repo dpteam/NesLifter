@@ -79,6 +79,46 @@ public sealed class MapperDescriptor
     /// <summary>Board can raise a scanline IRQ.</summary>
     public bool HasIrq { get; }
 
+    /// <summary>
+    /// Lowest CPU address the board never remaps, or <c>0x10000</c> when it can
+    /// remap the entire PRG window.
+    ///
+    /// A jump to an address at or above this floor always lands on the same PRG
+    /// offset, so it can be compiled to a direct <c>goto</c>. Below it, the
+    /// address can mean different bytes depending on the selected bank, so the
+    /// jump has to go through the runtime dispatcher.
+    ///
+    /// Both the analyser and the code generator use this: the analyser seeds
+    /// every bank view at such addresses, and the generator refuses to hardcode
+    /// them. Keeping it in one place is what stops the two from disagreeing —
+    /// which is exactly the bug that made Zelda execute another bank's bytes.
+    /// </summary>
+    public int FixedPrgFloor => Family switch
+    {
+        // No PRG banking at all: every address means exactly one offset.
+        MapperFamily.Nrom => 0x8000,
+        MapperFamily.Cnrom => 0x8000,
+        MapperFamily.Cprom => 0x8000,
+        MapperFamily.Nina => 0x8000,
+
+        // Fixed 16 KB tail at $C000.
+        MapperFamily.UxRom => 0xC000,
+        MapperFamily.Camerica => 0xC000,
+        MapperFamily.Quattro => 0xC000,
+        MapperFamily.Mmc2 => 0xC000,
+        MapperFamily.Fme7 => 0xC000,
+
+        // MMC3 can switch $8000-$9FFF, $A000-$BFFF and $C000-$DFFF, but
+        // $E000-$FFFF is always the last bank. Claiming $C000 is deliberate:
+        // both windows are fixed in practice, and it keeps the hot reset code
+        // direct.
+        MapperFamily.Mmc3 => 0xC000,
+
+        // Everything else can remap the whole window at least once: MMC1 in
+        // 32 KB mode, the VRC boards, and the AxROM-style single-window boards.
+        _ => 0x10000,
+    };
+
     public override string ToString()
     {
         return Id + " (" + Name + ")";

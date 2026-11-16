@@ -91,27 +91,38 @@ audio, input mapping, save slots and diagnostics all live in generated code
 with no way to reach them. A NES-style overlay solves all of it at once and
 becomes the natural home for every future option.
 
-- [ ] **Toggle with F2** (and `--overlay-key`), drawn over the framebuffer in
-      the same 8-bit visual language as the GUI (NES.css-styled panel rendered
-      by the game, not by a browser).
-- [ ] **Pause on open.** Freeze the CPU thread and the audio ring so settings can
-      be changed without the game running underneath.
-- [ ] **Tabs**: Settings · Video · Audio · Input · Debug · Log.
-- [ ] **Settings**: integer scale (1x-6x), aspect ratio, vsync, frame limiter,
-      region override (NTSC/PAL), sprite limit on/off.
-- [ ] **Audio**: master volume, per-channel mute (Pulse ×2, triangle, noise,
-      DMC), buffer size, "soft mathematical" UI feedback toggle.
+- [x] **Toggle with F2**, drawn over the framebuffer in the same 8-bit visual
+      language as the GUI (NES.css-styled panel rendered by the game, not by a
+      browser). Drawn at *window* resolution so text stays legible at any scale.
+- [x] **TAB switches tabs, arrows change values.** The selected row is
+      highlighted and its value is the only thing the arrows touch.
+- [x] **Input is locked per tab.** The Monitor tab is passive: you can watch
+      CPU/PPU/APU numbers while still playing. Every settings tab swallows game
+      input, so pressing an arrow to change a setting does not also move the
+      player.
+- [x] **Tabs**: Monitor · Video · Audio · Input · Debug · Log.
+- [x] **Monitor**: FPS, frame counter, CPU registers, PC, PPU control/mask,
+      scroll, mapper name, live APU channel state, trap count.
+- [x] **Video**: integer scale (1x-6x), FPS counter, 8-sprite limit on/off,
+      frame limiter.
+- [x] **Audio**: master volume, mute, audio-device state.
+- [x] **Debug**: force interpreter, instruction tracing, clear trap count, last
+      trap message.
+- [x] **Log**: tail of the in-memory log ring.
+- [ ] **Pause on open** for settings tabs (currently input is locked but the CPU
+      keeps running).
+- [ ] **Settings**: aspect ratio, vsync, region override (NTSC/PAL).
+- [ ] **Audio**: per-channel mute (Pulse ×2, triangle, noise, DMC), buffer size,
+      "soft mathematical" UI feedback toggle.
 - [ ] **Input**: rebind every button, per-player, with a capture prompt; gamepad
       mapping once controller support lands.
-- [ ] **Debug**: live CPU state (A/X/Y/SP/P/PC), mapper registers, PPU scroll
-      values, frame timing graph, trap log, "force interpreter" toggle, and a
-      RAM search / cheat box.
-- [ ] **Log**: tail of `runtime.log` plus `dynamic_targets.log`, filterable,
-      with a "copy report" button that bundles `analysis.txt` for bug reports.
+- [ ] **Debug**: mapper registers, frame timing graph, RAM search / cheat box.
+- [ ] **Log**: `dynamic_targets.log` alongside `runtime.log`, filterable, with a
+      "copy report" button that bundles `analysis.txt` for bug reports.
 - [ ] **Save/restore state** from the overlay once save states exist (Stage 5).
 - [ ] Persist overlay settings next to the game as `Game.settings.json` so a
       rebuild keeps them.
-- [ ] Headless mode must ignore the overlay entirely.
+- [x] Headless mode must ignore the overlay entirely.
 
 ---
 
@@ -133,14 +144,28 @@ becomes the natural home for every future option.
 Today the lifter analyses **one** bank layout: the one visible at power-on.
 Every other switchable bank is invisible to the analyser and is handled at
 runtime by the interpreter. This is the single largest accuracy gap.
-
 - [~] **Bank-aware analysis.** Instructions are keyed by **PRG offset**, and
       the analyser walks every PRG bank as if it were mapped at `$8000`,
       merging results by offset. The runtime dispatch resolves a CPU address to
       an offset through the mapper before jumping, so one lift covers all banks.
-      Done: offset-keyed model, per-bank descent, offset-keyed dispatch.
+      Done: offset-keyed model, per-bank descent, offset-keyed dispatch, and
+      `MapperDescriptor.FixedPrgFloor` so jumps into a switchable window are
+      dispatched rather than hardcoded to one bank's offset.
       Remaining: per-bank coverage accounting and pruning of banks that are
       proven to be data only.
+- [ ] **Seed each bank at cross-bank entry points.** A `JSR $B4AC` from the
+      fixed bank is ambiguous — it could mean bank 5's or bank 7's `$B4AC`.
+      Two attempts failed: seeding every bank at every ambiguous address decodes
+      overlapping regions (Zelda produced 140% of PRG and did not finish in 20
+      minutes), and filtering `$FF` padding did not make it converge. A real
+      solution needs bank-switch tracking (below) so the analyser knows *which*
+      bank is selected at each call site.
+- [ ] **Trace `$2007` reads as a first-class event.** Zelda's palette upload is
+      preceded by a `$2007` read per entry, so `v` advances twice and only the
+      odd palette slots get written (`$3F00` is never touched). The read does not
+      appear in `cpu.log`, so it comes from a path other than lifted game code —
+      most likely the interpreter. Fixing it is the last step to correct Zelda's
+      palette and tiles.
 - [ ] Bank-switch tracking: record the mapper writes that lead to each bank so
       cross-bank `JMP`/`JSR` edges can be resolved *statically* instead of
       relying on the runtime resolve-then-dispatch step

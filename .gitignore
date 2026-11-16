@@ -110,6 +110,7 @@ lifted/
 *.publishproj
 PublishScripts/
 publish/
+dist/
 *.env
 .env.*
 !.env.example

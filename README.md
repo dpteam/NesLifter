@@ -185,6 +185,46 @@ Game.exe --icon-out my.ico          # write the icon somewhere specific
 Game.exe --icon-exit                # quit right after the icon is written
 ```
 
+### Looking inside a running game
+
+The in-game overlay opens with **F2**. **TAB** switches tabs, **arrows** change
+the highlighted value.
+
+| Tab | Contents |
+| --- | --- |
+| Monitor | FPS, frame, CPU registers, PC, PPU control/mask, scroll, mapper, live APU channel state, trap count |
+| Video | Integer scale 1x-6x, FPS counter, 8-sprite limit, frame limiter |
+| Audio | Master volume, mute, device state |
+| Input | Button map, live pad state |
+| Debug | Force interpreter, instruction tracing, clear trap count, last trap |
+| Log | Tail of the in-memory log |
+
+The **Monitor tab does not lock game input** — you can keep playing while
+watching the numbers. Every other tab is a settings panel and swallows input, so
+pressing an arrow changes a setting instead of moving the player.
+
+### Headless screenshots and traces
+
+```powershell
+# PNG per requested frame, plus an audio trace of the same run
+Game.exe --headless 600 --shots 120,240,600 --shot-dir .\probe --apu-trace .\probe\audio.raw
+
+# Per-subsystem traces: cpu, ppu, apu, mapper, mem, frame (or "all")
+Game.exe --headless 600 --diag cpu,ppu,frame --diag-dir .\probe
+```
+
+Headless is frame-locked, so `frame 120` is exactly frame 120. `tools/Probe`
+wraps all of this and summarises the result:
+
+```powershell
+dotnet run --project tools/Probe -- --exe .\Game.exe --frames 120,240,600 --audio
+```
+
+It reports distinct colours and ink percentage per frame, plus silence,
+clipping and RMS for the audio. See
+[`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md#capture-screenshots-and-traces-headlessly)
+for how to read each trace.
+
 ## Packaging
 
 Three shapes, chosen at lift time:

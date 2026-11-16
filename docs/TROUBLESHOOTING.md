@@ -78,6 +78,58 @@ dotnet game.dll --headless 600
 Exit codes: `0` reached the frame budget, `2` ran but fell short (usually a
 trap), `3` trapped. The trap message names the address.
 
+Headless is **frame-locked**: the CPU thread finishes a frame, parks, and waits
+for the driver to capture it before continuing. That makes `frame N` mean
+exactly frame N, which is what makes the options below reproducible.
+
+### Capture screenshots and traces headlessly
+
+```powershell
+# PNGs at specific frames, plus an audio trace of the same run
+dotnet game.dll --headless 600 --shots 120,240,600 --shot-dir .\probe --apu-trace .\probe\audio.raw
+
+# Per-subsystem traces
+dotnet game.dll --headless 600 --diag cpu,ppu,apu --diag-dir .\probe
+```
+
+| Flag | What it writes |
+| --- | --- |
+| `--shots <frames>` | `frame_NNNNNN.png`, one per requested frame |
+| `--shot-dir <dir>` | where the PNGs and traces go (created if absent) |
+| `--apu-trace <file>` | raw signed 16-bit LE mono at 44.1 kHz |
+| `--diag <list>` | any of `cpu,ppu,apu,mapper,mem,frame`, or `all` |
+| `--diag-dir <dir>` | where the `.log` traces go |
+
+`tools/Probe` drives all of this and summarises the result:
+
+```powershell
+dotnet run --project tools/Probe -- --exe .\Game.exe --frames 120,240,600 --audio
+```
+
+It reports distinct colours and "ink" percentage per frame (a blank or
+single-colour frame is a rendering bug) and silence/clipping/RMS for the audio
+trace (100% silence means every channel is off; clipping means the mixer summed
+without headroom).
+
+### Read the per-subsystem traces
+
+Each trace is one event per line with fixed columns, so two runs can be diffed
+directly.
+
+- `frame.log` — one line per frame: `ctrl`, `mask`, `status`, scroll, base
+  nametable, split scanline, sprite 0, palette entry 0. **Start here** when the
+  picture is wrong: if `ctrl`/`mask` look sane, the bug is in the renderer, not
+  in the game's PPU setup.
+- `ppu.log` — every `$2000-$2007` write with the live `v`/`t` addresses and the
+  current scanline.
+- `cpu.log` — one line per instruction: frame, cycle, PC, opcode, A/X/Y/SP/P,
+  and a decoded mnemonic. Large: expect hundreds of MB for a few hundred frames.
+- `apu.log` — every `$4000-$4017` write with the decoded channel state
+  (enable, period, length counters).
+- `mapper.log` — every write above `$4020` with the resulting PRG window
+  offsets, which is how you catch a bank switch that landed on the wrong bank.
+- `mem.log` — accesses outside the regions a well-behaved game uses.
+
 ---
 
 ## Graphics are wrong
