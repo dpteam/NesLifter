@@ -186,15 +186,44 @@ Note that Tetris is **MMC1**, not NROM, so the earlier "NROM is fine, mappers ar
 broken" reading was not quite right: the worst failures were in the *interpreter*
 (see below), which every title uses until its code is fully lifted.
 
-**Super Mario Bros. 3 still fails.** It renders nothing and traps at frame 515
-with `Dynamic dispatch -> $0100`. `$0100` is RAM, and the interpreter runs there
-for the full 4-million-instruction budget before wandering into `$96FD`, which is
-level data (`34 7E 7E 30 30 7E 7E`), not code. The NMI handler at `$F795` *is*
-lifted and the stack is balanced (the `SP` drop from `$84` to `$7F` across the
-RTI is a legitimate NMI push plus a `JSR`), so the fault is upstream: some jump
-resolves to `$0100` when it should not. Finding it needs the diff harness in
-Stage 7 — running the generated game and FCEUX in lockstep and reporting the
-first divergence — rather than more staring at a single trace.
+**Super Mario Bros. 3 still fails**, but for a different reason than before. It used
+to trap at frame 515; it now runs indefinitely and renders nothing, because its
+PPU never leaves `ctrl`/`mask` `$00`.
+
+Getting there took two real fixes, both of which affected every title:
+
+1. **Instructions were being decoded inside other instructions.** Recursive
+   descent keyed by PRG offset never checked whether that offset was already
+   *within* a decoded instruction, so a branch or jump target landing
+   mid-instruction produced a second, contradictory decode over the same bytes.
+   SMB3 has `JSR $FD90` at `$C45D`; a target three bytes earlier created an extra
+   block at `$C45E` decoding `90 FD` as `BCC $C45D`. The two views fought, the CPU
+   ended up executing level data, hit a `BRK` at `$C477`, and lost one stack byte
+   per pass through the handler until `SP` wrapped to `$00` and `RTI` pulled
+   garbage. A byte is now claimed by the first instruction decoded over it.
+
+2. **Fall-throughs used a stale CPU address.** "Continue at the next instruction"
+   is a PRG offset, not an address: the same bytes can be mapped elsewhere at
+   runtime. `MapperStub.ToAddress` now resolves the offset against the live
+   mapping, so `STA $796A` at `$8457` continues at `$845A` instead of at another
+   bank's copy at `$C45A`.
+
+What remains for SMB3 is bank-switch trampolines. `$FFBF` writes the mapper from
+values in RAM and then `RTS`es, so the continuation lives in whichever bank was
+just selected — unknowable statically.
+
+`Disassembler.SeedBankedReturns` implements the fix and is **off by default**. It
+seeds every bank view at JSR return points whose call targeted the fixed PRG
+window, which covers SMB3's trampoline (68% of PRG decoded, all plausible), but
+it is too broad: the same seeds include return points that are only meaningful in
+one bank view, and that is enough to derail Contra, which then executes the wrong
+bank at `$80D5` and traps. Enabling it fixes SMB3's control flow and breaks
+Contra, so it stays off until the ambiguity can be resolved properly — most
+likely by tracking which bank each call site has selected, which is the
+bank-switch tracking item in `ROADMAP.md`.
+
+SMB3 currently runs indefinitely without trapping but renders nothing, because
+its PPU never leaves `ctrl`/`mask` `$00`.
 
 ---
 

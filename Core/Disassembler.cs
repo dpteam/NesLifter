@@ -81,6 +81,23 @@ namespace NesLifter.Core
 
         /// <summary>Number of distinct bank views that contributed code.</summary>
         public int BankViews;
+
+        /// <summary>
+        /// CPU addresses that are return points of a <c>JSR</c> inside the PRG
+        /// window.
+        ///
+        /// A bank-switch trampoline does not return to its own caller: it writes
+        /// the mapper, then <c>RTS</c>s, so the caller continues at the address it
+        /// pushed — but now in a *different* bank. The bank number usually comes
+        /// out of RAM, so the analyser cannot know which bank that is.
+        ///
+        /// Seeding every bank view at these addresses covers the case. That used
+        /// to be unusable because it decoded overlapping regions in each view and
+        /// inflated the output past the size of PRG; with the byte-coverage guard
+        /// in <see cref="IsCovered"/> a byte is decoded at most once, so the work
+        /// is bounded by the size of PRG no matter how many seeds there are.
+        /// </summary>
+        public HashSet<ushort> BankedReturnPoints = new HashSet<ushort>();
     }
 
     /// <summary>
@@ -125,6 +142,18 @@ namespace NesLifter.Core
         }
 
         public List<ushort> ForcedAddresses = new List<ushort>();
+
+        /// <summary>
+        /// Seed every bank view at JSR return points whose call targeted the fixed
+        /// PRG window.
+        ///
+        /// This is what Super Mario Bros. 3 needs: its bank-switch trampoline at
+        /// $FFBF writes the mapper and RTSes, so the continuation runs in a bank
+        /// chosen from RAM at runtime. Off by default because it is currently too
+        /// broad — it also seeds return points that are only meaningful in one
+        /// view, which is enough to derail Contra.
+        /// </summary>
+        public bool SeedBankedReturns;
 
         public Disassembler(NesRom rom)
             : this(rom, ProgramImage.Create(rom, null))
@@ -227,26 +256,19 @@ namespace NesLifter.Core
             if (bankCount <= 1)
                 return;
 
-            // One pass over every bank. This used to loop up to four times,
-            // re-walking until nothing new appeared, because a function discovered
-            // while walking bank 3 could be the only way into code in bank 1.
-            //
-            // That no longer helps. The loop only made progress by seeding every
-            // bank at every ambiguous jump target, and that was removed: it decodes
-            // overlapping regions in each view and inflates the output past the size
-            // of PRG (Zelda produced 140% of its own PRG and did not finish in 20
-            // minutes). Ambiguous jumps are now resolved at runtime by the
-            // dispatcher instead — see MapperDescriptor.FixedPrgFloor — so a second
-            // pass would re-walk the same banks and find exactly the same code.
-            //
-            // If cross-bank seeding comes back, restore the loop with it, otherwise
-            // this is dead work that the compiler rightly flags.
-            for (int bank = 0; bank < bankCount; bank++)
+            // Two passes: the first discovers code in the power-on view, which may
+            // reveal JSR return points that the second pass can then seed into
+            // every other bank view. More passes would be wasted — seeding is
+            // exhaustive within a pass and each PRG byte is decoded at most once.
+            for (int pass = 0; pass < 2; pass++)
             {
-                if (_result.Instructions.Count >= MaxInstructions)
-                    return;
+                for (int bank = 0; bank < bankCount; bank++)
+                {
+                    if (_result.Instructions.Count >= MaxInstructions)
+                        return;
 
-                WalkBank(bank, windowBytes);
+                    WalkBank(bank, windowBytes);
+                }
             }
         }
 
@@ -327,6 +349,31 @@ namespace NesLifter.Core
 
                 if (seedSet.Add(cpuAddress))
                     seeds.Add(cpuAddress);
+            }
+
+            // Return points of JSRs whose target is in the fixed window.
+            //
+            // A bank-switch trampoline writes the mapper and then RTSes, so the
+            // continuation runs in whichever bank it just selected. Seeding those
+            // return points into every bank view is what Super Mario Bros. 3 needs
+            // (its trampoline at $FFBF returns into a bank chosen from RAM), but it
+            // is off by default: it also seeds return points that are only valid in
+            // one view, and that is enough to derail Contra, which then executes
+            // the wrong bank at $80D5 and traps.
+            //
+            // Enabled with --bank-seeding until the ambiguity is resolved properly.
+            if (SeedBankedReturns)
+            {
+                foreach (ushort returnPoint in _result.BankedReturnPoints)
+                {
+                    int inBank = returnPoint - 0x8000;
+
+                    if (inBank < 0 || inBank >= windowBytes)
+                        continue;
+
+                    if (seedSet.Add(returnPoint))
+                        seeds.Add(returnPoint);
+                }
             }
 
             RunDescent(image, seeds, isPowerOn: false);
@@ -444,6 +491,22 @@ namespace NesLifter.Core
                     !_result.Functions.Contains(inst.TargetOffset))
                 {
                     _result.Functions.Add(inst.TargetOffset);
+                }
+
+                // A JSR return address is a code entry point in whichever bank is
+                // selected when the callee returns — which a bank-switch trampoline
+                // changes. Record it so every bank view gets seeded there.
+                //
+                // Only for calls into the *fixed* PRG window. That is where
+                // trampolines live (SMB3's is at $FFBF), and it keeps the seed set
+                // small: seeding every JSR return point in every bank decodes 68%
+                // of SMB3's PRG and makes compilation take longer than twenty
+                // minutes, for no accuracy gain over this.
+                if (inst.Control == OpControl.Jsr &&
+                    inst.Fallthrough >= 0x8000 &&
+                    inst.Target >= MapperCatalog.Get(_rom.Cart.Mapper).FixedPrgFloor)
+                {
+                    _result.BankedReturnPoints.Add(inst.Fallthrough);
                 }
 
                 if (isPowerOn && inst.TargetOffset >= 0 && !_result.Functions.Contains(inst.TargetOffset))
