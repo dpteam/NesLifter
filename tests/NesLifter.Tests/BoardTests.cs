@@ -19,6 +19,30 @@ public class BoardFactoryTests
         }
     }
 
+    /// <summary>
+    /// The reverse direction of the test above, and the one that actually caught a
+    /// bug: mapper 5 (MMC5) had a board — an alias to <c>Mmc3Board</c> — while
+    /// being absent from the catalog. Nothing noticed, because every existing test
+    /// started from the catalog. The result was that MMC5 cartridges lifted
+    /// "successfully" into builds that rendered garbage.
+    ///
+    /// A board without a catalog entry means the two lists disagree about what is
+    /// supported, and MMC5 and MMC3 are not interchangeable: MMC5 has its own
+    /// register window at $5100-$5FFF, ExRAM, 8x8 attributes, a multiplier and
+    /// three extra sound channels.
+    /// </summary>
+    [Fact]
+    public void EveryBoardHasACatalogEntry()
+    {
+        foreach (int id in BoardFactory.SupportedMappers)
+        {
+            Assert.True(
+                MapperCatalog.TryGet(id, out _),
+                "Mapper " + id + " has a board but is not in the catalog, so its descriptor claims "
+                + "it is unsupported while a lift would silently use the board anyway.");
+        }
+    }
+
     [Fact]
     public void SupportedMappersAreSortedAndUnique()
     {

@@ -203,39 +203,26 @@ namespace NesLifter.Core
             if (bankCount <= 1)
                 return;
 
-            // Repeat until nothing new appears. A function discovered while
-            // walking bank 3 may be the only way into code in bank 1, so a single
-            // pass is not enough. The cap keeps pathological ROMs finite.
-            const int MaxRounds = 4;
-
-            for (int round = 0; round < MaxRounds; round++)
+            // One pass over every bank. This used to loop up to four times,
+            // re-walking until nothing new appeared, because a function discovered
+            // while walking bank 3 could be the only way into code in bank 1.
+            //
+            // That no longer helps. The loop only made progress by seeding every
+            // bank at every ambiguous jump target, and that was removed: it decodes
+            // overlapping regions in each view and inflates the output past the size
+            // of PRG (Zelda produced 140% of its own PRG and did not finish in 20
+            // minutes). Ambiguous jumps are now resolved at runtime by the
+            // dispatcher instead — see MapperDescriptor.FixedPrgFloor — so a second
+            // pass would re-walk the same banks and find exactly the same code.
+            //
+            // If cross-bank seeding comes back, restore the loop with it, otherwise
+            // this is dead work that the compiler rightly flags.
+            for (int bank = 0; bank < bankCount; bank++)
             {
-                int instructionsBefore = _result.Instructions.Count;
+                if (_result.Instructions.Count >= MaxInstructions)
+                    return;
 
-                for (int bank = 0; bank < bankCount; bank++)
-                {
-                    if (_result.Instructions.Count >= MaxInstructions)
-                        return;
-
-                    WalkBank(bank, windowBytes);
-                }
-
-                if (_result.Instructions.Count == instructionsBefore)
-                    break;
-
-                // A jump into a switchable window is ambiguous: $B4AC could be
-                // bank 5's $B4AC or bank 7's, and the analyser cannot know which
-                // bank is loaded when the call happens.
-                //
-                // Two approaches were tried here. Seeding every bank at every
-                // ambiguous address decodes overlapping regions in each view and
-                // inflates the output past the size of PRG; filtering out $FF
-                // padding helps but still explodes on real titles (Zelda did not
-                // finish in 20 minutes). So the generator routes such jumps
-                // through the runtime dispatcher instead and the interpreter
-                // executes whatever the live mapping points at. See
-                // MapperDescriptor.FixedPrgFloor.
-                break;
+                WalkBank(bank, windowBytes);
             }
         }
 

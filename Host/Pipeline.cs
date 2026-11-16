@@ -159,6 +159,24 @@ public sealed class Pipeline
 
         Console.WriteLine("Board: " + descriptor.Id + " " + descriptor.Name + " - " + descriptor.Summary);
 
+        if (!supported && !_options.AllowUnsupportedMapper)
+        {
+            // Refusing is much better than the alternative. The flat fallback
+            // produces a build that reports success and then renders garbage,
+            // because the game's own bank switches are not modelled at all. A
+            // user testing that build has no way to tell an unimplemented mapper
+            // from a broken lifter.
+            Console.Error.WriteLine(
+                "error: mapper " + cart.Mapper + " has no implementation, so a lift would " +
+                "silently produce a broken game.");
+            Console.Error.WriteLine(
+                "  Supported mappers: " + string.Join(", ", MapperCatalog.All.Select(d => d.Id).OrderBy(id => id)));
+            Console.Error.WriteLine(
+                "  Pass --allow-unsupported-mapper to lift with a flat PRG layout anyway.");
+
+            return false;
+        }
+
         if (!supported)
         {
             Console.WriteLine("Board: mapper is not implemented; falling back to a flat PRG layout.");

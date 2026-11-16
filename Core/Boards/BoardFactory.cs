@@ -19,7 +19,12 @@ namespace NesLifter.Core.Boards
                 [2] = (c, m) => new UxRomBoard(c, m),
                 [3] = (c, m) => new CnromBoard(c, m),
                 [4] = (c, m) => new Mmc3Board(c, m),
-                [5] = (c, m) => new Mmc3Board(c, m),
+                // Mapper 5 is MMC5, which is *not* MMC3-compatible: it has its own
+                // register window at $5100-$5FFF, ExRAM, 8x8 attribute mode, a
+                // hardware multiplier and three extra sound channels. Mapping it
+                // onto Mmc3Board — as an earlier version did — produced a build
+                // that reported success and rendered garbage. It is deliberately
+                // absent so the pipeline refuses the cartridge instead.
                 [7] = (c, m) => new AxRomBoard(c, m),
                 [9] = (c, m) => new Mmc2Board(c, m),
                 [11] = (c, m) => new GxRomBoard(c, m, 11),

@@ -49,6 +49,15 @@ public sealed class CliOptions
     /// </summary>
     public bool AnalyseAllBanks = true;
 
+    /// <summary>
+    /// Lift a cartridge whose mapper has no implementation, falling back to a flat
+    /// PRG layout. Off by default: the fallback produces a build that reports
+    /// success and then renders garbage, which is a much worse outcome than a
+    /// clear refusal. Mappers 5 (MMC5), 19 (Namco 163), 85 (VRC7) and the JY
+    /// Company boards (90/209/211) are the notable gaps.
+    /// </summary>
+    public bool AllowUnsupportedMapper;
+
     public List<string> UnknownArgs = new List<string>();
 
     public static CliOptions Parse(string[] args)
@@ -233,6 +242,12 @@ public sealed class CliOptions
             if (TryGetValue(a, "--icon", out string iconValue))
             {
                 o.IconPath = iconValue;
+                continue;
+            }
+
+            if (Is(a, "--allow-unsupported-mapper"))
+            {
+                o.AllowUnsupportedMapper = true;
                 continue;
             }
 

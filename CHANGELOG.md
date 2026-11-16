@@ -141,30 +141,60 @@ Headless diagnostics, a real APU, and the in-game overlay.
   hard to read. Verified on Super Mario Bros: Start enters the level and Right
   walks Mario to the first block.
 
+### Fixed (unsupported mappers are refused, not faked)
+
+- **Mapper 5 (MMC5) was aliased to `Mmc3Board`** in `BoardFactory` while being
+  absent from `MapperCatalog`. Nothing noticed because every test started from
+  the catalog, so the mismatch was invisible in one direction only. The result:
+  MMC5 cartridges lifted with `Summary: ok=1, failed=0` into builds that rendered
+  garbage. MMC5 is not MMC3-compatible — it has its own register window at
+  `$5100-$5FFF`, ExRAM, 8x8 attribute mode, a hardware multiplier and three extra
+  sound channels — so the alias is gone and the pipeline now refuses the
+  cartridge, listing what *is* supported, with `--allow-unsupported-mapper` as
+  the explicit escape hatch.
+- A new test asserts the board list and the catalog agree in **both** directions,
+  which is the direction that would have caught this.
+
 ### Status
 
-All ten reference cartridges render and run:
+Sixteen reference cartridges were measured headlessly. Fifteen run and render:
 
 | Title | Mapper | State |
 | --- | --- | --- |
-| Adventure Island | CNROM (3) | correct, audio active |
-| Battletoads | AxROM (7) | correct — slow star-field intro |
-| Castlevania | UxROM (2) | correct, audio active |
-| Excitebike | NROM (0) | correct, audio active |
-| Gradius | CNROM (3) | correct, plays the game |
-| Kirby's Adventure | MMC3 (4) | correct — plays level 1; one later scene has wrong tiles |
-| Zelda | MMC1 (1) | correct, audio active |
-| Metroid | MMC1 (1) | correct, audio active |
-| Super Mario Bros. | NROM (0) | correct |
+| Adventure Island | CNROM (3) | correct, plays |
+| Battletoads | AxROM (7) | title screen correct; stalls in a wait loop |
+| Blaster Master | MMC1 (1) | correct |
+| Castlevania | UxROM (2) | correct, plays |
+| Contra | UxROM (2) | correct, plays |
+| Double Dragon | MMC1 (1) | correct |
+| Excitebike | NROM (0) | correct, plays |
+| Gradius | CNROM (3) | correct, plays |
+| Kirby's Adventure | MMC3 (4) | correct — plays level 1; one tutorial overlay has wrong tiles |
+| Life Force | UxROM (2) | correct |
+| Metroid | MMC1 (1) | correct, plays |
+| Ninja Gaiden | MMC1 (1) | correct |
+| Punch-Out!! | MMC2 (9) | correct — the 34th-tile CHR latch works |
+| Super Mario Bros. | NROM (0) | correct, plays |
 | Tetris | MMC1 (1) | correct |
+| Super Mario Bros. 3 | MMC3 (4) | **broken** — see below |
 
-Frames that come out blank at a given frame number are screen transitions in the
-game (Gradius' attract mode, Zelda's demo hand-off), not rendering failures —
-sampling a few frames per run distinguishes the two.
+Frames that come out blank at a given frame number are usually screen
+transitions in the game (Gradius' attract mode, Zelda's demo hand-off), not
+rendering failures — sampling several frames per run distinguishes the two.
 
 Note that Tetris is **MMC1**, not NROM, so the earlier "NROM is fine, mappers are
 broken" reading was not quite right: the worst failures were in the *interpreter*
 (see below), which every title uses until its code is fully lifted.
+
+**Super Mario Bros. 3 still fails.** It renders nothing and traps at frame 515
+with `Dynamic dispatch -> $0100`. `$0100` is RAM, and the interpreter runs there
+for the full 4-million-instruction budget before wandering into `$96FD`, which is
+level data (`34 7E 7E 30 30 7E 7E`), not code. The NMI handler at `$F795` *is*
+lifted and the stack is balanced (the `SP` drop from `$84` to `$7F` across the
+RTI is a legitimate NMI push plus a `JSR`), so the fault is upstream: some jump
+resolves to `$0100` when it should not. Finding it needs the diff harness in
+Stage 7 — running the generated game and FCEUX in lockstep and reporting the
+first divergence — rather than more staring at a single trace.
 
 ---
 

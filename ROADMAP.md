@@ -37,6 +37,40 @@ The mapper is the single largest source of "it runs but the graphics are wrong".
 - [x] Mapper-aware disassembly: the analyser decodes through the power-on bank
       layout instead of assuming a flat image
 - [x] Per-family code emission: a generated game carries only its own mapper
+- [x] **Unsupported mappers are refused, not faked.** Mapper 5 (MMC5) used to be
+      aliased to `Mmc3Board`, so MMC5 cartridges lifted "successfully" into
+      builds that rendered garbage — the worst possible outcome, because there is
+      no way to tell an unimplemented mapper from a broken lifter. The alias is
+      gone, the pipeline refuses with a list of supported mappers, and
+      `--allow-unsupported-mapper` is the explicit escape hatch. A test now
+      asserts the board list and the catalog list agree in *both* directions.
+
+### Not implemented (deliberately refused)
+
+These are the boards with real extra silicon. Each needs its own chip emulation,
+not a banking rule, so each is a project rather than a checkbox:
+
+- [ ] **MMC5 (5)** — the most advanced NES mapper: register window at
+      `$5100-$5FFF`, ExRAM, 8x8 attribute mode, hardware 8x8 multiplier, 1 KB CHR
+      banking with four nametables, two extra pulse channels plus PCM.
+      Games: Castlevania III (US/EU), Just Breed, Metal Slader Glory, Uchuu
+      Keibitai SDF, Laser Invasion, Uncharted Waters, Romance of the Three
+      Kingdoms II, Bandit Kings of Ancient China, Gemfire, Ishin no Arashi,
+      Shin 4 Nin Uchi Mahjong.
+- [ ] **VRC7 (85)** — Konami, with a 6-channel FM synthesis chip (OPLL).
+      Games: Lagrange Point, Tiny Toon Adventures 2 (JP).
+- [ ] **Namco 163 (19)** — 8 extra wavetable sound channels sharing one time
+      multiplexer, plus 1 KB CHR banking through a register file.
+      Games: Final Lap, Rolling Thunder (JP), Dragon Ninja, Erika to Satoru no
+      Yume Bouken, Megami Tensei II, Sangokushi II, Hydlide 3, Mappy Kids.
+- [ ] **JY Company ASIC (90, 209, 211)** — unlicensed, up to 2 MB CHR, hardware
+      multiplier, several variants that differ only in register addresses.
+      Games: Aladdin, Pocahontas, Tekken 2, Mortal Kombat II/III, Super Contra 3,
+      Final Fight 3, Super Mario World (pirate port).
+
+Note that VRC6 (24/26) *is* implemented for banking and IRQ, but its three
+expansion sound channels are not mixed yet — Akumajou Densetsu will lift and
+play, with the wrong soundtrack.
 
 ---
 
@@ -295,12 +329,38 @@ generated game exposes `Joy1` only.
 
 ---
 
-## Stage 6 — Emulation-grade fidelity (hard)- [ ] Cycle-exact 6502 (per-cycle bus accesses, RMW double writes, dummy reads)
+## Stage 6 — Emulation-grade fidelity (hard)
+
+Some titles use trivial mappers but lean on hardware behaviour that a
+frame-level model cannot reproduce. These are the accuracy targets:
+
+- [ ] **Micro Machines** — the usual answer to "hardest NES game to emulate".
+      Needs cycle accuracy *and* correct `$2004` (OAMDATA) reads during
+      rendering, which is how it finds a free sprite slot.
+- [ ] **Battletoads** — exact CPU/PPU timing plus a faithful sprite-0 hit; any
+      drift and level 1 hangs. Currently stalls in a wait loop at `$871F`.
+- [ ] **Marble Madness** — switches CHR banks mid-scanline to draw text blocks,
+      so pattern fetches must see the *current* bank, not the VBlank snapshot.
+      The same gap corrupts Kirby's Adventure's tutorial overlay.
+- [ ] **The Young Indiana Jones Chronicles** — writes `$2007` during rendering
+      to shake the screen, which requires modelling VRAM writes mid-frame.
+- [ ] **Bill & Ted's Excellent Adventure** — depends on MMC1 ignoring writes in
+      consecutive cycles (the RMW write filter), and toggles rendering mid-frame
+      to switch CHR banks.
+- [ ] **Punch-Out!!** — needs the 34th-tile sprite fetch to select the MMC2 CHR
+      latch, otherwise the ring draws with wrong tiles.
+- [ ] **Super Mario Bros.** — trivial mapper, but exercises indirect `JMP`,
+      palette mirroring, sprite-0 and the one-byte `$2007` read delay. A good
+      canary: it already runs correctly here, so a regression in those areas
+      shows up immediately.
+
+- [ ] Cycle-exact 6502 (per-cycle bus accesses, RMW double writes, dummy reads)
 - [ ] CPU interrupt timing: NMI hijacking, IRQ at instruction boundaries only
 - [ ] PPU open bus and decay
 - [ ] Four-screen VRAM and mapper-controlled nametable RAM
 - [ ] MMC5: ExRAM, extended attributes, vertical split mode, 8×8 multiply
-- [ ] Mapper 163/MMC5 sound, Namco 163 wavetable, Sunsoft 5B
+- [ ] Expansion sound: VRC6 (3 channels), VRC7 (FM), Namco 163 wavetable,
+      Sunsoft 5B, MMC5
 - [ ] Famicom Disk System BIOS and disk I/O
 - [ ] VS. System / PlayChoice-10 arcade variants
 
