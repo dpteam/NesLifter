@@ -1414,7 +1414,27 @@ namespace NesLifter.Lifting
                     Line(sb, "case 0x" + offset.ToString("X6") + ": goto " + Label(offset) + ";");
 
                 sb.Append(Raw("""
-                                        default: if (Diag.TraceDispatch) Diag.Dispatch(Runtime.DispatchTarget, "not lifted"); Runtime.ReportDynamicTarget(Runtime.DispatchTarget); if (!Runtime.Interpret()) { Runtime.Trap("Dynamic dispatch -> $" + Runtime.DispatchTarget.ToString("X4")); return; } goto Dispatch;
+                                        default:
+                                            if (Diag.TraceDispatch) Diag.Dispatch(Runtime.DispatchTarget, "not lifted");
+                                            Runtime.ReportDynamicTarget(Runtime.DispatchTarget);
+
+                                            // An address below $4020 is RAM. A game may legitimately
+                                            // run code there — Zelda's NMI handler is at $0084, copied
+                                            // into RAM at boot — so the interpreter has to run it to
+                                            // completion and return here, not treat it as a dead end.
+                                            //
+                                            // The interpreter returns true when it hands control back
+                                            // to a lifted block or takes an interrupt, and false when it
+                                            // hit a trap or an unimplemented opcode. On success control
+                                            // goes back to the dispatcher, which is what lets an
+                                            // interrupt handler written in RAM finish and RTI out.
+                                            if (!Runtime.Interpret())
+                                            {
+                                                Runtime.Trap("Dynamic dispatch -> $" + Runtime.DispatchTarget.ToString("X4"));
+                                                return;
+                                            }
+
+                                            goto Dispatch;
                                     }
                                 }
                     """));
@@ -1449,8 +1469,14 @@ namespace NesLifter.Lifting
                 // is fixed on most boards but remapped wholesale on AxROM-style
                 // mappers. Resolving through the dispatcher costs one indirect
                 // branch per frame and is correct on both.
-                if (_nmiOffset >= 0)
-                    Line(sb, "if (Runtime.CheckNmi(0x" + hex + ")) { Runtime.DispatchTarget = Runtime.NmiVector; goto Dispatch; }");
+                //
+                // This must not be conditional on the analyser having found the
+                // handler. If it is, a title whose NMI vector points at code the
+                // analyser did not reach never services an interrupt at all:
+                // NmiPending accumulates and the game sits in its wait-for-vblank
+                // loop forever. That is exactly how Zelda hung — its handler at
+                // $E484 lives in the last PRG bank and was never lifted.
+                Line(sb, "if (Runtime.CheckNmi(0x" + hex + ")) { Runtime.DispatchTarget = Runtime.NmiVector; goto Dispatch; }");
 
                 Line(sb, "if (Runtime.CheckIrq(0x" + hex + ")) { Runtime.DispatchTarget = Runtime.IrqVector; goto Dispatch; }");
 
@@ -2082,8 +2108,8 @@ namespace NesLifter.Lifting
                                 {
                                     case 44: { ushort tgt; if (mode == 9) { ushort ptr = Memory.Read16((ushort)(pc + 1)); ushort loAddr = ptr; ushort hiAddr = (ushort)((ptr & 0xFF00) | ((ptr + 1) & 0x00FF)); tgt = (ushort)(Memory.Read(loAddr) | (Memory.Read(hiAddr) << 8)); } else { tgt = Memory.Read16((ushort)(pc + 1)); } if (IsStaticLabel(tgt)) { DispatchTarget = tgt; return true; } pc = tgt; continue; }
                                     case 45: { JsrPush((ushort)(pc + 3)); ushort tgt = Memory.Read16((ushort)(pc + 1)); if (IsStaticLabel(tgt)) { DispatchTarget = tgt; return true; } pc = tgt; continue; }
-                                    case 46: { ushort tgt = RtsPull(); if (IsStaticLabel(tgt)) { DispatchTarget = tgt; return true; } pc = tgt; continue; }
-                                    case 47: { P = (byte)((Pull() & 0xEF) | 0x20); ushort tgt = Pull16(); LeaveInterrupt(); if (IsStaticLabel(tgt)) { DispatchTarget = tgt; return true; } pc = tgt; continue; }
+                                    case 46: { ushort tgt = RtsPull(); if (!ForceInterpreter && IsStaticLabel(tgt)) { DispatchTarget = tgt; return true; } pc = tgt; continue; }
+                                    case 47: { P = (byte)((Pull() & 0xEF) | 0x20); ushort tgt = Pull16(); LeaveInterrupt(); if (!ForceInterpreter && IsStaticLabel(tgt)) { DispatchTarget = tgt; return true; } pc = tgt; continue; }
                                     case 48: { Push16((ushort)(pc + 2)); Push((byte)(P | 0x30)); P = (byte)(P | 0x04); ushort tgt = Memory.Read16(0xFFFE); if (IsStaticLabel(tgt)) { DispatchTarget = tgt; return true; } pc = tgt; continue; }
                                     case 49: { bool c; switch (op) { case 0x10: c = (P & 0x80) == 0; break; case 0x30: c = (P & 0x80) != 0; break; case 0x50: c = (P & 0x40) == 0; break; case 0x70: c = (P & 0x40) != 0; break; case 0x90: c = (P & 0x01) == 0; break; case 0xB0: c = (P & 0x01) != 0; break; case 0xD0: c = (P & 0x02) == 0; break; case 0xF0: c = (P & 0x02) != 0; break; default: c = false; break; } ushort nxt = c ? (ushort)(pc + 2 + (sbyte)imm) : (ushort)(pc + 2); if (IsStaticLabel(nxt)) { DispatchTarget = nxt; return true; } pc = nxt; continue; }
                                 }
